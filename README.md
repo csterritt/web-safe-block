@@ -1,9 +1,14 @@
-write a simple program called web-safe-block in rust. it should do the following.
-the idea is that you have a web server program running that may or may not be super hardened. its port is not available to the outside world, but another port is. the web-safe-block program will be connected to the internet on another port, and will forward requests to the protected web server in the following way.
-web-safe-block will listen on its internet port, and for a new connection, send a very simple no-css HTML page with a single form with a text entry box, labeled "Phrase", and a button labeled "Submit" which submits the form.
-There will be a env variable named PASS_PHRASE - and web-safe-block should exit with an error if that phrase is not set. when it's set, and the html page submit happens with a phrase, trim leading and trailing whitespace off of the input and compare it to the PASS_PHRASE value.
-When the input matches the phrase, then go ahead and set a cookie with a large random value. for page requests from then on that have the cookie set with a value stored in memory, pass the request on to the other progarm's port.
-First, will this work? Can one program 'front' for another with its own cookies? can it prevent that cookie being sent to the protected program?
+# Web-Safe Block
+
+A simple program called `web-safe-block` in rust, which does the following.
+
+The idea is that you have a web server program running that may or may not be super hardened. Its port is not available to the outside world. The `web-safe-block` program will be connected to the internet on another port, and will forward requests to the protected web server in the following way.
+
+`web-safe-block` will listen on its internet port, and for a new connection, send a very simple no-css HTML page with a single form with a text entry box, labeled "Phrase", and a button labeled "Submit" which submits the form.
+
+There will be a env variable named `PASS_PHRASE` - and `web-safe-block` exits with an error if that phrase is not set. When it's set, and the html page submit happens with a phrase, it trims leading and trailing whitespace off of the input and compare it to the `PASS_PHRASE` value.
+
+When the input matches the phrase, then it sets a cookie with a large random value. For page requests from then on that have the cookie set with a value stored in memory, it passes the request on to the other progarm's port.
 
 ## Usage
 
