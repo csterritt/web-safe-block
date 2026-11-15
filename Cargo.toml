@@ -1,0 +1,17 @@
+[package]
+name = "web-safe-block"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["form"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["http1"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1"] }
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["full"] }
+
+[dev-dependencies]
+reqwest = "0.13.5"
