@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Form, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header, uri::Scheme};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
@@ -17,8 +17,10 @@ use rand::Rng;
 use serde::Deserialize;
 
 pub mod monitor;
+pub mod settings;
 pub mod users;
 use monitor::{Event, EventKind, EventQueue, Outcome};
+use settings::Settings;
 use users::UserStore;
 
 pub const SESSION_COOKIE: &str = "wsb_session";
@@ -43,33 +45,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load config from environment. Returns Err(message) on invalid config.
-    pub fn from_env(users: UserStore) -> Result<Self, String> {
-        let upstream_raw =
-            std::env::var("UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
-        let upstream: Uri = upstream_raw
-            .parse()
-            .map_err(|_| format!("UPSTREAM is not a valid URI: {upstream_raw:?}"))?;
-        if upstream.scheme() != Some(&Scheme::HTTP) || upstream.authority().is_none() {
-            return Err(format!(
-                "UPSTREAM must be an http:// URI with a host: {upstream_raw:?}"
-            ));
-        }
-        let session_ttl_secs: u64 = std::env::var("SESSION_TTL_SECS")
-            .ok()
-            .map(|s| s.parse())
-            .transpose()
-            .map_err(|_| "SESSION_TTL_SECS is not a valid integer".to_string())?
-            .unwrap_or(604_800);
-        let cookie_secure =
-            !matches!(std::env::var("COOKIE_SECURE"), Ok(v) if v == "false" || v == "0");
-        Ok(Config {
+    pub fn new(settings: &Settings, users: UserStore) -> Self {
+        Config {
             users: Arc::new(users),
-            upstream,
-            session_ttl: Duration::from_secs(session_ttl_secs),
-            cookie_secure,
+            upstream: settings.upstream.clone(),
+            session_ttl: Duration::from_secs(settings.session_ttl_secs),
+            cookie_secure: settings.cookie_secure,
             fail_delay: Duration::from_secs(1),
-        })
+        }
     }
 }
 

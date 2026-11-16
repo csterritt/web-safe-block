@@ -1,23 +1,31 @@
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use web_safe_block::monitor::{self, EventQueue};
-use web_safe_block::users::{self, DB_FILE, UserStore};
+use web_safe_block::settings::{self, CONFIG_FILE, Settings};
+use web_safe_block::users::{self, UserStore};
 
-const USAGE: &str = "usage: web-safe-block <command>
+const USAGE: &str = "usage: web-safe-block [-c path-to-config] <command>
 
 commands:
-  add-user   read 'user-name pass phrase words...' lines from stdin into ./users.db
-  serve      run the proxy (users from ./users.db) and the local monitor port";
+  write-config  write a config file with default values (refuses to overwrite)
+  add-user      read 'user-name pass phrase words...' lines from stdin into the users database
+  serve         run the proxy and the local monitor port
+
+The config file defaults to ./config.toml.";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("add-user") if args.len() == 1 => add_user(),
-        Some("serve") if args.len() == 1 => serve(),
+    let Some((config_path, command)) = parse_args(std::env::args().skip(1)) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    match command.as_str() {
+        "write-config" => write_config(&config_path),
+        "add-user" => with_settings(&config_path, add_user),
+        "serve" => with_settings(&config_path, serve),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -25,15 +33,52 @@ fn main() -> ExitCode {
     }
 }
 
+/// Accepts exactly one command plus an optional `-c path` anywhere.
+fn parse_args(args: impl Iterator<Item = String>) -> Option<(PathBuf, String)> {
+    let (mut config, mut command) = (None, None);
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        if arg == "-c" {
+            if config.replace(PathBuf::from(args.next()?)).is_some() {
+                return None;
+            }
+        } else if command.replace(arg).is_some() {
+            return None;
+        }
+    }
+    Some((
+        config.unwrap_or_else(|| PathBuf::from(CONFIG_FILE)),
+        command?,
+    ))
+}
+
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("web-safe-block: {msg}");
     ExitCode::FAILURE
 }
 
-fn add_user() -> ExitCode {
-    let conn = match users::open_for_add(Path::new(DB_FILE)) {
+fn with_settings(path: &Path, run: fn(Settings) -> ExitCode) -> ExitCode {
+    match settings::load(path) {
+        Ok(s) => run(s),
+        Err(e) => fail(e),
+    }
+}
+
+fn write_config(path: &Path) -> ExitCode {
+    match settings::write_default(path) {
+        Ok(()) => {
+            eprintln!("web-safe-block: wrote default config to {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+fn add_user(settings: Settings) -> ExitCode {
+    let db = &settings.users_db;
+    let conn = match users::open_for_add(db) {
         Ok(c) => c,
-        Err(e) => return fail(format!("cannot open {DB_FILE}: {e}")),
+        Err(e) => return fail(format!("cannot open {}: {e}", db.display())),
     };
     match users::add_users(&conn, std::io::stdin().lock(), &mut std::io::stderr()) {
         Ok((added, skipped)) => {
@@ -48,32 +93,16 @@ fn add_user() -> ExitCode {
     }
 }
 
-fn serve() -> ExitCode {
-    let config =
-        match UserStore::open(Path::new(DB_FILE)).and_then(web_safe_block::Config::from_env) {
-            Ok(c) => c,
-            Err(e) => return fail(e),
-        };
-    let listen: SocketAddr = match std::env::var("LISTEN_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
-        .parse()
-    {
-        Ok(a) => a,
-        Err(_) => return fail("LISTEN_ADDR is not a valid socket address"),
+fn serve(settings: Settings) -> ExitCode {
+    let config = match UserStore::open(&settings.users_db) {
+        Ok(users) => web_safe_block::Config::new(&settings, users),
+        Err(e) => return fail(e),
     };
-    let monitor_addr: SocketAddr = match std::env::var("MONITOR_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8081".to_string())
-        .parse::<SocketAddr>()
-    {
-        Ok(a) if a.ip().is_loopback() => a,
-        Ok(a) => return fail(format!("MONITOR_ADDR must be a loopback address, got {a}")),
-        Err(_) => return fail("MONITOR_ADDR is not a valid socket address"),
-    };
-    let queue_len = match std::env::var("MONITOR_QUEUE_LEN").map(|s| s.parse::<usize>()) {
-        Err(_) => 1000,
-        Ok(Ok(n)) if n > 0 => n,
-        Ok(_) => return fail("MONITOR_QUEUE_LEN must be a positive integer"),
-    };
+    let (listen, monitor_addr, queue_len) = (
+        settings.listen_addr,
+        settings.monitor_addr,
+        settings.monitor_queue_len,
+    );
     let monitor_listener = match std::net::TcpListener::bind(monitor_addr) {
         Ok(l) => l,
         Err(e) => return fail(format!("failed to bind monitor {monitor_addr}: {e}")),
@@ -87,8 +116,9 @@ fn serve() -> ExitCode {
     };
     rt.block_on(async move {
         println!(
-            "web-safe-block: listening on {listen}, upstream {}, session TTL {}s, cookie_secure={}",
+            "web-safe-block: listening on {listen}, upstream {}, users {}, session TTL {}s, cookie_secure={}",
             config.upstream,
+            settings.users_db.display(),
             config.session_ttl.as_secs(),
             config.cookie_secure
         );
@@ -103,4 +133,30 @@ fn serve() -> ExitCode {
             Err(e) => fail(format!("server error: {e}")),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Option<(PathBuf, String)> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn parse_args_cases() {
+        let ok = |p: &str, c: &str| Some((PathBuf::from(p), c.to_string()));
+        assert_eq!(parse(&["serve"]), ok("config.toml", "serve"));
+        assert_eq!(parse(&["-c", "x.toml", "serve"]), ok("x.toml", "serve"));
+        assert_eq!(
+            parse(&["add-user", "-c", "/a/b.toml"]),
+            ok("/a/b.toml", "add-user")
+        );
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["-c"]), None);
+        assert_eq!(parse(&["serve", "-c"]), None);
+        assert_eq!(parse(&["-c", "x.toml"]), None);
+        assert_eq!(parse(&["-c", "a", "-c", "b", "serve"]), None);
+        assert_eq!(parse(&["serve", "extra"]), None);
+    }
 }

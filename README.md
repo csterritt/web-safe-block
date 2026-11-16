@@ -6,7 +6,7 @@ The idea is that you have a web server program running that may or may not be su
 
 `web-safe-block` will listen on its internet port, and for a new connection, send a very simple no-css HTML page with a single form with a text entry box, labeled "Phrase", and a button labeled "Submit" which submits the form.
 
-Users are stored in a sqlite3 database (`users.db` in the current directory), added with the `add-user` command. Each user has a user name, a unique pass phrase, and an admin flag (set when the user name contains "admin"). When the html page submit happens with a phrase, all whitespace is removed and it is lower-cased, then it is looked up in the database.
+Settings come from a `config.toml` file (`./config.toml` by default, or `-c path`). Users are stored in a sqlite3 database (set by `users_db` in the config), added with the `add-user` command. Each user has a user name, a unique pass phrase, and an admin flag (set when the user name contains "admin"). When the html page submit happens with a phrase, all whitespace is removed and it is lower-cased, then it is looked up in the database.
 
 When the input matches a user's phrase, then it sets a cookie with a large random value. For page requests from then on that have the cookie set with a value stored in memory, it passes the request on to the other progarm's port.
 
@@ -15,22 +15,47 @@ When the input matches a user's phrase, then it sets a cookie with a large rando
 ```sh
 cargo build --release
 
+# Write ./config.toml with default values, then edit it.
+./target/release/web-safe-block write-config
+
 # Add users: one per line, "user-name pass phrase words...".
 ./target/release/web-safe-block add-user <<'EOF'
 chris correct horse battery staple
 site-admin Purple Monkey Dishwasher
 EOF
 
-UPSTREAM=http://127.0.0.1:3000 \
-LISTEN_ADDR=127.0.0.1:8080 \
 ./target/release/web-safe-block serve
 ```
 
 Then point Cloudflare Tunnel (or another TLS terminator) at `http://127.0.0.1:8080`.
 
+Every command accepts `-c path-to-config` (before or after the command name) to use a config file other than `./config.toml`:
+
+```sh
+web-safe-block -c /etc/web-safe-block/config.toml serve
+```
+
+### Configuration
+
+`add-user` and `serve` exit with an error if the config file is missing, can't be parsed, is missing any setting, or contains an unknown one.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `users_db` | `"users.db"` | sqlite3 users database. A relative path is relative to the config file's directory. |
+| `listen_addr` | `"127.0.0.1:8080"` | Public-facing address web-safe-block listens on. |
+| `upstream` | `"http://127.0.0.1:3000"` | Protected server (must be `http://`). |
+| `session_ttl_secs` | `604800` (7 days) | Session lifetime. |
+| `cookie_secure` | `true` | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
+| `monitor_addr` | `"127.0.0.1:8081"` | Local monitor port. Must be a loopback address. |
+| `monitor_queue_len` | `1000` | How many unreported events are kept. |
+
+### `write-config`
+
+Writes a config file with all the default values above, with comments, to `./config.toml` or the `-c` path. It refuses to overwrite an existing file.
+
 ### `add-user`
 
-Reads lines from stdin into `./users.db`, creating it if needed. Each line is split on whitespace: the first word is the user name and the rest is the pass phrase.
+Reads lines from stdin into the users database, creating it if needed. Each line is split on whitespace: the first word is the user name and the rest is the pass phrase.
 
 - Pass phrases are normalized: all whitespace is removed and the phrase is lower-cased. `Open Sesame` and `opensesame` are the same phrase.
 - The database stores the hex SHA-512 of the normalized phrase, not the phrase itself.
@@ -40,22 +65,13 @@ Reads lines from stdin into `./users.db`, creating it if needed. Each line is sp
 
 ### `serve`
 
-Runs the proxy, using `./users.db` from the current directory. It exits with an error if the database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `UPSTREAM` | `http://127.0.0.1:3000` | Protected server (must be `http://`). |
-| `LISTEN_ADDR` | `127.0.0.1:8080` | Address web-safe-block listens on. |
-| `SESSION_TTL_SECS` | `604800` (7 days) | Session lifetime. |
-| `COOKIE_SECURE` | `true` | Set to `false`/`0` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
-| `MONITOR_ADDR` | `127.0.0.1:8081` | Local monitor port. Must be a loopback address. |
-| `MONITOR_QUEUE_LEN` | `1000` | How many unreported events are kept. |
+Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
 
 Visit `/__wsb/logout` to end a session.
 
 ### Monitor port
 
-`serve` also listens on `MONITOR_ADDR` (loopback only) and reports every request to the public port as one JSON object per line:
+`serve` also listens on `monitor_addr` (loopback only) and reports every request to the public port as one JSON object per line:
 
 ```sh
 $ nc 127.0.0.1 8081
@@ -80,7 +96,7 @@ $ nc 127.0.0.1 8081
 
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
 - The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped.
-- Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP), with a 1s delay on each failure. Because `CF-Connecting-IP` is trusted, don't expose `LISTEN_ADDR` anywhere except to the tunnel.
+- Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP), with a 1s delay on each failure. Because `CF-Connecting-IP` is trusted, don't expose `listen_addr` anywhere except to the tunnel.
 - Sessions live in memory and are lost on restart.
 - Pass phrases are stored as unsalted SHA-512 hashes (lookup is by phrase alone, so a per-user salt isn't possible). This keeps phrases out of plain view if `users.db` leaks, but short or common phrases can still be brute-forced, so use long phrases and keep `users.db` private.
 - WebSockets are not supported in v1.

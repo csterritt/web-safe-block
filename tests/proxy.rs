@@ -475,9 +475,43 @@ fn serve_fails_with(dir: &PathBuf, needle: &str) {
     assert!(stderr.contains("add-user"), "stderr: {stderr}");
 }
 
+/// Fresh temp dir with a default ./config.toml written by `write-config`.
+fn config_dir() -> PathBuf {
+    let dir = temp_dir();
+    let out = bin()
+        .arg("write-config")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    dir
+}
+
+fn edit_config(path: &PathBuf, key: &str, line: &str) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let text: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            if l.starts_with(&format!("{key} =")) {
+                line
+            } else {
+                l
+            }
+        })
+        .collect();
+    std::fs::write(path, text.join("\n")).unwrap();
+}
+
 #[test]
 fn cli_usage() {
-    for args in [&[][..], &["bogus"][..], &["serve", "extra"][..]] {
+    for args in [
+        &[][..],
+        &["bogus"][..],
+        &["serve", "extra"][..],
+        &["-c"][..],
+        &["serve", "-c"][..],
+        &["-c", "x.toml"][..],
+    ] {
         let out = bin().args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
@@ -485,8 +519,85 @@ fn cli_usage() {
 }
 
 #[test]
-fn cli_serve_requires_users() {
+fn cli_requires_config() {
     let dir = temp_dir();
+    for cmd in ["serve", "add-user"] {
+        let out = bin().arg(cmd).current_dir(&dir).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("config file config.toml not found"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("web-safe-block write-config"), "{stderr}");
+    }
+    assert!(!dir.join(users::DB_FILE).exists());
+
+    // A config missing a setting is rejected, naming the setting.
+    let out = bin()
+        .arg("write-config")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    edit_config(&dir.join("config.toml"), "upstream", "");
+    let out = bin().arg("serve").current_dir(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("upstream"), "{stderr}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_write_config_and_c_flag() {
+    let dir = temp_dir();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let write = || {
+        bin()
+            .args(["-c", "sub/my.toml", "write-config"])
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    assert!(write().status.success());
+    let written = std::fs::read_to_string(dir.join("sub/my.toml")).unwrap();
+    assert_eq!(written, web_safe_block::settings::DEFAULT_CONFIG);
+    assert!(!dir.join("config.toml").exists());
+
+    // Refuses to overwrite.
+    std::fs::write(dir.join("sub/my.toml"), format!("{written}# mine\n")).unwrap();
+    let out = write();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    assert!(
+        std::fs::read_to_string(dir.join("sub/my.toml"))
+            .unwrap()
+            .ends_with("# mine\n")
+    );
+
+    // users_db is relative to the config file's directory.
+    let mut child = bin()
+        .args(["add-user", "-c", "sub/my.toml"])
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"alice hunter2\n")
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert!(dir.join("sub").join(users::DB_FILE).exists());
+    assert!(!dir.join(users::DB_FILE).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_serve_requires_users() {
+    let dir = config_dir();
     serve_fails_with(&dir, "no users database");
     // add-user with only bad/blank lines creates the db but adds nobody
     let out = run_add_user(&dir, "\nnophrase\n");
@@ -498,18 +609,18 @@ fn cli_serve_requires_users() {
 
 #[test]
 fn cli_monitor_must_be_loopback() {
-    let dir = temp_dir();
+    let dir = config_dir();
     assert!(run_add_user(&dir, "alice hunter2\n").status.success());
-    let out = bin()
-        .arg("serve")
-        .current_dir(&dir)
-        .env("MONITOR_ADDR", "0.0.0.0:0")
-        .output()
-        .unwrap();
+    edit_config(
+        &dir.join("config.toml"),
+        "monitor_addr",
+        "monitor_addr = \"0.0.0.0:0\"",
+    );
+    let out = bin().arg("serve").current_dir(&dir).output().unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("MONITOR_ADDR must be a loopback"),
+        stderr.contains("monitor_addr must be a loopback"),
         "{stderr}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -517,7 +628,7 @@ fn cli_monitor_must_be_loopback() {
 
 #[test]
 fn cli_add_user() {
-    let dir = temp_dir();
+    let dir = config_dir();
     let out = run_add_user(&dir, "alice Open Sesame\nadmin-bob  Big Secret\n");
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("added 2 user(s), skipped 0"));
