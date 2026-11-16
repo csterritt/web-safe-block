@@ -1,4 +1,7 @@
+use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -10,6 +13,7 @@ use axum::response::{AppendHeaders, IntoResponse};
 use axum::routing::any;
 use tokio::net::TcpListener;
 use web_safe_block::Config;
+use web_safe_block::users::{self, UserStore};
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -52,9 +56,33 @@ async fn spawn_upstream(hits: Arc<AtomicUsize>) -> String {
     format!("http://{addr}")
 }
 
+/// Fresh empty directory under the system temp dir.
+fn temp_dir() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "wsb-it-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn user_store() -> UserStore {
+    let path = temp_dir().join(users::DB_FILE);
+    let conn = users::open_for_add(&path).unwrap();
+    users::add_users(&conn, "alice hunter2\n".as_bytes(), &mut Vec::new()).unwrap();
+    UserStore::open(&path).unwrap()
+}
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_web-safe-block"))
+}
+
 async fn spawn_proxy(upstream: &str) -> SocketAddr {
     let config = Config {
-        pass_phrase: "hunter2".to_string(),
+        users: Arc::new(user_store()),
         upstream: upstream.parse().unwrap(),
         session_ttl: Duration::from_secs(600),
         cookie_secure: false,
@@ -110,7 +138,7 @@ async fn end_to_end() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=++hunter2++%0A&next=%2Ffoo%3Fx%3D1")
+        .body("phrase=++HUNTER+2++%0A&next=%2Ffoo%3Fx%3D1")
         .send()
         .await
         .unwrap();
@@ -233,17 +261,75 @@ async fn rate_limit() {
     assert_eq!(resp.status(), 303);
 }
 
+fn run_add_user(dir: &PathBuf, input: &str) -> std::process::Output {
+    let mut child = bin()
+        .arg("add-user")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn serve_fails_with(dir: &PathBuf, needle: &str) {
+    let out = bin().arg("serve").current_dir(dir).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(needle), "stderr: {stderr}");
+    assert!(stderr.contains("add-user"), "stderr: {stderr}");
+}
+
 #[test]
-fn missing_pass_phrase_exits() {
-    for value in [None, Some("   ")] {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_web-safe-block"));
-        cmd.env_remove("PASS_PHRASE");
-        if let Some(v) = value {
-            cmd.env("PASS_PHRASE", v);
-        }
-        let out = cmd.output().unwrap();
-        assert!(!out.status.success());
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("PASS_PHRASE"), "stderr: {stderr}");
+fn cli_usage() {
+    for args in [&[][..], &["bogus"][..], &["serve", "extra"][..]] {
+        let out = bin().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
     }
+}
+
+#[test]
+fn cli_serve_requires_users() {
+    let dir = temp_dir();
+    serve_fails_with(&dir, "no users database");
+    // add-user with only bad/blank lines creates the db but adds nobody
+    let out = run_add_user(&dir, "\nnophrase\n");
+    assert!(!out.status.success());
+    assert!(dir.join(users::DB_FILE).exists());
+    serve_fails_with(&dir, "has no users");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_add_user() {
+    let dir = temp_dir();
+    let out = run_add_user(&dir, "alice Open Sesame\nadmin-bob  Big Secret\n");
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("added 2 user(s), skipped 0"));
+
+    // second run: duplicate name and duplicate (normalized) phrase are skipped
+    let out = run_add_user(&dir, "alice other\ncarol OPENSESAME\ndave fine\n");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("user 'alice' already exists"), "{stderr}");
+    assert!(
+        stderr.contains("pass phrase for 'carol' is already in use"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("added 1 user(s), skipped 2"), "{stderr}");
+
+    let store = UserStore::open(&dir.join(users::DB_FILE)).unwrap();
+    assert!(store.lookup("big secret").unwrap().is_admin);
+    assert!(!store.lookup("open sesame").unwrap().is_admin);
+    assert_eq!(store.lookup("fine").unwrap().name, "dave");
+    assert!(store.lookup("other").is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

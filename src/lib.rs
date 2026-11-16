@@ -14,7 +14,9 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rand::Rng;
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
+
+pub mod users;
+use users::UserStore;
 
 pub const SESSION_COOKIE: &str = "wsb_session";
 pub const LOGIN_PATH: &str = "/__wsb/login";
@@ -26,8 +28,8 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Config {
-    /// The pass phrase. Compared as-is (not trimmed) against the trimmed input.
-    pub pass_phrase: String,
+    /// Users that may log in, looked up by normalized pass phrase.
+    pub users: Arc<UserStore>,
     /// Upstream base URI (http scheme + host + optional port).
     pub upstream: Uri,
     pub session_ttl: Duration,
@@ -39,12 +41,7 @@ pub struct Config {
 
 impl Config {
     /// Load config from environment. Returns Err(message) on invalid config.
-    pub fn from_env() -> Result<Self, String> {
-        let pass_phrase =
-            std::env::var("PASS_PHRASE").map_err(|_| "PASS_PHRASE is not set".to_string())?;
-        if pass_phrase.trim().is_empty() {
-            return Err("PASS_PHRASE is empty or whitespace-only".to_string());
-        }
+    pub fn from_env(users: UserStore) -> Result<Self, String> {
         let upstream_raw =
             std::env::var("UPSTREAM").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
         let upstream: Uri = upstream_raw
@@ -64,7 +61,7 @@ impl Config {
         let cookie_secure =
             !matches!(std::env::var("COOKIE_SECURE"), Ok(v) if v == "false" || v == "0");
         Ok(Config {
-            pass_phrase,
+            users: Arc::new(users),
             upstream,
             session_ttl: Duration::from_secs(session_ttl_secs),
             cookie_secure,
@@ -340,13 +337,8 @@ async fn login(
             login_page(Some("Too many attempts, try again later."), &next),
         );
     }
-    let ok = form
-        .phrase
-        .trim()
-        .as_bytes()
-        .ct_eq(state.config.pass_phrase.as_bytes())
-        .into();
-    if ok {
+    if let Some(user) = state.config.users.lookup(&form.phrase) {
+        println!("web-safe-block: user '{}' logged in", user.name);
         let token = new_token();
         state
             .sessions
