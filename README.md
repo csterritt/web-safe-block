@@ -48,8 +48,33 @@ Runs the proxy, using `./users.db` from the current directory. It exits with an 
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Address web-safe-block listens on. |
 | `SESSION_TTL_SECS` | `604800` (7 days) | Session lifetime. |
 | `COOKIE_SECURE` | `true` | Set to `false`/`0` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
+| `MONITOR_ADDR` | `127.0.0.1:8081` | Local monitor port. Must be a loopback address. |
+| `MONITOR_QUEUE_LEN` | `1000` | How many unreported events are kept. |
 
 Visit `/__wsb/logout` to end a session.
+
+### Monitor port
+
+`serve` also listens on `MONITOR_ADDR` (loopback only) and reports every request to the public port as one JSON object per line:
+
+```sh
+$ nc 127.0.0.1 8081
+{"seq":4,"time":"2026-11-16T18:40:01Z","kind":"login_succeeded","status":303,"ip":"203.0.113.9","method":"POST","path":"/__wsb/login","user":"chris","user_agent":"Mozilla/5.0 ..."}
+```
+
+- `kind` is one of:
+  - `login_page`: unauthenticated request, shown the form.
+  - `login_failed`, `login_succeeded`, `rate_limited`, `logout`.
+  - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502.
+  - `reserved`: an unknown `/__wsb/` path.
+  - `other`: e.g. wrong method or a malformed form.
+- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied` and `logout`.
+- The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor and marks them consumed only after they have been written.
+- When the queue is full, the oldest events are overwritten.
+  - With no monitor connected this happens silently. A monitor that connects later first receives whatever is still queued.
+  - If events are overwritten before a connected monitor gets them, it receives `{"kind":"dropped","count":N}`.
+- Only one monitor can be connected at a time. Another connection gets `{"error":"another monitor is already connected"}` and is closed.
+- If the monitor client stops sending (e.g. `nc 127.0.0.1 8081 < /dev/null`), it gets a `{"kind":"heartbeat",...}` line every 10s while idle; this is how the server finds out when it has gone away.
 
 ## Security notes
 

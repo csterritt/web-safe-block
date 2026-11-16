@@ -7,6 +7,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Form, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header, uri::Scheme};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use hyper_util::client::legacy::Client;
@@ -15,7 +16,9 @@ use hyper_util::rt::TokioExecutor;
 use rand::Rng;
 use serde::Deserialize;
 
+pub mod monitor;
 pub mod users;
+use monitor::{Event, EventKind, EventQueue, Outcome};
 use users::UserStore;
 
 pub const SESSION_COOKIE: &str = "wsb_session";
@@ -73,31 +76,85 @@ impl Config {
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
-    sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
     failures: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    events: Arc<EventQueue>,
     client: Client<HttpConnector, Body>,
 }
 
+struct Session {
+    expires: Instant,
+    user: String,
+}
+
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, events: Arc<EventQueue>) -> Self {
         let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         AppState {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             failures: Arc::new(Mutex::new(HashMap::new())),
+            events,
             client,
         }
     }
 }
 
-pub fn build_router(config: Config) -> Router {
-    let state = AppState::new(config);
+/// Build the public-facing router. Every request is reported to `events`.
+pub fn build_router(config: Config, events: Arc<EventQueue>) -> Router {
+    let state = AppState::new(config, events);
     spawn_purger(state.clone());
     Router::new()
         .route(LOGIN_PATH, post(login))
         .route(LOGOUT_PATH, any(logout))
         .fallback(proxy_or_login)
+        .layer(middleware::from_fn_with_state(state.clone(), record_event))
         .with_state(state)
+}
+
+/// Push one event per request, using the `Outcome` the handler attached.
+async fn record_event(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let ip = client_key(req.headers(), peer);
+    let method = req.method().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |pq| pq.as_str())
+        .to_string();
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut resp = next.run(req).await;
+    let outcome = resp
+        .extensions_mut()
+        .remove::<Outcome>()
+        .unwrap_or(Outcome {
+            kind: EventKind::Other,
+            user: None,
+        });
+    state.events.push(Event {
+        seq: 0,
+        time: String::new(),
+        kind: outcome.kind,
+        status: resp.status().as_u16(),
+        ip,
+        method,
+        path,
+        user: outcome.user,
+        user_agent,
+    });
+    resp
+}
+
+fn with_outcome(mut resp: Response, kind: EventKind, user: Option<String>) -> Response {
+    resp.extensions_mut().insert(Outcome { kind, user });
+    resp
 }
 
 fn spawn_purger(state: AppState) {
@@ -105,7 +162,11 @@ fn spawn_purger(state: AppState) {
         loop {
             tokio::time::sleep(PURGE_INTERVAL).await;
             let now = Instant::now();
-            state.sessions.lock().unwrap().retain(|_, exp| *exp > now);
+            state
+                .sessions
+                .lock()
+                .unwrap()
+                .retain(|_, s| s.expires > now);
             state.failures.lock().unwrap().retain(|_, v| {
                 v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
                 !v.is_empty()
@@ -238,6 +299,7 @@ fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The user name of a valid, unexpired session, if the request has one.
 fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = parse_cookies(headers)
         .into_iter()
@@ -245,7 +307,7 @@ fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
         .1;
     let mut sessions = state.sessions.lock().unwrap();
     match sessions.get(&token) {
-        Some(exp) if *exp > Instant::now() => Some(token),
+        Some(s) if s.expires > Instant::now() => Some(s.user.clone()),
         Some(_) => {
             sessions.remove(&token);
             None
@@ -332,19 +394,25 @@ async fn login(
     let key = client_key(&headers, Some(peer));
     let next = sanitize_next(&form.next);
     if rate_limited(&state, &key) {
-        return html_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            login_page(Some("Too many attempts, try again later."), &next),
+        return with_outcome(
+            html_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                login_page(Some("Too many attempts, try again later."), &next),
+            ),
+            EventKind::RateLimited,
+            None,
         );
     }
     if let Some(user) = state.config.users.lookup(&form.phrase) {
         println!("web-safe-block: user '{}' logged in", user.name);
         let token = new_token();
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), Instant::now() + state.config.session_ttl);
+        state.sessions.lock().unwrap().insert(
+            token.clone(),
+            Session {
+                expires: Instant::now() + state.config.session_ttl,
+                user: user.name.clone(),
+            },
+        );
         clear_failures(&state, &key);
         let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
         let h = resp.headers_mut();
@@ -358,25 +426,27 @@ async fn login(
             ))
             .unwrap(),
         );
-        resp
+        with_outcome(resp, EventKind::LoginSucceeded, Some(user.name))
     } else {
         record_failure(&state, &key);
         tokio::time::sleep(state.config.fail_delay).await;
-        html_response(
-            StatusCode::UNAUTHORIZED,
-            login_page(Some("Incorrect phrase."), &next),
+        with_outcome(
+            html_response(
+                StatusCode::UNAUTHORIZED,
+                login_page(Some("Incorrect phrase."), &next),
+            ),
+            EventKind::LoginFailed,
+            None,
         )
     }
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(token) = parse_cookies(&headers)
+    let user = parse_cookies(&headers)
         .into_iter()
         .find(|(n, _)| n == SESSION_COOKIE)
-        .map(|(_, v)| v)
-    {
-        state.sessions.lock().unwrap().remove(&token);
-    }
+        .and_then(|(_, token)| state.sessions.lock().unwrap().remove(&token))
+        .map(|s| s.user);
     let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
     let h = resp.headers_mut();
     h.insert(header::LOCATION, HeaderValue::from_static("/"));
@@ -384,31 +454,40 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         header::SET_COOKIE,
         HeaderValue::from_str(&clear_cookie_header(state.config.cookie_secure)).unwrap(),
     );
-    resp
+    with_outcome(resp, EventKind::Logout, user)
 }
 
 async fn proxy_or_login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    mut req: Request,
+    req: Request,
 ) -> Response {
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/")
-        .to_string();
-
     // Reserved namespace: never forward /__wsb/* upstream.
     if req.uri().path().starts_with("/__wsb/") {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        return with_outcome(
+            (StatusCode::NOT_FOUND, "Not Found").into_response(),
+            EventKind::Reserved,
+            None,
+        );
     }
 
-    if valid_session(&state, req.headers()).is_none() {
-        let next = sanitize_next(&path_and_query);
-        return html_response(StatusCode::UNAUTHORIZED, login_page(None, &next));
-    }
+    let Some(user) = valid_session(&state, req.headers()) else {
+        let next = sanitize_next(req.uri().path_and_query().map_or("/", |pq| pq.as_str()));
+        return with_outcome(
+            html_response(StatusCode::UNAUTHORIZED, login_page(None, &next)),
+            EventKind::LoginPage,
+            None,
+        );
+    };
 
+    with_outcome(
+        forward(&state, peer, req).await,
+        EventKind::Proxied,
+        Some(user),
+    )
+}
+
+async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Response {
     let upstream = &state.config.upstream;
     let mut parts = req.uri().clone().into_parts();
     parts.scheme = upstream.scheme().cloned();

@@ -1,15 +1,17 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
+use web_safe_block::monitor::{self, EventQueue};
 use web_safe_block::users::{self, DB_FILE, UserStore};
 
 const USAGE: &str = "usage: web-safe-block <command>
 
 commands:
   add-user   read 'user-name pass phrase words...' lines from stdin into ./users.db
-  serve      run the proxy (users from ./users.db)";
+  serve      run the proxy (users from ./users.db) and the local monitor port";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -59,6 +61,26 @@ fn serve() -> ExitCode {
         Ok(a) => a,
         Err(_) => return fail("LISTEN_ADDR is not a valid socket address"),
     };
+    let monitor_addr: SocketAddr = match std::env::var("MONITOR_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8081".to_string())
+        .parse::<SocketAddr>()
+    {
+        Ok(a) if a.ip().is_loopback() => a,
+        Ok(a) => return fail(format!("MONITOR_ADDR must be a loopback address, got {a}")),
+        Err(_) => return fail("MONITOR_ADDR is not a valid socket address"),
+    };
+    let queue_len = match std::env::var("MONITOR_QUEUE_LEN").map(|s| s.parse::<usize>()) {
+        Err(_) => 1000,
+        Ok(Ok(n)) if n > 0 => n,
+        Ok(_) => return fail("MONITOR_QUEUE_LEN must be a positive integer"),
+    };
+    let monitor_listener = match std::net::TcpListener::bind(monitor_addr) {
+        Ok(l) => l,
+        Err(e) => return fail(format!("failed to bind monitor {monitor_addr}: {e}")),
+    };
+    let events = Arc::new(EventQueue::new(queue_len));
+    monitor::spawn_monitor(monitor_listener, events.clone());
+    println!("web-safe-block: monitor on {monitor_addr} (queue {queue_len} events)");
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => return fail(format!("cannot start runtime: {e}")),
@@ -75,7 +97,7 @@ fn serve() -> ExitCode {
             Err(e) => return fail(format!("failed to bind {listen}: {e}")),
         };
         let service: IntoMakeServiceWithConnectInfo<_, SocketAddr> =
-            web_safe_block::build_router(config).into_make_service_with_connect_info();
+            web_safe_block::build_router(config, events).into_make_service_with_connect_info();
         match axum::serve(listener, service).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("server error: {e}")),
