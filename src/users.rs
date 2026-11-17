@@ -61,6 +61,27 @@ pub fn open_for_add(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Open an existing database read-write for `remove-user`.
+pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
+    if !path.exists() {
+        return Err(format!(
+            "no users database at {}; add users with: web-safe-block add-user < users.txt",
+            path.display()
+        ));
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
+        .map_err(|_| format!("{} does not contain a users table", path.display()))?;
+    Ok(conn)
+}
+
+/// Remove the user `name`; returns whether a row was deleted.
+pub fn remove_user(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.execute("DELETE FROM users WHERE user_name = ?1", [name])
+        .map(|removed| removed > 0)
+}
+
 /// Read `user-name pass phrase words...` lines and insert them. Bad lines are
 /// reported to `err` and skipped. Returns (added, skipped).
 pub fn add_users(
@@ -255,6 +276,28 @@ mod tests {
         assert!(!rows[0].2);
         assert_eq!(rows[1].0, "SuperAdmin");
         assert!(rows[1].2);
+    }
+
+    #[test]
+    fn remove_user_cases() {
+        let conn = mem_db();
+        add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\nbob Another Fine Phrase 77!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(remove_user(&conn, "alice").unwrap());
+        assert!(!remove_user(&conn, "alice").unwrap());
+        assert!(!remove_user(&conn, "carol").unwrap());
+        let names: Vec<String> = conn
+            .prepare("SELECT user_name FROM users")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["bob"]);
     }
 
     #[test]

@@ -8,24 +8,26 @@ use web_safe_block::monitor::{self, EventQueue};
 use web_safe_block::settings::{self, CONFIG_FILE, Settings};
 use web_safe_block::users::{self, UserStore};
 
-const USAGE: &str = "usage: web-safe-block [-c path-to-config] <command>
+const USAGE: &str = "usage: web-safe-block [-c path-to-config] <command> [name]
 
 commands:
-  write-config  write a config file with default values (refuses to overwrite)
-  add-user      read 'user-name pass phrase words...' lines from stdin into the users database
-  serve         run the proxy and the local monitor port
+  write-config      write a config file with default values (refuses to overwrite)
+  add-user          read 'user-name pass phrase words...' lines from stdin into the users database
+  remove-user NAME  remove NAME from the users database
+  serve             run the proxy and the local monitor port
 
 The config file defaults to ./config.toml.";
 
 fn main() -> ExitCode {
-    let Some((config_path, command)) = parse_args(std::env::args().skip(1)) else {
+    let Some((config_path, command, name)) = parse_args(std::env::args().skip(1)) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match command.as_str() {
-        "write-config" => write_config(&config_path),
-        "add-user" => with_settings(&config_path, add_user),
-        "serve" => with_settings(&config_path, serve),
+    match (command.as_str(), name.as_deref()) {
+        ("write-config", None) => write_config(&config_path),
+        ("add-user", None) => with_settings(&config_path, add_user),
+        ("remove-user", Some(name)) => with_settings(&config_path, |s| remove_user(s, name)),
+        ("serve", None) => with_settings(&config_path, serve),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -33,22 +35,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// Accepts exactly one command plus an optional `-c path` anywhere.
-fn parse_args(args: impl Iterator<Item = String>) -> Option<(PathBuf, String)> {
-    let (mut config, mut command) = (None, None);
+/// Accepts a command, at most one positional argument, and `-c path` anywhere.
+fn parse_args(args: impl Iterator<Item = String>) -> Option<(PathBuf, String, Option<String>)> {
+    let (mut config, mut positional) = (None, Vec::new());
     let mut args = args;
     while let Some(arg) = args.next() {
         if arg == "-c" {
             if config.replace(PathBuf::from(args.next()?)).is_some() {
                 return None;
             }
-        } else if command.replace(arg).is_some() {
-            return None;
+        } else {
+            positional.push(arg);
         }
     }
+    if positional.len() > 2 {
+        return None;
+    }
+    let mut positional = positional.into_iter();
     Some((
         config.unwrap_or_else(|| PathBuf::from(CONFIG_FILE)),
-        command?,
+        positional.next()?,
+        positional.next(),
     ))
 }
 
@@ -57,7 +64,7 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn with_settings(path: &Path, run: fn(Settings) -> ExitCode) -> ExitCode {
+fn with_settings(path: &Path, run: impl FnOnce(Settings) -> ExitCode) -> ExitCode {
     match settings::load(path) {
         Ok(s) => run(s),
         Err(e) => fail(e),
@@ -89,6 +96,22 @@ fn add_user(settings: Settings) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        Err(e) => fail(format!("database error: {e}")),
+    }
+}
+
+fn remove_user(settings: Settings, name: &str) -> ExitCode {
+    let db = &settings.users_db;
+    let conn = match users::open_for_remove(db) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    match users::remove_user(&conn, name) {
+        Ok(true) => {
+            eprintln!("web-safe-block: removed user '{name}'");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => fail(format!("no user named '{name}'")),
         Err(e) => fail(format!("database error: {e}")),
     }
 }
@@ -139,24 +162,37 @@ fn serve(settings: Settings) -> ExitCode {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Option<(PathBuf, String)> {
+    fn parse(args: &[&str]) -> Option<(PathBuf, String, Option<String>)> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
     #[test]
     fn parse_args_cases() {
-        let ok = |p: &str, c: &str| Some((PathBuf::from(p), c.to_string()));
-        assert_eq!(parse(&["serve"]), ok("config.toml", "serve"));
-        assert_eq!(parse(&["-c", "x.toml", "serve"]), ok("x.toml", "serve"));
+        let ok = |p: &str, c: &str, n: Option<&str>| {
+            Some((PathBuf::from(p), c.to_string(), n.map(str::to_string)))
+        };
+        assert_eq!(parse(&["serve"]), ok("config.toml", "serve", None));
+        assert_eq!(
+            parse(&["-c", "x.toml", "serve"]),
+            ok("x.toml", "serve", None)
+        );
         assert_eq!(
             parse(&["add-user", "-c", "/a/b.toml"]),
-            ok("/a/b.toml", "add-user")
+            ok("/a/b.toml", "add-user", None)
+        );
+        assert_eq!(
+            parse(&["remove-user", "bob"]),
+            ok("config.toml", "remove-user", Some("bob"))
+        );
+        assert_eq!(
+            parse(&["remove-user", "-c", "/a/b.toml", "bob"]),
+            ok("/a/b.toml", "remove-user", Some("bob"))
         );
         assert_eq!(parse(&[]), None);
         assert_eq!(parse(&["-c"]), None);
         assert_eq!(parse(&["serve", "-c"]), None);
         assert_eq!(parse(&["-c", "x.toml"]), None);
         assert_eq!(parse(&["-c", "a", "-c", "b", "serve"]), None);
-        assert_eq!(parse(&["serve", "extra"]), None);
+        assert_eq!(parse(&["a", "b", "c"]), None);
     }
 }

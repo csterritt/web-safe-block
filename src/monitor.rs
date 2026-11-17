@@ -38,6 +38,8 @@ pub enum EventKind {
     Forbidden,
     /// Authenticated request forwarded upstream.
     Proxied,
+    /// Authenticated request asked for a protocol upgrade; refused with 501.
+    Upgrade,
     /// Request for an unknown path under `/__wsb/`.
     Reserved,
     /// Anything else, e.g. wrong method or malformed login form.

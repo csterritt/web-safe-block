@@ -898,3 +898,86 @@ fn cli_add_user() {
     assert!(store.lookup("another good phrase 77!").unwrap().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn cli_remove_user() {
+    let dir = config_dir();
+    let out = run_add_user(
+        &dir,
+        "alice Correct-Horse-Battery-42\nadmin-bob Big Secret Phrase Number 99!\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+
+    // Missing name -> usage error; unknown name -> failure.
+    let out = bin().arg("remove-user").current_dir(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let out = bin()
+        .args(["remove-user", "carol"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no user named 'carol'"), "{stderr}");
+
+    // Removing alice leaves bob; alice's phrase no longer resolves.
+    let out = bin()
+        .args(["remove-user", "alice"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("removed user 'alice'"));
+    let store = UserStore::open(&dir.join(users::DB_FILE)).unwrap();
+    assert!(store.lookup("correct-horse-battery-42").unwrap().is_none());
+    assert!(
+        store
+            .lookup("big secret phrase number 99!")
+            .unwrap()
+            .is_some()
+    );
+
+    // Removing the last user leaves a database `serve` refuses.
+    let out = bin()
+        .args(["remove-user", "admin-bob"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    serve_fails_with(&dir, "has no users");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_requests_get_501() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits.clone()).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    let cookie = set_cookie_values(&resp)[0]
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Authenticated upgrade attempt -> 501, nothing forwarded upstream.
+    let resp = client
+        .get(format!("{base}/ws"))
+        .header(header::COOKIE, cookie)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "upgrade")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
