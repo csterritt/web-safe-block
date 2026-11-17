@@ -12,9 +12,9 @@ use axum::http::header;
 use axum::response::{AppendHeaders, IntoResponse};
 use axum::routing::any;
 use tokio::net::TcpListener;
-use web_safe_block::Config;
 use web_safe_block::monitor::{self, EventQueue};
 use web_safe_block::users::{self, UserStore};
+use web_safe_block::{Config, Limits};
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -73,7 +73,12 @@ fn temp_dir() -> PathBuf {
 fn user_store() -> UserStore {
     let path = temp_dir().join(users::DB_FILE);
     let conn = users::open_for_add(&path).unwrap();
-    users::add_users(&conn, "alice hunter2\n".as_bytes(), &mut Vec::new()).unwrap();
+    users::add_users(
+        &conn,
+        "alice Correct-Horse-Battery-42\n".as_bytes(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     UserStore::open(&path).unwrap()
 }
 
@@ -87,6 +92,15 @@ async fn spawn_proxy(upstream: &str) -> SocketAddr {
 
 /// Start the proxy plus a monitor thread; returns (proxy addr, monitor addr).
 async fn spawn_proxy_with_monitor(upstream: &str, queue_len: usize) -> (SocketAddr, SocketAddr) {
+    spawn_proxy_full(upstream, queue_len, Limits::default()).await
+}
+
+/// Start the proxy with custom limits; returns (proxy addr, monitor addr).
+async fn spawn_proxy_full(
+    upstream: &str,
+    queue_len: usize,
+    limits: Limits,
+) -> (SocketAddr, SocketAddr) {
     let events = Arc::new(EventQueue::new(queue_len));
     let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let monitor_addr = monitor_listener.local_addr().unwrap();
@@ -97,6 +111,7 @@ async fn spawn_proxy_with_monitor(upstream: &str, queue_len: usize) -> (SocketAd
         session_ttl: Duration::from_secs(600),
         cookie_secure: false,
         fail_delay: Duration::ZERO,
+        limits,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -228,7 +243,7 @@ async fn monitor_reports() {
 
     // Live events while connected.
     login("wrong").await.unwrap();
-    let resp = login("hunter2").await.unwrap();
+    let resp = login("Correct-Horse-Battery-42").await.unwrap();
     let cookie = set_cookie_values(&resp)[0]
         .split(';')
         .next()
@@ -267,6 +282,13 @@ async fn monitor_reports() {
     authed("/foo?x=1").await.unwrap();
     check("proxied", 200, "/foo?x=1", Some("alice"));
     authed("/__wsb/logout").await.unwrap();
+    check("logout_page", 200, "/__wsb/logout", Some("alice"));
+    client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, cookie.clone())
+        .send()
+        .await
+        .unwrap();
     check("logout", 303, "/__wsb/logout", Some("alice"));
     let get = |path: &str| client.get(format!("{base}{path}")).send();
     get("/__wsb/nope").await.unwrap();
@@ -281,7 +303,7 @@ async fn monitor_reports() {
     client.get(format!("{base}/after")).send().await.unwrap();
     let e = m.event();
     assert_eq!(e["path"], "/after", "{e}");
-    assert_eq!(e["seq"], 12);
+    assert_eq!(e["seq"], 13);
 }
 
 fn set_cookie_values(resp: &reqwest::Response) -> Vec<String> {
@@ -326,7 +348,7 @@ async fn end_to_end() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=++HUNTER+2++%0A&next=%2Ffoo%3Fx%3D1")
+        .body("phrase=++CORRECT-HORSE-BATTERY-42++%0A&next=%2Ffoo%3Fx%3D1")
         .send()
         .await
         .unwrap();
@@ -384,9 +406,25 @@ async fn end_to_end() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("name=\"phrase\""));
 
-    // f. logout -> 303 + Max-Age=0; token no longer works
+    // f. GET logout -> log-out form, session unchanged; POST logs out
     let resp = client
         .get(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Log out"), "body: {body}");
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
         .header(header::COOKIE, format!("wsb_session={token}"))
         .send()
         .await
@@ -429,7 +467,7 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", ip)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=hunter2&next=%2F")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -442,7 +480,187 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", "203.0.113.100")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=hunter2&next=%2F")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_is_atomic() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let mut handles = Vec::new();
+    for _ in 0..30 {
+        let (client, base) = (client.clone(), base.clone());
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/__wsb/login"))
+                .header("CF-Connecting-IP", "203.0.113.77")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body("phrase=wrong&next=%2F")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    let mut counts = (0, 0);
+    for h in handles {
+        match h.await.unwrap().as_u16() {
+            401 => counts.0 += 1,
+            429 => counts.1 += 1,
+            s => panic!("unexpected status {s}"),
+        }
+    }
+    assert_eq!(counts, (10, 20));
+}
+
+#[tokio::test]
+async fn per_user_session_cap() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let limits = Limits {
+        max_sessions_per_user: 2,
+        ..Limits::default()
+    };
+    let (proxy, _) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let mut tokens = Vec::new();
+    for _ in 0..3 {
+        let resp = client
+            .post(format!("{base}/__wsb/login"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("phrase=Correct-Horse-Battery-42&next=%2F")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 303);
+        let sc = set_cookie_values(&resp)[0].clone();
+        tokens.push(
+            sc.split(';')
+                .next()
+                .unwrap()
+                .strip_prefix("wsb_session=")
+                .unwrap()
+                .to_string(),
+        );
+    }
+    for (i, token) in tokens.iter().enumerate() {
+        let resp = client
+            .get(format!("{base}/foo"))
+            .header(header::COOKIE, format!("wsb_session={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            if i == 0 { 401 } else { 200 },
+            "{i}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_upstream_times_out() {
+    // Accept connections but never respond.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+    let limits = Limits {
+        upstream_response_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (proxy, _) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    let cookie = set_cookie_values(&resp)[0]
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+    assert_eq!(resp.text().await.unwrap(), "Gateway Timeout");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn cross_site_posts_rejected() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    // Log in to get a session.
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    let cookie = set_cookie_values(&resp)[0]
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Cross-site POST logout: 403, session untouched.
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, cookie.clone())
+        .header("sec-fetch-site", "cross-site")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, cookie.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Cross-site POST login via Origin mismatch: 403.
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("origin", "http://evil.example")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.text().await.unwrap(), "Forbidden");
+
+    // Same-site POST logout still works.
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, cookie.clone())
+        .header("sec-fetch-site", "same-origin")
         .send()
         .await
         .unwrap();
@@ -587,7 +805,7 @@ fn cli_write_config_and_c_flag() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"alice hunter2\n")
+        .write_all(b"alice Correct-Horse-Battery-42\n")
         .unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
     assert!(dir.join("sub").join(users::DB_FILE).exists());
@@ -610,7 +828,11 @@ fn cli_serve_requires_users() {
 #[test]
 fn cli_monitor_must_be_loopback() {
     let dir = config_dir();
-    assert!(run_add_user(&dir, "alice hunter2\n").status.success());
+    assert!(
+        run_add_user(&dir, "alice Correct-Horse-Battery-42\n")
+            .status
+            .success()
+    );
     edit_config(
         &dir.join("config.toml"),
         "monitor_addr",
@@ -629,12 +851,18 @@ fn cli_monitor_must_be_loopback() {
 #[test]
 fn cli_add_user() {
     let dir = config_dir();
-    let out = run_add_user(&dir, "alice Open Sesame\nadmin-bob  Big Secret\n");
+    let out = run_add_user(
+        &dir,
+        "alice Open Sesame Number Forty 4!\nadmin-bob  Big Secret Phrase Number 99!\n",
+    );
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("added 2 user(s), skipped 0"));
 
     // second run: duplicate name and duplicate (normalized) phrase are skipped
-    let out = run_add_user(&dir, "alice other\ncarol OPENSESAME\ndave fine\n");
+    let out = run_add_user(
+        &dir,
+        "alice Another Good Phrase 77!\ncarol OPENSESAME NUMBER FORTY 4!\ndave Fine But Good Enough 88!\n",
+    );
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("user 'alice' already exists"), "{stderr}");
@@ -645,9 +873,28 @@ fn cli_add_user() {
     assert!(stderr.contains("added 1 user(s), skipped 2"), "{stderr}");
 
     let store = UserStore::open(&dir.join(users::DB_FILE)).unwrap();
-    assert!(store.lookup("big secret").unwrap().is_admin);
-    assert!(!store.lookup("open sesame").unwrap().is_admin);
-    assert_eq!(store.lookup("fine").unwrap().name, "dave");
-    assert!(store.lookup("other").is_none());
+    assert!(
+        store
+            .lookup("big secret phrase number 99!")
+            .unwrap()
+            .unwrap()
+            .is_admin
+    );
+    assert!(
+        !store
+            .lookup("open sesame number forty 4!")
+            .unwrap()
+            .unwrap()
+            .is_admin
+    );
+    assert_eq!(
+        store
+            .lookup("fine but good enough 88!")
+            .unwrap()
+            .unwrap()
+            .name,
+        "dave"
+    );
+    assert!(store.lookup("another good phrase 77!").unwrap().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }

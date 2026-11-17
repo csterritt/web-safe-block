@@ -19,7 +19,7 @@ users_db = "users.db"
 # Public-facing address (point Cloudflare Tunnel here).
 listen_addr = "127.0.0.1:8080"
 
-# Protected server; must be http://.
+# Protected server; must be http:// with no path.
 upstream = "http://127.0.0.1:3000"
 
 # Session lifetime in seconds (7 days).
@@ -93,6 +93,12 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if upstream.scheme() != Some(&Scheme::HTTP) || upstream.authority().is_none() {
         return Err(bad(format!(
             "upstream must be an http:// URI with a host: {:?}",
+            raw.upstream
+        )));
+    }
+    if upstream.path_and_query().is_some_and(|pq| pq != "/") {
+        return Err(bad(format!(
+            "upstream must not have a path or query: {:?}",
             raw.upstream
         )));
     }
@@ -224,6 +230,16 @@ mod tests {
             ("upstream", "upstream = \"https://x\"", "http://"),
             ("upstream", "upstream = \"not a uri\"", "upstream"),
             (
+                "upstream",
+                "upstream = \"http://x/app\"",
+                "must not have a path or query",
+            ),
+            (
+                "upstream",
+                "upstream = \"http://x?a=1\"",
+                "must not have a path or query",
+            ),
+            (
                 "monitor_addr",
                 "monitor_addr = \"0.0.0.0:8081\"",
                 "loopback",
@@ -244,6 +260,16 @@ mod tests {
             let err = load_str(&replace(key, line)).unwrap_err();
             assert!(err.contains(needle), "{line}: {err}");
         }
+    }
+
+    #[test]
+    fn upstream_root_slash_ok() {
+        let s = load_str(&replace(
+            "upstream",
+            "upstream = \"http://127.0.0.1:3000/\"",
+        ))
+        .unwrap();
+        assert_eq!(s.upstream, "http://127.0.0.1:3000/");
     }
 
     #[test]

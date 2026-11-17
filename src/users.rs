@@ -21,6 +21,31 @@ pub fn normalize_phrase(s: &str) -> String {
         .collect()
 }
 
+pub const MIN_PHRASE_CHARS: usize = 20;
+
+/// Problems with a pass phrase under the policy, or None if it is acceptable.
+pub fn phrase_problem(phrase: &str) -> Option<String> {
+    let chars: Vec<char> = phrase.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut problems = Vec::new();
+    if chars.len() < MIN_PHRASE_CHARS {
+        problems.push(format!(
+            "at least {MIN_PHRASE_CHARS} non-whitespace characters (has {})",
+            chars.len()
+        ));
+    }
+    if !chars.iter().any(|c| c.is_ascii_digit()) {
+        problems.push("a number".to_string());
+    }
+    if !chars.iter().any(|c| c.is_ascii_punctuation()) {
+        problems.push("a punctuation character".to_string());
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(format!("is too weak: needs {}", problems.join(", ")))
+    }
+}
+
 /// Hex SHA-512 of the normalized phrase; this is what is stored in the database.
 pub fn hash_phrase(s: &str) -> String {
     Sha512::digest(normalize_phrase(s).as_bytes())
@@ -59,6 +84,8 @@ pub fn add_users(
         let phrase: String = words.collect();
         let problem = if phrase.is_empty() {
             Some(format!("user '{name}' has no pass phrase"))
+        } else if let Some(p) = phrase_problem(&phrase) {
+            Some(format!("pass phrase for '{name}' {p}"))
         } else if exists(conn, "user_name", name)? {
             Some(format!("user '{name}' already exists"))
         } else if exists(conn, "pass_phrase", &hash_phrase(&phrase))? {
@@ -127,7 +154,7 @@ impl UserStore {
         })
     }
 
-    pub fn lookup(&self, phrase: &str) -> Option<User> {
+    pub fn lookup(&self, phrase: &str) -> rusqlite::Result<Option<User>> {
         self.conn
             .lock()
             .unwrap()
@@ -141,7 +168,7 @@ impl UserStore {
                     })
                 },
             )
-            .ok()
+            .optional()
     }
 }
 
@@ -169,22 +196,51 @@ mod tests {
     }
 
     #[test]
+    fn phrase_problem_cases() {
+        // Exactly 20 non-whitespace chars with digit and punctuation is fine.
+        assert_eq!(phrase_problem("abcd efgh ijkl mnop qr1!"), None);
+        // 19 is rejected.
+        let p = phrase_problem("abcdefghijklmnopqrs").unwrap();
+        assert!(
+            p.contains("at least 20 non-whitespace characters (has 19)"),
+            "{p}"
+        );
+        // Whitespace is not counted.
+        let p = phrase_problem("a b c d e f g h i j 1 !").unwrap();
+        assert!(p.contains("(has 12)"), "{p}");
+        // Missing digit.
+        let p = phrase_problem("abcdefghij!klmnopqrst").unwrap();
+        assert_eq!(p, "is too weak: needs a number");
+        // Missing punctuation.
+        let p = phrase_problem("abcdefghij1klmnopqrst").unwrap();
+        assert_eq!(p, "is too weak: needs a punctuation character");
+        // Several problems are listed together.
+        let p = phrase_problem("short").unwrap();
+        assert_eq!(
+            p,
+            "is too weak: needs at least 20 non-whitespace characters (has 5), a number, a punctuation character"
+        );
+    }
+
+    #[test]
     fn add_users_rules() {
         let conn = mem_db();
-        let input = "alice Open Sesame\n\
+        let input = "alice Correct Horse Battery Staple 42!\n\
                      \n\
-                     bob opensesame\n\
-                     alice something else\n\
+                     bob correct horse battery staple 42!\n\
+                     alice Another Valid Phrase 99!\n\
                      carol\n\
-                     SuperAdmin  admin  phrase\n";
+                     mallory weak\n\
+                     SuperAdmin  Very  Long  Admin  Pass  Phrase 9!\n";
         let mut err = Vec::new();
         let (added, skipped) = add_users(&conn, input.as_bytes(), &mut err).unwrap();
         let err = String::from_utf8(err).unwrap();
-        assert_eq!((added, skipped), (2, 3), "{err}");
+        assert_eq!((added, skipped), (2, 4), "{err}");
         assert!(err.contains("line 3: skipped: pass phrase for 'bob' is already in use"));
         assert!(err.contains("line 4: skipped: user 'alice' already exists"));
         assert!(err.contains("line 5: skipped: user 'carol' has no pass phrase"));
-        assert!(!err.to_lowercase().contains("sesame"));
+        assert!(err.contains("line 6: skipped: pass phrase for 'mallory' is too weak"));
+        assert!(!err.to_lowercase().contains("staple"));
 
         let rows: Vec<(String, String, bool)> = conn
             .prepare("SELECT user_name, pass_phrase, is_admin FROM users ORDER BY rowid")
@@ -195,7 +251,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "alice");
-        assert_eq!(rows[0].1, hash_phrase("opensesame"));
+        assert_eq!(rows[0].1, hash_phrase("correcthorsebatterystaple42!"));
         assert!(!rows[0].2);
         assert_eq!(rows[1].0, "SuperAdmin");
         assert!(rows[1].2);
@@ -211,18 +267,45 @@ mod tests {
         assert!(UserStore::open(&path).unwrap_err().contains("add-user"));
         let conn = open_for_add(&path).unwrap();
         assert!(UserStore::open(&path).unwrap_err().contains("no users"));
-        add_users(&conn, "admin1 Big Secret\n".as_bytes(), &mut Vec::new()).unwrap();
+        add_users(
+            &conn,
+            "admin1 Big Secret Phrase Number 99!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         drop(conn);
 
         let store = UserStore::open(&path).unwrap();
         assert_eq!(
-            store.lookup("  BIG secret "),
+            store.lookup("  BIG secret phrase number 99! ").unwrap(),
             Some(User {
                 name: "admin1".into(),
                 is_admin: true
             })
         );
-        assert_eq!(store.lookup("bigsecret!"), None);
+        assert_eq!(store.lookup("bigsecret!").unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lookup_reports_db_errors() {
+        let dir = std::env::temp_dir().join(format!("wsb-users-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+        let conn = open_for_add(&path).unwrap();
+        add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
+        let store = UserStore::open(&path).unwrap();
+        open_for_add(&path)
+            .unwrap()
+            .execute("DROP TABLE users", [])
+            .unwrap();
+        assert!(store.lookup("anything at all 1!").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

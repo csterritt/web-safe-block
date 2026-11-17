@@ -28,8 +28,14 @@ pub enum EventKind {
     LoginPage,
     LoginFailed,
     LoginSucceeded,
+    /// User lookup failed; the attempt did not count against the rate limit.
+    LoginError,
     RateLimited,
+    /// The log-out form was shown.
+    LogoutPage,
     Logout,
+    /// Cross-site POST to a `/__wsb/` endpoint; rejected unchanged.
+    Forbidden,
     /// Authenticated request forwarded upstream.
     Proxied,
     /// Request for an unknown path under `/__wsb/`.

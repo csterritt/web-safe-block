@@ -9,7 +9,7 @@ use axum::extract::{ConnectInfo, Form, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, post};
+use axum::routing::{get, post};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -31,6 +31,27 @@ const RATE_LIMIT_MAX_FAILURES: usize = 10;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const PURGE_INTERVAL: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_sessions: usize,
+    pub max_sessions_per_user: usize,
+    pub max_failure_keys: usize,
+    pub upstream_connect_timeout: Duration,
+    pub upstream_response_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_sessions: 10_000,
+            max_sessions_per_user: 10,
+            max_failure_keys: 10_000,
+            upstream_connect_timeout: Duration::from_secs(10),
+            upstream_response_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// Users that may log in, looked up by normalized pass phrase.
@@ -42,6 +63,8 @@ pub struct Config {
     pub cookie_secure: bool,
     /// Delay before answering a failed login.
     pub fail_delay: Duration,
+    /// Resource bounds for in-memory state and upstream requests.
+    pub limits: Limits,
 }
 
 impl Config {
@@ -52,6 +75,7 @@ impl Config {
             session_ttl: Duration::from_secs(settings.session_ttl_secs),
             cookie_secure: settings.cookie_secure,
             fail_delay: Duration::from_secs(1),
+            limits: Limits::default(),
         }
     }
 }
@@ -72,7 +96,9 @@ struct Session {
 
 impl AppState {
     pub fn new(config: Config, events: Arc<EventQueue>) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         AppState {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -89,7 +115,7 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Router {
     spawn_purger(state.clone());
     Router::new()
         .route(LOGIN_PATH, post(login))
-        .route(LOGOUT_PATH, any(logout))
+        .route(LOGOUT_PATH, get(logout_page).post(logout))
         .fallback(proxy_or_login)
         .layer(middleware::from_fn_with_state(state.clone(), record_event))
         .with_state(state)
@@ -276,10 +302,41 @@ fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     headers
         .get("CF-Connecting-IP")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
         .or_else(|| peer.map(|a| a.ip().to_string()))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// True if a POST came from another site, per Sec-Fetch-Site or Origin.
+fn cross_site(headers: &HeaderMap) -> bool {
+    if let Some(v) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return !(v.trim().eq_ignore_ascii_case("same-origin")
+            || v.trim().eq_ignore_ascii_case("none"));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let authority = origin
+            .parse::<Uri>()
+            .ok()
+            .and_then(|u| u.authority().map(|a| a.as_str().to_string()));
+        return match authority {
+            Some(a) => !a.eq_ignore_ascii_case(host.trim()),
+            None => true,
+        };
+    }
+    false
+}
+
+fn forbidden() -> Response {
+    with_outcome(
+        (StatusCode::FORBIDDEN, "Forbidden").into_response(),
+        EventKind::Forbidden,
+        None,
+    )
 }
 
 /// The user name of a valid, unexpired session, if the request has one.
@@ -299,27 +356,99 @@ fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn rate_limited(state: &AppState, key: &str) -> bool {
+/// Under one lock: prune the key's stale timestamps, refuse once it has
+/// RATE_LIMIT_MAX_FAILURES in the window, else record this attempt now.
+fn reserve_attempt(
+    failures: &mut HashMap<String, Vec<Instant>>,
+    max_keys: usize,
+    key: &str,
+) -> bool {
     let now = Instant::now();
-    let mut failures = state.failures.lock().unwrap();
     if let Some(v) = failures.get_mut(key) {
         v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
-        v.len() >= RATE_LIMIT_MAX_FAILURES
-    } else {
-        false
+        if v.is_empty() {
+            failures.remove(key);
+        }
     }
+    if failures
+        .get(key)
+        .is_some_and(|v| v.len() >= RATE_LIMIT_MAX_FAILURES)
+    {
+        return false;
+    }
+    if !failures.contains_key(key) && failures.len() >= max_keys {
+        failures.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+            !v.is_empty()
+        });
+        if failures.len() >= max_keys
+            && let Some(oldest) = failures
+                .iter()
+                .max_by_key(|(_, v)| v.last().map(|t| now.duration_since(*t)).unwrap_or_default())
+                .map(|(k, _)| k.clone())
+        {
+            failures.remove(&oldest);
+        }
+    }
+    let v = failures.entry(key.to_string()).or_default();
+    if v.len() >= RATE_LIMIT_MAX_FAILURES {
+        v.drain(..v.len() + 1 - RATE_LIMIT_MAX_FAILURES);
+    }
+    v.push(now);
+    true
 }
 
-fn record_failure(state: &AppState, key: &str) {
-    let now = Instant::now();
-    let mut failures = state.failures.lock().unwrap();
-    let v = failures.entry(key.to_string()).or_default();
-    v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
-    v.push(now);
+/// Undo a reserved attempt that turned out not to be a login failure.
+fn refund_attempt(failures: &mut HashMap<String, Vec<Instant>>, key: &str) {
+    if let Some(v) = failures.get_mut(key) {
+        v.pop();
+        if v.is_empty() {
+            failures.remove(key);
+        }
+    }
 }
 
 fn clear_failures(state: &AppState, key: &str) {
     state.failures.lock().unwrap().remove(key);
+}
+
+/// Insert a session, evicting to stay within the per-user and global caps.
+fn insert_session(
+    sessions: &mut HashMap<String, Session>,
+    limits: &Limits,
+    token: String,
+    session: Session,
+) {
+    let now = Instant::now();
+    let user_count = |sessions: &HashMap<String, Session>| {
+        sessions.values().filter(|s| s.user == session.user).count()
+    };
+    if sessions.len() >= limits.max_sessions || user_count(sessions) >= limits.max_sessions_per_user
+    {
+        sessions.retain(|_, s| s.expires > now);
+    }
+    while user_count(sessions) >= limits.max_sessions_per_user {
+        let Some(oldest) = sessions
+            .iter()
+            .filter(|(_, s)| s.user == session.user)
+            .min_by_key(|(_, s)| s.expires)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+    while sessions.len() >= limits.max_sessions {
+        let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, s)| s.expires)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+    sessions.insert(token, session);
 }
 
 fn new_token() -> String {
@@ -374,9 +503,16 @@ async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let key = client_key(&headers, Some(peer));
     let next = sanitize_next(&form.next);
-    if rate_limited(&state, &key) {
+    if cross_site(&headers) {
+        return forbidden();
+    }
+    let key = client_key(&headers, Some(peer));
+    if !reserve_attempt(
+        &mut state.failures.lock().unwrap(),
+        state.config.limits.max_failure_keys,
+        &key,
+    ) {
         return with_outcome(
             html_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -386,45 +522,77 @@ async fn login(
             None,
         );
     }
-    if let Some(user) = state.config.users.lookup(&form.phrase) {
-        println!("web-safe-block: user '{}' logged in", user.name);
-        let token = new_token();
-        state.sessions.lock().unwrap().insert(
-            token.clone(),
-            Session {
-                expires: Instant::now() + state.config.session_ttl,
-                user: user.name.clone(),
-            },
-        );
-        clear_failures(&state, &key);
-        let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
-        let h = resp.headers_mut();
-        h.insert(header::LOCATION, HeaderValue::from_str(&next).unwrap());
-        h.insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&session_cookie_header(
-                &token,
-                state.config.session_ttl,
-                state.config.cookie_secure,
-            ))
-            .unwrap(),
-        );
-        with_outcome(resp, EventKind::LoginSucceeded, Some(user.name))
-    } else {
-        record_failure(&state, &key);
-        tokio::time::sleep(state.config.fail_delay).await;
-        with_outcome(
-            html_response(
-                StatusCode::UNAUTHORIZED,
-                login_page(Some("Incorrect phrase."), &next),
-            ),
-            EventKind::LoginFailed,
-            None,
-        )
+    match state.config.users.lookup(&form.phrase) {
+        Err(e) => {
+            eprintln!("web-safe-block: user lookup failed: {e}");
+            refund_attempt(&mut state.failures.lock().unwrap(), &key);
+            with_outcome(
+                html_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    login_page(Some("Server error, try again later."), &next),
+                ),
+                EventKind::LoginError,
+                None,
+            )
+        }
+        Ok(None) => {
+            tokio::time::sleep(state.config.fail_delay).await;
+            with_outcome(
+                html_response(
+                    StatusCode::UNAUTHORIZED,
+                    login_page(Some("Incorrect phrase."), &next),
+                ),
+                EventKind::LoginFailed,
+                None,
+            )
+        }
+        Ok(Some(user)) => {
+            println!("web-safe-block: user '{}' logged in", user.name);
+            let token = new_token();
+            insert_session(
+                &mut state.sessions.lock().unwrap(),
+                &state.config.limits,
+                token.clone(),
+                Session {
+                    expires: Instant::now() + state.config.session_ttl,
+                    user: user.name.clone(),
+                },
+            );
+            clear_failures(&state, &key);
+            let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
+            let h = resp.headers_mut();
+            h.insert(header::LOCATION, HeaderValue::from_str(&next).unwrap());
+            h.insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&session_cookie_header(
+                    &token,
+                    state.config.session_ttl,
+                    state.config.cookie_secure,
+                ))
+                .unwrap(),
+            );
+            with_outcome(resp, EventKind::LoginSucceeded, Some(user.name))
+        }
     }
 }
 
+/// Log-out form; GETting it changes nothing.
+async fn logout_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = valid_session(&state, &headers);
+    let body = format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Log out</title>\n</head>\n<body>\n<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
+    );
+    with_outcome(
+        html_response(StatusCode::OK, body),
+        EventKind::LogoutPage,
+        user,
+    )
+}
+
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if cross_site(&headers) {
+        return forbidden();
+    }
     let user = parse_cookies(&headers)
         .into_iter()
         .find(|(n, _)| n == SESSION_COOKIE)
@@ -484,36 +652,52 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     let headers = req.headers_mut();
     strip_session_cookie(headers);
     strip_hop_by_hop(headers);
-
+    // The client is untrusted: rebuild forwarding headers from scratch.
+    for name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-real-ip",
+    ] {
+        while headers.remove(name).is_some() {}
+    }
     let key = client_key(headers, Some(peer));
-    match headers.get_mut("x-forwarded-for") {
-        Some(v) if !v.as_bytes().is_empty() => {
-            if let Ok(existing) = v.to_str()
-                && let Ok(nv) = HeaderValue::from_str(&format!("{existing}, {key}"))
-            {
-                *v = nv;
-            }
-        }
-        _ => {
-            if let Ok(v) = HeaderValue::from_str(&key) {
-                headers.insert("x-forwarded-for", v);
-            }
-        }
+    if let Ok(v) = HeaderValue::from_str(&key) {
+        headers.insert("x-forwarded-for", v);
     }
-    if !headers.contains_key("x-forwarded-proto") {
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
-    }
+    headers.insert(
+        "x-forwarded-proto",
+        HeaderValue::from_static(if state.config.cookie_secure {
+            "https"
+        } else {
+            "http"
+        }),
+    );
     if let Some(host) = headers.get(header::HOST).cloned() {
         headers.insert("x-forwarded-host", host);
     }
 
-    let upstream_resp = match state.client.request(req).await {
-        Ok(r) => r,
-        Err(_) => {
+    let pending = tokio::time::timeout(
+        state.config.limits.upstream_response_timeout,
+        state.client.request(req),
+    );
+    let upstream_resp = match pending.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => {
             return (
                 StatusCode::BAD_GATEWAY,
                 [(header::CONTENT_TYPE, "text/plain")],
                 "Bad Gateway",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "Gateway Timeout",
             )
                 .into_response();
         }
@@ -610,5 +794,133 @@ mod tests {
         assert!(sets_session_cookie("wsb_session=x; Path=/"));
         assert!(sets_session_cookie(" wsb_session =x"));
         assert!(!sets_session_cookie("wsb_session2=x"));
+    }
+
+    #[test]
+    fn cross_site_cases() {
+        let h = |pairs: &[(&str, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(
+                    k.parse::<header::HeaderName>().unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            m
+        };
+        assert!(!cross_site(&h(&[("sec-fetch-site", "same-origin")])));
+        assert!(!cross_site(&h(&[("sec-fetch-site", "none")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "cross-site")])));
+        assert!(cross_site(&h(&[("sec-fetch-site", "same-site")])));
+        assert!(!cross_site(&h(&[
+            ("origin", "http://example.com"),
+            ("host", "example.com")
+        ])));
+        assert!(!cross_site(&h(&[
+            ("origin", "http://Example.com:8443"),
+            ("host", "example.com:8443")
+        ])));
+        assert!(cross_site(&h(&[
+            ("origin", "http://evil.example"),
+            ("host", "example.com")
+        ])));
+        assert!(cross_site(&h(&[
+            ("origin", "null"),
+            ("host", "example.com")
+        ])));
+        assert!(cross_site(&h(&[("origin", "http://nohost.example"),])));
+        assert!(!cross_site(&h(&[])));
+    }
+
+    #[test]
+    fn client_key_requires_ip_header() {
+        let peer = "9.9.9.9:1234".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("cf-connecting-ip", HeaderValue::from_static("not an ip"));
+        assert_eq!(client_key(&h, Some(peer)), "9.9.9.9");
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static(" 203.0.113.5 "),
+        );
+        assert_eq!(client_key(&h, Some(peer)), "203.0.113.5");
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            max_sessions: 3,
+            max_sessions_per_user: 2,
+            max_failure_keys: 3,
+            ..Limits::default()
+        }
+    }
+
+    fn session(user: &str, secs: u64) -> Session {
+        Session {
+            expires: Instant::now() + Duration::from_secs(secs),
+            user: user.to_string(),
+        }
+    }
+
+    #[test]
+    fn session_caps() {
+        let l = limits();
+        let mut sessions = HashMap::new();
+        // Per-user cap: the oldest of the user's sessions is evicted.
+        for i in 0..3 {
+            insert_session(
+                &mut sessions,
+                &l,
+                format!("a{i}"),
+                session("alice", 100 + i),
+            );
+        }
+        let mut keys: Vec<&String> = sessions.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["a1", "a2"]);
+
+        // Global cap: the globally earliest-expiring session goes.
+        insert_session(&mut sessions, &l, "b0".into(), session("bob", 50));
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.contains_key("a1") || sessions.contains_key("a2"));
+        assert!(sessions.contains_key("b0"));
+        insert_session(&mut sessions, &l, "b1".into(), session("bob", 40));
+        assert_eq!(sessions.len(), 3);
+        assert!(!sessions.contains_key("b0"), "earliest expiry evicted");
+
+        // An expired session does not count against a cap.
+        let mut sessions = HashMap::new();
+        sessions.insert("old".into(), session("alice", 0));
+        insert_session(&mut sessions, &l, "n1".into(), session("alice", 10));
+        insert_session(&mut sessions, &l, "n2".into(), session("alice", 11));
+        assert!(!sessions.contains_key("old"));
+        assert!(sessions.contains_key("n1") && sessions.contains_key("n2"));
+    }
+
+    #[test]
+    fn failure_caps() {
+        let l = limits();
+        let mut failures = HashMap::new();
+        for i in 0..RATE_LIMIT_MAX_FAILURES {
+            assert!(reserve_attempt(&mut failures, l.max_failure_keys, "a"));
+            let _ = i;
+        }
+        assert!(!reserve_attempt(&mut failures, l.max_failure_keys, "a"));
+        assert_eq!(failures["a"].len(), RATE_LIMIT_MAX_FAILURES);
+
+        // New keys evict the key whose most recent failure is oldest.
+        let mut failures = HashMap::new();
+        assert!(reserve_attempt(&mut failures, l.max_failure_keys, "old"));
+        std::thread::sleep(Duration::from_millis(2));
+        for k in ["b", "c"] {
+            assert!(reserve_attempt(&mut failures, l.max_failure_keys, k));
+        }
+        assert_eq!(failures.len(), 3);
+        assert!(reserve_attempt(&mut failures, l.max_failure_keys, "new"));
+        assert_eq!(failures.len(), 3);
+        assert!(!failures.contains_key("old"), "{failures:?}");
+
+        // Refund removes the newest timestamp and the key when empty.
+        refund_attempt(&mut failures, "new");
+        assert!(!failures.contains_key("new"));
     }
 }

@@ -20,8 +20,8 @@ cargo build --release
 
 # Add users: one per line, "user-name pass phrase words...".
 ./target/release/web-safe-block add-user <<'EOF'
-chris correct horse battery staple
-site-admin Purple Monkey Dishwasher
+chris correct horse battery staple 42!
+site-admin Purple Monkey Dishwasher, 1999.
 EOF
 
 ./target/release/web-safe-block serve
@@ -43,7 +43,7 @@ web-safe-block -c /etc/web-safe-block/config.toml serve
 |---|---|---|
 | `users_db` | `"users.db"` | sqlite3 users database. A relative path is relative to the config file's directory. |
 | `listen_addr` | `"127.0.0.1:8080"` | Public-facing address web-safe-block listens on. |
-| `upstream` | `"http://127.0.0.1:3000"` | Protected server (must be `http://`). |
+| `upstream` | `"http://127.0.0.1:3000"` | Protected server (must be `http://` with no path). |
 | `session_ttl_secs` | `604800` (7 days) | Session lifetime. |
 | `cookie_secure` | `true` | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
 | `monitor_addr` | `"127.0.0.1:8081"` | Local monitor port. Must be a loopback address. |
@@ -58,6 +58,7 @@ Writes a config file with all the default values above, with comments, to `./con
 Reads lines from stdin into the users database, creating it if needed. Each line is split on whitespace: the first word is the user name and the rest is the pass phrase.
 
 - Pass phrases are normalized: all whitespace is removed and the phrase is lower-cased. `Open Sesame` and `opensesame` are the same phrase.
+- New pass phrases must have at least 20 non-whitespace characters, at least one number, and at least one punctuation character. Lines with weaker phrases are reported and skipped.
 - The database stores the hex SHA-512 of the normalized phrase, not the phrase itself.
 - User names and pass phrases must both be unique, including against users already in the database.
 - A user whose name contains `admin` (any case) is an admin.
@@ -67,7 +68,7 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 
 Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
 
-Visit `/__wsb/logout` to end a session.
+Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected.
 
 ### Monitor port
 
@@ -80,11 +81,11 @@ $ nc 127.0.0.1 8081
 
 - `kind` is one of:
   - `login_page`: unauthenticated request, shown the form.
-  - `login_failed`, `login_succeeded`, `rate_limited`, `logout`.
-  - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502.
+  - `login_failed`, `login_succeeded`, `login_error` (user lookup failed), `rate_limited`, `logout_page`, `logout`, `forbidden` (cross-site POST rejected).
+  - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502/504.
   - `reserved`: an unknown `/__wsb/` path.
   - `other`: e.g. wrong method or a malformed form.
-- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied` and `logout`.
+- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page` and `logout`.
 - The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor and marks them consumed only after they have been written.
 - When the queue is full, the oldest events are overwritten.
   - With no monitor connected this happens silently. A monitor that connects later first receives whatever is still queued.
@@ -97,8 +98,10 @@ $ nc 127.0.0.1 8081
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
 - The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped.
 - Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP), with a 1s delay on each failure. Because `CF-Connecting-IP` is trusted, don't expose `listen_addr` anywhere except to the tunnel.
-- Sessions live in memory and are lost on restart.
-- Pass phrases are stored as unsalted SHA-512 hashes (lookup is by phrase alone, so a per-user salt isn't possible). This keeps phrases out of plain view if `users.db` leaks, but short or common phrases can still be brute-forced, so use long phrases and keep `users.db` private.
+- Sessions live in memory and are lost on restart. At most 10 live sessions per user (the oldest is dropped) and 10,000 in total are kept.
+- Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
+- Upstream requests time out after 10s to connect and 60s waiting for response headers (504).
+- Pass phrases are stored as unsalted SHA-512 hashes (lookup is by phrase alone, so a per-user salt isn't possible). This keeps phrases out of plain view if `users.db` leaks, but short or common phrases can still be brute-forced. `add-user` therefore enforces a minimum strength (see above); users added before that policy existed are not re-checked. Keep `users.db` private.
 - WebSockets are not supported in v1.
 - Paths under `/__wsb/` are reserved and never forwarded.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.
