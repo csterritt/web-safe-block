@@ -9,20 +9,20 @@ export const META = {
   outDir: '.',                            // generated files land in Notes/atlas/, next to this source
   stats: [
     { k: 'System', v: 'rust · axum 0.8 + hyper 1' },
-    { k: 'Source', v: '~2,000 LOC' },
+    { k: 'Source', v: '~3,300 LOC' },
     { k: 'Seats', v: '1 public port · 1 monitor' },
   ],
   intro: `_**This file is the living source of truth for the design.** The interactive atlas (\`atlas.html\`) is built from the same data; edit this file and rebuild, never the outputs._`,
-  onePara: `web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in \`users.db\` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 does not relay WebSockets, and sessions vanish on restart.`,
+  onePara: `web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in \`users.db\` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions vanish on restart.`,
   costModel: [
     'Bounds, not dollars — this is one process on one box. Every in-memory structure is capped:',
     '',
     '| Resource | Bound | Where |',
     '|---|---|---|',
-    '| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/lib.rs` `Limits` |',
-    '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/lib.rs` `reserve_attempt` |',
+    '| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/state.rs` `Limits` + `src/sessions.rs` |',
+    '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |',
     '| Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |',
-    '| Upstream waits | 10s to connect, 60s for response headers | `src/lib.rs` `forward` |',
+    '| Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |',
     '| users.db | one row per user; phrase kept only as SHA-512 hex | `src/users.rs` |',
   ],
   deepDive: '',
@@ -30,8 +30,15 @@ export const META = {
   weOwn: 'the gate: phrase-only login, in-memory sessions, the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.',
   filesystem: `web-safe-block/
   src/
-    main.rs       commands: write-config · add-user · serve
-    lib.rs        router, gate handlers, sessions, throttle, forwarder
+    main.rs       commands: write-config · add-user · remove-user · list-users · serve
+    lib.rs        crate root: module wiring + re-exports
+    app.rs        router, record_event middleware, 60s purger
+    auth.rs       login/logout handlers
+    proxy.rs      session check, 501 on upgrade, forwarder
+    sessions.rs   session table ops + token minting
+    rate_limit.rs per-IP failure ledger ops
+    state.rs      Config · Limits · AppState
+    util.rs       cookie/header/HTML helpers
     users.rs      users.db schema, phrase normalize/hash, UserStore
     monitor.rs    EventQueue + monitor thread (JSON lines)
     settings.rs   config.toml: strict load + write_default
@@ -50,6 +57,7 @@ export const DECISIONS = [
   { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; bounded queue overwrites the oldest events', adr: '[0005](./adr/0005-one-monitor.md)' },
   { axis: 'Upstream', decision: 'http:// only, no path — the protected app stays on loopback', adr: '—' },
   { axis: 'Reserved paths', decision: '/__wsb/* is never forwarded; cross-site POSTs to it are rejected', adr: '—' },
+  { axis: 'Protocol upgrades', decision: 'An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost)', adr: '—' },
 ];
 
 export const GROUPS = [
@@ -87,13 +95,13 @@ export const NODES = [
     ] },
   // ---- The gate ----
   { id: 'G', code: 'G', name: 'The gate', short: 'GATE', group: 'gate', gx: 7, gy: 3, w: 3, d: 2.5, h: 56, kind: 'gate',
-    one: 'The public listener: login page, session check, reserved endpoints, then forward-or-refuse.',
-    what: 'One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder. A tiny /__wsb/ namespace carries login, logout, and nothing else.',
-    how: '<code>axum</code> router in <code>src/lib.rs</code>: <code>POST /__wsb/login</code>, <code>GET|POST /__wsb/logout</code>, fallback <code>proxy_or_login</code>. Any other <code>/__wsb/*</code> path is a 404 <mark>reserved</mark>. Cross-site POSTs are refused via <code>Sec-Fetch-Site</code>, then <code>Origin</code>. Every request exits through <code>record_event</code> middleware.',
+    one: 'The public listener: login page, session check, reserved endpoints, upgrade refusal, then forward-or-refuse.',
+    what: 'One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.',
+    how: '<code>axum</code> router in <code>src/app.rs</code>: <code>POST /__wsb/login</code> and <code>GET|POST /__wsb/logout</code> live in <code>src/auth.rs</code>, fallback <code>proxy_or_login</code> in <code>src/proxy.rs</code>. Any other <code>/__wsb/*</code> path is a 404 <mark>reserved</mark>. Cross-site POSTs are refused via <code>Sec-Fetch-Site</code>, then <code>Origin</code>. Authenticated requests with an <code>Upgrade</code> header get <mark>501</mark>, kind <code>upgrade</code>. Every request exits through <code>record_event</code> middleware.',
     steps: [
       ['Route', '/__wsb/ endpoints handled here; unknown ones are 404 reserved.'],
       ['Authenticate', 'Parse cookies → wsb_session → sessions table → user.'],
-      ['Decide', 'Login page (401), the login/logout handlers, or hand to the forwarder.'],
+      ['Decide', 'Login page (401), the login/logout handlers, 501 for upgrade attempts, or hand to the forwarder.'],
       ['Report', 'Attach an Outcome; middleware pushes one event per request.'],
     ],
     cond: [
@@ -128,22 +136,23 @@ export const NODES = [
   { id: 'U', code: 'U', name: 'Phrase book', short: 'USERS.DB', group: 'gate', gx: 10, gy: 0.5, w: 2, d: 2, h: 22, kind: 'store',
     one: 'The sqlite file of who may enter — phrase hashes only, never phrases.',
     what: 'The list of people allowed in. It stores each user name, the SHA-512 of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "is there anyone with this phrase?" on every login.',
-    how: '<code>users.db</code>, opened read-only by <code>UserStore</code>. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hex SHA-512\'d. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.',
+    how: '<code>users.db</code>: <code>UserStore</code> opens it read-only for <code>serve</code> and <code>list-users</code>; <code>add-user</code> creates and writes it, <code>remove-user NAME</code> deletes one row. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hex SHA-512\'d. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.',
     steps: [
       ['Normalize', 'Drop all whitespace, lower-case ("Open Sesame" == "opensesame").'],
       ['Hash', 'SHA-512 hex — that string is what is stored and searched.'],
       ['Lookup', 'SELECT user_name, is_admin WHERE pass_phrase = hash.'],
+      ['Manage', 'add-user inserts; remove-user deletes by name; list-users prints names + flags.'],
     ],
     cond: [
-      'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?',
-      'The is_admin flag is stored but serve never reads it — what should admins be able to do?',
+      { q: 'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?', r: 'remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.' },
+      'The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?',
       { q: 'Why not a per-user salt on the hash?', r: 'Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).' },
     ] },
   // ---- Through to the app ----
   { id: 'F', code: 'F', name: 'Forwarder', short: 'FORWARDER', group: 'relay', gx: 10.5, gy: 3, w: 2.5, d: 2, h: 44, kind: 'box',
     one: 'Rewrites the request, scrubs it, sends it upstream, brings the answer back.',
     what: 'Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app\'s answer.',
-    how: '<code>hyper-util</code> client in <code>forward()</code>. Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers, and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504. Upstream Set-Cookie for wsb_session is dropped.',
+    how: '<code>hyper-util</code> client in <code>forward()</code> (<code>src/proxy.rs</code>). Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers, and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.',
     steps: [
       ['Rewrite', 'Keep path+query; replace scheme and authority with upstream.'],
       ['Scrub', 'Session cookie out; hop-by-hop out; client forwarding headers out.'],
@@ -170,21 +179,24 @@ export const NODES = [
   { id: 'OP', code: 'O', name: 'Operator', short: 'OPERATOR', group: 'ops', gx: -1, gy: 1, w: 2, d: 2, h: 30, kind: 'screen',
     one: 'The person with shell access who owns the box.',
     what: 'You, on the machine itself: writing the config, adding users by piping lines, starting the server, and optionally tailing the monitor with netcat.',
-    how: 'Everything is one binary: <code>web-safe-block write-config | add-user | serve</code>, plus <code>-c path</code> for a non-default <code>config.toml</code>. Watching is <code>nc 127.0.0.1 8081</code>.',
+    how: 'Everything is one binary: <code>web-safe-block write-config | add-user | remove-user | list-users | serve</code>, plus <code>-c path</code> for a non-default <code>config.toml</code>. Watching is <code>nc 127.0.0.1 8081</code>.',
     steps: [
       ['Configure', 'write-config emits a commented config.toml; refuses to overwrite.'],
       ['Populate', 'add-user reads "name pass phrase…" lines from stdin.'],
+      ['Maintain', 'list-users shows names + admin flags; remove-user NAME deletes a row.'],
       ['Run', 'serve binds the public port and the monitor port.'],
       ['Watch', 'nc to the monitor port for a live event stream.'],
     ],
     cond: [] },
   { id: 'C', code: 'C', name: 'CLI & config', short: 'CLI+CONFIG', group: 'ops', gx: 2, gy: 0.5, w: 2.5, d: 2, h: 30, kind: 'cards',
-    one: 'Three commands and one strict config file.',
-    what: 'The whole control surface. write-config lays down a commented config.toml; add-user feeds the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.',
+    one: 'Five commands and one strict config file.',
+    what: 'The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.',
     how: '<code>src/main.rs</code> + <code>src/settings.rs</code>. Seven settings, <mark>all required, unknown keys denied</mark>: users_db, listen_addr, upstream, session_ttl_secs, cookie_secure, monitor_addr (loopback only), monitor_queue_len. Relative users_db resolves against the config file\'s directory.',
     steps: [
       ['write-config', 'Emit defaults with comments; refuse to overwrite an existing file.'],
       ['add-user', 'Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped.'],
+      ['remove-user NAME', 'Deletes the row; errors if the name is not found.'],
+      ['list-users', 'Print user_name + is_admin, sorted by name.'],
       ['serve', 'Load config + users.db (must exist and be non-empty), bind both ports.'],
     ],
     cond: [
@@ -217,14 +229,14 @@ export const NODES = [
   // ---- Not switched on ----
   { id: 'WS', code: 'W', name: 'WebSocket relay', short: 'WEBSOCKETS', group: 'off', ghost: true, gx: 17, gy: 5.5, w: 2, d: 2, h: 34, kind: 'box',
     one: 'Designed for, not built: live upgrade connections to the app.',
-    what: 'Apps that want WebSockets cannot work through the gate today — the forwarder deliberately strips Upgrade and Connection before anything goes upstream.',
-    how: 'v1 removes <code>connection</code>, <code>upgrade</code>, and friends in <code>strip_hop_by_hop</code>, so an upgrade arrives upstream as an ordinary GET. A real relay needs an upgrade path in <code>forward()</code> and a decision about streaming bodies.',
+    what: 'Apps that want WebSockets cannot work through the gate today — an authenticated request carrying an Upgrade header is answered 501 and never reaches the app.',
+    how: '<code>proxy_or_login</code> returns <mark>501 Not Implemented</mark>, kind <code>upgrade</code>, for any authenticated request with an <code>Upgrade</code> header; the hop-by-hop scrub still removes <code>connection</code>/<code>upgrade</code> from ordinary traffic. A real relay needs an upgrade path in <code>forward()</code> and a decision about streaming bodies.',
     steps: [
       ['Upgrade', 'Detect a genuine upgrade request after the session check.'],
       ['Relay', 'Pipe the connection to upstream instead of request/response.'],
     ],
     cond: [
-      'Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?',
+      { q: 'Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?', r: 'Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).' },
     ] },
   { id: 'PS', code: 'P', name: 'Saved sessions', short: 'SAVED SESS', group: 'off', ghost: true, gx: 4.5, gy: 9.5, w: 2, d: 2, h: 20, kind: 'store',
     one: 'Designed for, not built: sessions that survive a restart.',
@@ -350,21 +362,23 @@ export const CH = [
       ['MO', 'EQ', 'mark consumed', { up_to: 4 }],
     ] },
   { id: 'operate', title: 'Running it', reveal: ['OP', 'C'],
-    lede: `Three commands: write-config, add-user, serve.`,
-    story: `<p>The operator <mark>manages users by piping lines</mark> — "name pass phrase words…" — into add-user; weak or duplicate lines are skipped, hashes stored. serve refuses to start with no users at all.</p>`,
+    lede: `Five commands: write-config, add-user, remove-user, list-users, serve.`,
+    story: `<p>The operator <mark>manages users by piping lines</mark> — "name pass phrase words…" — into add-user; remove-user deletes by name and list-users shows who is in. serve refuses to start with no users at all.</p>`,
     flow: [
       ['OP', 'C', 'add-user <<EOF', { line: 'chris correct horse … 42!' }],
       ['C', 'U', 'INSERT hash', { user_name: 'chris', pass_phrase: '<sha512 hex>', is_admin: false }],
+      ['OP', 'C', 'remove-user carol', { arg: 'carol' }],
+      ['C', 'U', 'DELETE row', { changes: 1 }],
       ['OP', 'MO', 'nc 127.0.0.1:8081', { connect: 'monitor stream' }],
     ] },
   { id: 'later', title: 'Not switched on', reveal: ['WS', 'PS'],
     lede: `Designed for, not built.`,
-    story: `<p>Two sketches sit on the map as <mark>dashed ghosts</mark>: a WebSocket relay (v1 strips upgrade headers before forwarding) and saved sessions (today a restart logs everyone out).</p>`,
+    story: `<p>Two sketches sit on the map as <mark>dashed ghosts</mark>: a WebSocket relay (today the gate answers upgrade attempts 501) and saved sessions (today a restart logs everyone out).</p>`,
     flow: [
-      ['BR', 'G', 'GET /ws + Upgrade', { headers: { upgrade: 'websocket' } }],
-      ['G', 'F', 'forward', { note: 'session ok' }],
-      ['F', 'UP', 'Upgrade stripped', { headers: { upgrade: '(removed)' } }],
-      ['UP', 'F', 'no upgrade', { status: '400/426 from app' }],
+      ['BR', 'G', 'GET /ws + Upgrade', { headers: { upgrade: 'websocket', cookie: 'wsb_session=9f3a…' } }],
+      ['G', 'S', 'session check', { token: '9f3a…' }],
+      ['S', 'G', 'ok: chris', { user: 'chris' }],
+      ['G', 'BR', '501 Not Implemented', { status: 501, kind: 'upgrade' }],
     ] },
   { id: 'all', title: 'The whole system', reveal: [],
     lede: `Everything at once, for free exploration.`,
@@ -376,8 +390,15 @@ export const CH = [
 export const HOW_HTML = `<div class="eyebrow">web-safe-block · v0.1</div><h1 class="t">How it's built</h1><div class="sub">a small Rust gate in front of a softer app</div>
 <h3 class="sec">Filesystem</h3><pre>web-safe-block/
   src/
-    main.rs       write-config · add-user · serve
-    lib.rs        router, gate, sessions, throttle, forwarder
+    main.rs       write-config · add-user · remove-user · list-users · serve
+    lib.rs        crate root: module wiring + re-exports
+    app.rs        router, event middleware, purger
+    auth.rs       login/logout handlers
+    proxy.rs      session check, 501 on upgrade, forwarder
+    sessions.rs   session table ops + token minting
+    rate_limit.rs per-IP failure ledger ops
+    state.rs      Config · Limits · AppState
+    util.rs       cookie/header/HTML helpers
     users.rs      users.db schema + phrase policy
     monitor.rs    EventQueue + monitor thread
     settings.rs   strict config.toml

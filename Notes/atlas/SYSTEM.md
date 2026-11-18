@@ -2,11 +2,11 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **13 open · 4 resolved**._
+_Question status: **11 open · 6 resolved**._
 
 ## One paragraph
 
-web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in `users.db` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 does not relay WebSockets, and sessions vanish on restart.
+web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in `users.db` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions vanish on restart.
 
 ## Decisions locked
 
@@ -21,6 +21,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Monitor | One loopback JSON-lines client at a time; bounded queue overwrites the oldest events | [0005](./adr/0005-one-monitor.md) |
 | Upstream | http:// only, no path — the protected app stays on loopback | — |
 | Reserved paths | /__wsb/* is never forwarded; cross-site POSTs to it are rejected | — |
+| Protocol upgrades | An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost) | — |
 
 ## Cost model
 
@@ -28,10 +29,10 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 | Resource | Bound | Where |
 |---|---|---|
-| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/lib.rs` `Limits` |
-| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/lib.rs` `reserve_attempt` |
+| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/state.rs` `Limits` + `src/sessions.rs` |
+| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |
 | Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |
-| Upstream waits | 10s to connect, 60s for response headers | `src/lib.rs` `forward` |
+| Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |
 | users.db | one row per user; phrase kept only as SHA-512 hex | `src/users.rs` |
 ## Reading order (the atlas chapters)
 
@@ -41,7 +42,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 4. **Through to the app** — Once you're known, the gate rewrites and forwards — the app never sees the login dance. _(adds F, UP)_
 5. **Slowing down guessing** — Wrong phrase? Ten tries per quarter-hour per client — and each miss costs a second. _(adds R)_
 6. **Watching the door** — Every request leaves a one-line trace on a loopback port. _(adds EQ, MO)_
-7. **Running it** — Three commands: write-config, add-user, serve. _(adds OP, C)_
+7. **Running it** — Five commands: write-config, add-user, remove-user, list-users, serve. _(adds OP, C)_
 8. **Not switched on** — Designed for, not built. _(adds WS, PS)_
 9. **The whole system** — Everything at once, for free exploration.
 
@@ -85,17 +86,17 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 #### G · The gate
 
-**In one line.** The public listener: login page, session check, reserved endpoints, then forward-or-refuse.
+**In one line.** The public listener: login page, session check, reserved endpoints, upgrade refusal, then forward-or-refuse.
 
-**What it does.** One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder. A tiny /__wsb/ namespace carries login, logout, and nothing else.
+**What it does.** One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.
 
-**How it's built.** `axum` router in `src/lib.rs`: `POST /__wsb/login`, `GET|POST /__wsb/logout`, fallback `proxy_or_login`. Any other `/__wsb/*` path is a 404 **reserved**. Cross-site POSTs are refused via `Sec-Fetch-Site`, then `Origin`. Every request exits through `record_event` middleware.
+**How it's built.** `axum` router in `src/app.rs`: `POST /__wsb/login` and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. Cross-site POSTs are refused via `Sec-Fetch-Site`, then `Origin`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware.
 
 **Steps in execution.**
 
 1. **Route** — /__wsb/ endpoints handled here; unknown ones are 404 reserved.
 2. **Authenticate** — Parse cookies → wsb_session → sessions table → user.
-3. **Decide** — Login page (401), the login/logout handlers, or hand to the forwarder.
+3. **Decide** — Login page (401), the login/logout handlers, 501 for upgrade attempts, or hand to the forwarder.
 4. **Report** — Attach an Outcome; middleware pushes one event per request.
 
 **Questions.**
@@ -146,18 +147,19 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The list of people allowed in. It stores each user name, the SHA-512 of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "is there anyone with this phrase?" on every login.
 
-**How it's built.** `users.db`, opened read-only by `UserStore`. Phrases are **normalized — whitespace stripped, lower-cased** — then hex SHA-512'd. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
+**How it's built.** `users.db`: `UserStore` opens it read-only for `serve` and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes one row. Phrases are **normalized — whitespace stripped, lower-cased** — then hex SHA-512'd. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
 
 **Steps in execution.**
 
 1. **Normalize** — Drop all whitespace, lower-case ("Open Sesame" == "opensesame").
 2. **Hash** — SHA-512 hex — that string is what is stored and searched.
 3. **Lookup** — SELECT user_name, is_admin WHERE pass_phrase = hash.
+4. **Manage** — add-user inserts; remove-user deletes by name; list-users prints names + flags.
 
 **Questions.**
 
-- **Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?
-- **Q-U2** The is_admin flag is stored but serve never reads it — what should admins be able to do?
+- ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.
+- **Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
 
 ### Through to the app
@@ -168,7 +170,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app's answer.
 
-**How it's built.** `hyper-util` client in `forward()`. Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers, and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504. Upstream Set-Cookie for wsb_session is dropped.
+**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers, and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
 
 **Steps in execution.**
 
@@ -208,20 +210,21 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** You, on the machine itself: writing the config, adding users by piping lines, starting the server, and optionally tailing the monitor with netcat.
 
-**How it's built.** Everything is one binary: `web-safe-block write-config | add-user | serve`, plus `-c path` for a non-default `config.toml`. Watching is `nc 127.0.0.1 8081`.
+**How it's built.** Everything is one binary: `web-safe-block write-config | add-user | remove-user | list-users | serve`, plus `-c path` for a non-default `config.toml`. Watching is `nc 127.0.0.1 8081`.
 
 **Steps in execution.**
 
 1. **Configure** — write-config emits a commented config.toml; refuses to overwrite.
 2. **Populate** — add-user reads "name pass phrase…" lines from stdin.
-3. **Run** — serve binds the public port and the monitor port.
-4. **Watch** — nc to the monitor port for a live event stream.
+3. **Maintain** — list-users shows names + admin flags; remove-user NAME deletes a row.
+4. **Run** — serve binds the public port and the monitor port.
+5. **Watch** — nc to the monitor port for a live event stream.
 
 #### C · CLI & config
 
-**In one line.** Three commands and one strict config file.
+**In one line.** Five commands and one strict config file.
 
-**What it does.** The whole control surface. write-config lays down a commented config.toml; add-user feeds the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.
+**What it does.** The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.
 
 **How it's built.** `src/main.rs` + `src/settings.rs`. Seven settings, **all required, unknown keys denied**: users_db, listen_addr, upstream, session_ttl_secs, cookie_secure, monitor_addr (loopback only), monitor_queue_len. Relative users_db resolves against the config file's directory.
 
@@ -229,7 +232,9 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 1. **write-config** — Emit defaults with comments; refuse to overwrite an existing file.
 2. **add-user** — Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped.
-3. **serve** — Load config + users.db (must exist and be non-empty), bind both ports.
+3. **remove-user NAME** — Deletes the row; errors if the name is not found.
+4. **list-users** — Print user_name + is_admin, sorted by name.
+5. **serve** — Load config + users.db (must exist and be non-empty), bind both ports.
 
 **Questions.**
 
@@ -277,9 +282,9 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **In one line.** Designed for, not built: live upgrade connections to the app.
 
-**What it does.** Apps that want WebSockets cannot work through the gate today — the forwarder deliberately strips Upgrade and Connection before anything goes upstream.
+**What it does.** Apps that want WebSockets cannot work through the gate today — an authenticated request carrying an Upgrade header is answered 501 and never reaches the app.
 
-**How it's built.** v1 removes `connection`, `upgrade`, and friends in `strip_hop_by_hop`, so an upgrade arrives upstream as an ordinary GET. A real relay needs an upgrade path in `forward()` and a decision about streaming bodies.
+**How it's built.** `proxy_or_login` returns **501 Not Implemented**, kind `upgrade`, for any authenticated request with an `Upgrade` header; the hop-by-hop scrub still removes `connection`/`upgrade` from ordinary traffic. A real relay needs an upgrade path in `forward()` and a decision about streaming bodies.
 
 **Steps in execution.**
 
@@ -288,7 +293,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- **Q-W1** Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?
+- ~~**Q-W1** Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?~~ ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
 
 #### P · Saved sessions _(not switched on)_
 
@@ -378,8 +383,8 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - **Q-S1** (S) Sessions die on restart — acceptable while this guards one box, or should they persist? (see ghost P)
 - **Q-R1** (R) Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
 - ~~**Q-R2**~~ (R) ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
-- **Q-U1** (U) There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?
-- **Q-U2** (U) The is_admin flag is stored but serve never reads it — what should admins be able to do?
+- ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.
+- **Q-U2** (U) The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3**~~ (U) ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
 - **Q-F2** (F) Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?
@@ -387,7 +392,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
 - **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
 - **Q-M1** (M) The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?
-- **Q-W1** (W) Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?
+- ~~**Q-W1**~~ (W) ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
 - **Q-P1** (P) Worth doing? It trades "restart clears the decks" (a nice property after an incident) for nobody being logged out on deploys.
 
 ## What the platform gives vs what we own
@@ -401,8 +406,15 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 ```
 web-safe-block/
   src/
-    main.rs       commands: write-config · add-user · serve
-    lib.rs        router, gate handlers, sessions, throttle, forwarder
+    main.rs       commands: write-config · add-user · remove-user · list-users · serve
+    lib.rs        crate root: module wiring + re-exports
+    app.rs        router, record_event middleware, 60s purger
+    auth.rs       login/logout handlers
+    proxy.rs      session check, 501 on upgrade, forwarder
+    sessions.rs   session table ops + token minting
+    rate_limit.rs per-IP failure ledger ops
+    state.rs      Config · Limits · AppState
+    util.rs       cookie/header/HTML helpers
     users.rs      users.db schema, phrase normalize/hash, UserStore
     monitor.rs    EventQueue + monitor thread (JSON lines)
     settings.rs   config.toml: strict load + write_default

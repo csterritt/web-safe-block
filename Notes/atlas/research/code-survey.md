@@ -43,3 +43,26 @@ All eight findings appear addressed in current code: X-Forwarded-* rebuilt (F1),
 - WebSocket upgrades stripped → apps can't do WS (Q-W1 → ghost W).
 - CF-Connecting-IP trusted unconditionally (Q-T1); IP-keyed limiter shares budget across NATs (Q-R1).
 - No mid-body upstream timeout (Q-F2); monitor has no auth beyond loopback (Q-M1); unconnected drops uncounted (Q-Q1); config-only settings (Q-C1); csrf check posture (Q-G2); https/unix upstream (Q-A1).
+
+## Update 2026-11-17 — CLI growth, lib.rs split, upgrade 501
+
+Changes landed after the first survey; resolves Q-U1 (mostly) and Q-W1.
+
+### src/lib.rs refactor (~926 → 15 lines)
+The gate code split into per-concern modules; `lib.rs` is now only module declarations plus re-exports (`build_router`, `Config`, `Limits`, `SESSION_COOKIE`, `LOGIN_PATH`, `LOGOUT_PATH`):
+- `app.rs` — `build_router`, `record_event` middleware, `with_outcome`, 60s purger.
+- `auth.rs` — `login`, `logout_page`, `logout`, `forbidden`, `LoginForm`.
+- `proxy.rs` — `proxy_or_login`, `forward`.
+- `sessions.rs` — `Session`, `valid_session`, `insert_session`, `new_token`.
+- `rate_limit.rs` — `reserve_attempt`, `refund_attempt`, `clear_failures`, window consts.
+- `state.rs` — `Config`, `Limits`, `AppState`.
+- `util.rs` — cookie/header/HTML helpers (`parse_cookies`, `strip_hop_by_hop`, `cross_site`, `login_page`, …).
+Public API unchanged; tests moved next to the code they cover.
+
+### New commands
+- `remove-user NAME` — opens users.db read-write (`open_for_remove`: errors if missing or lacking the users table), `DELETE WHERE user_name`; exit 2 missing arg, exit 1 unknown name. Live sessions are unaffected (in-memory; expire on TTL or restart).
+- `list-users` — `UserStore::list()` = `SELECT user_name, is_admin … ORDER BY user_name`; prints `name<TAB>true|false` on stdout. Errors on missing/empty db (same open as `serve`).
+- `parse_args` now accepts one optional positional arg.
+
+### Upgrade attempts → 501
+`proxy_or_login` answers `501 Not Implemented` for any authenticated request with an `Upgrade` header — checked after the `/__wsb/` reserved check and after the session check, so the event carries the user name. New `EventKind::Upgrade` serializes as `upgrade`. Unauthenticated requests still get the 401 login page. Integration test `upgrade_requests_get_501` asserts nothing reaches upstream.
