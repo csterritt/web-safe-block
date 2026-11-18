@@ -948,6 +948,28 @@ fn cli_remove_user() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn cli_list_users() {
+    let dir = config_dir();
+
+    // No database yet -> error.
+    let out = bin().arg("list-users").current_dir(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no users database"), "{stderr}");
+
+    run_add_user(
+        &dir,
+        "alice Correct-Horse-Battery-42\nadmin-bob Big Secret Phrase Number 99!\n",
+    );
+    let out = bin().arg("list-users").current_dir(&dir).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, ["admin-bob\ttrue", "alice\tfalse"], "{stdout}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn upgrade_requests_get_501() {
     let hits = Arc::new(AtomicUsize::new(0));

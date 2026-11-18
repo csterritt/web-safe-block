@@ -68,6 +68,10 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 
 `web-safe-block remove-user <user-name>` deletes that user from the users database. It exits with an error if the database is missing or there is no such user. The user's pass phrase stops working immediately; sessions they already hold stay valid until they expire or `serve` restarts.
 
+### `list-users`
+
+`web-safe-block list-users` prints one line per user — `user_name`, a tab, then `is_admin` (`true`/`false`) — sorted by name. It exits with an error if the users database is missing or empty.
+
 ### `serve`
 
 Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.

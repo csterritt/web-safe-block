@@ -82,6 +82,18 @@ pub fn remove_user(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
         .map(|removed| removed > 0)
 }
 
+/// Every user, sorted by name.
+pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<User>> {
+    conn.prepare("SELECT user_name, is_admin FROM users ORDER BY user_name")?
+        .query_map([], |r| {
+            Ok(User {
+                name: r.get(0)?,
+                is_admin: r.get(1)?,
+            })
+        })?
+        .collect()
+}
+
 /// Read `user-name pass phrase words...` lines and insert them. Bad lines are
 /// reported to `err` and skipped. Returns (added, skipped).
 pub fn add_users(
@@ -173,6 +185,11 @@ impl UserStore {
         Ok(UserStore {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Every user, sorted by name.
+    pub fn list(&self) -> rusqlite::Result<Vec<User>> {
+        list_users(&self.conn.lock().unwrap())
     }
 
     pub fn lookup(&self, phrase: &str) -> rusqlite::Result<Option<User>> {
@@ -298,6 +315,30 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(names, ["bob"]);
+    }
+
+    #[test]
+    fn list_users_sorted() {
+        let conn = mem_db();
+        add_users(
+            &conn,
+            "bob Correct Horse Battery 42!\nadmin-alice Another Fine Phrase 77!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            list_users(&conn).unwrap(),
+            [
+                User {
+                    name: "admin-alice".into(),
+                    is_admin: true
+                },
+                User {
+                    name: "bob".into(),
+                    is_admin: false
+                },
+            ]
+        );
     }
 
     #[test]

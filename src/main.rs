@@ -14,6 +14,7 @@ commands:
   write-config      write a config file with default values (refuses to overwrite)
   add-user          read 'user-name pass phrase words...' lines from stdin into the users database
   remove-user NAME  remove NAME from the users database
+  list-users        show user_name and is_admin for every user
   serve             run the proxy and the local monitor port
 
 The config file defaults to ./config.toml.";
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
         ("write-config", None) => write_config(&config_path),
         ("add-user", None) => with_settings(&config_path, add_user),
         ("remove-user", Some(name)) => with_settings(&config_path, |s| remove_user(s, name)),
+        ("list-users", None) => with_settings(&config_path, list_users),
         ("serve", None) => with_settings(&config_path, serve),
         _ => {
             eprintln!("{USAGE}");
@@ -112,6 +114,22 @@ fn remove_user(settings: Settings, name: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(false) => fail(format!("no user named '{name}'")),
+        Err(e) => fail(format!("database error: {e}")),
+    }
+}
+
+fn list_users(settings: Settings) -> ExitCode {
+    let store = match UserStore::open(&settings.users_db) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    match store.list() {
+        Ok(users) => {
+            for u in users {
+                println!("{}\t{}", u.name, u.is_admin);
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => fail(format!("database error: {e}")),
     }
 }
