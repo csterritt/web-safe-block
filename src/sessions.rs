@@ -2,7 +2,7 @@
 //! write-through to the `sessions` table in users.db.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use rand::Rng;
@@ -14,6 +14,17 @@ use crate::util::{SESSION_COOKIE, parse_cookies};
 pub(crate) struct Session {
     pub expires: SystemTime,
     pub user: String,
+    /// Creation stamp (unix microseconds, unique and increasing); evictions
+    /// take the smallest stamp, not the earliest expiry.
+    pub created: i64,
+}
+
+/// Now in unix microseconds (used for `created` stamps).
+pub(crate) fn unix_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
 }
 
 /// Hex SHA-256 of a raw token; the map key and the stored cookie_string.
@@ -69,7 +80,7 @@ pub(crate) fn insert_session(
         let Some(oldest) = sessions
             .iter()
             .filter(|(_, s)| s.user == session.user)
-            .min_by_key(|(_, s)| s.expires)
+            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
             .map(|(k, _)| k.clone())
         else {
             break;
@@ -80,7 +91,7 @@ pub(crate) fn insert_session(
     while sessions.len() >= limits.max_sessions {
         let Some(oldest) = sessions
             .iter()
-            .min_by_key(|(_, s)| s.expires)
+            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
             .map(|(k, _)| k.clone())
         else {
             break;
@@ -94,23 +105,28 @@ pub(crate) fn insert_session(
 
 /// Drop expired rows in the database, then rebuild the in-memory map from
 /// whatever rows remain. Picks up removals made by other processes (such as
-/// `remove-user`) as well as expiries.
-pub(crate) fn reload_sessions(state: &AppState) -> rusqlite::Result<()> {
+/// `remove-user`) as well as expiries. Returns the largest `created` stamp
+/// loaded, so the caller can keep issuing increasing stamps. Callers hold
+/// `session_writes`; the map lock is only taken for the final swap.
+pub(crate) fn reload_sessions(state: &AppState) -> rusqlite::Result<i64> {
     let now = SystemTime::now();
-    let mut sessions = state.sessions.lock().unwrap();
     state.config.users.delete_expired_sessions(now)?;
     let stored = state.config.users.load_sessions(now)?;
+    let mut max_created = 0i64;
+    let mut sessions = state.sessions.lock().unwrap();
     sessions.clear();
     for s in stored {
+        max_created = max_created.max(s.created);
         sessions.insert(
             s.cookie_string,
             Session {
                 expires: s.expires,
                 user: s.user_name,
+                created: s.created,
             },
         );
     }
-    Ok(())
+    Ok(max_created)
 }
 
 pub(crate) fn new_token() -> String {
@@ -132,10 +148,11 @@ mod tests {
         }
     }
 
-    fn session(user: &str, secs: u64) -> Session {
+    fn session(user: &str, secs: u64, created: i64) -> Session {
         Session {
             expires: SystemTime::now() + Duration::from_secs(secs),
             user: user.to_string(),
+            created,
         }
     }
 
@@ -153,14 +170,14 @@ mod tests {
     fn session_caps() {
         let l = limits();
         let mut sessions = HashMap::new();
-        // Per-user cap: the oldest of the user's sessions is evicted.
+        // Per-user cap: the earliest-created of the user's sessions is evicted.
         let mut removed = Vec::new();
         for i in 0..3 {
             removed.extend(insert_session(
                 &mut sessions,
                 &l,
                 format!("a{i}"),
-                session("alice", 100 + i),
+                session("alice", 100 + i, i as i64),
             ));
         }
         assert_eq!(removed, ["a0"]);
@@ -168,31 +185,32 @@ mod tests {
         keys.sort();
         assert_eq!(keys, ["a1", "a2"]);
 
-        // Global cap: the globally earliest-expiring session goes.
-        assert!(insert_session(&mut sessions, &l, "b0".into(), session("bob", 50)).is_empty());
+        // Global cap: the globally earliest-created session goes, even when
+        // it has the latest expiry (e.g. the TTL was raised after restart).
+        assert!(insert_session(&mut sessions, &l, "b0".into(), session("bob", 50, 10)).is_empty());
         assert_eq!(sessions.len(), 3);
         assert!(sessions.contains_key("a1") || sessions.contains_key("a2"));
         assert!(sessions.contains_key("b0"));
-        let removed = insert_session(&mut sessions, &l, "b1".into(), session("bob", 40));
+        let removed = insert_session(&mut sessions, &l, "b1".into(), session("bob", 40, 11));
         assert_eq!(sessions.len(), 3);
-        assert!(!sessions.contains_key("b0"), "earliest expiry evicted");
-        assert_eq!(removed, ["b0"]);
+        assert!(!sessions.contains_key("a1"), "earliest created evicted");
+        assert_eq!(removed, ["a1"]);
 
         // An expired session does not count against a cap.
         let mut sessions = HashMap::new();
-        sessions.insert("old".into(), session("alice", 0));
+        sessions.insert("old".into(), session("alice", 0, 1));
         let mut removed = Vec::new();
         removed.extend(insert_session(
             &mut sessions,
             &l,
             "n1".into(),
-            session("alice", 10),
+            session("alice", 10, 2),
         ));
         removed.extend(insert_session(
             &mut sessions,
             &l,
             "n2".into(),
-            session("alice", 11),
+            session("alice", 11, 3),
         ));
         assert!(!sessions.contains_key("old"));
         assert!(sessions.contains_key("n1") && sessions.contains_key("n2"));

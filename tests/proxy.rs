@@ -51,7 +51,22 @@ async fn spawn_upstream(hits: Arc<AtomicUsize>) -> String {
             format!("{cookie} {path}"),
         )
     }
-    let app = Router::new().fallback(any(handler)).with_state(hits);
+    async fn cached() -> impl IntoResponse {
+        (
+            AppendHeaders([
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (
+                    header::HeaderName::from_static("cdn-cache-control"),
+                    "max-age=600",
+                ),
+            ]),
+            "cached body",
+        )
+    }
+    let app = Router::new()
+        .route("/cached", axum::routing::get(cached))
+        .fallback(any(handler))
+        .with_state(hits);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -435,6 +450,20 @@ async fn end_to_end() {
     assert_eq!(resp.status(), 401);
     let body = resp.text().await.unwrap();
     assert!(body.contains("name=\"phrase\""));
+
+    // e2. upstream caching headers are rewritten for shared caches.
+    let resp = client
+        .get(format!("{base}/cached"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, max-age=300"
+    );
+    assert!(resp.headers().get("cdn-cache-control").is_none());
 
     // f. GET logout -> log-out form, session unchanged; POST logs out
     let resp = client
@@ -1169,4 +1198,371 @@ async fn upgrade_requests_get_501() {
         .unwrap();
     assert_eq!(resp.status(), 501);
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn monitor_truncates_oversized_fields() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, monitor_addr) = spawn_proxy_with_monitor(&upstream, 10).await;
+    let mut m = MonitorClient::connect(monitor_addr);
+    client()
+        .get(format!("http://{proxy}/x"))
+        .header(header::USER_AGENT, "a".repeat(100_000))
+        .send()
+        .await
+        .unwrap();
+    let e = m.event();
+    assert_eq!(e["kind"], "login_page", "{e}");
+    assert_eq!(e["user_agent"].as_str().unwrap().len(), 512, "{e}");
+    assert_eq!(e["truncated"], true, "{e}");
+}
+
+/// Log-out reports failure (and keeps the session) while users.db cannot be
+/// written; it succeeds once the write goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_waits_for_durable_revoke() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, _, db) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    // Hold a write transaction on another connection past the 5s busy timeout.
+    let db_path = db.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = users::open_for_remove(&db_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(6));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    assert!(
+        !set_cookie_values(&resp)
+            .iter()
+            .any(|c| c.contains("Max-Age=0")),
+        "cookie must not be cleared on failure"
+    );
+    assert!(resp.text().await.unwrap().contains("Log out failed"));
+    // The session is still valid.
+    assert_eq!(token_status(&client, &base, &token).await, 200);
+
+    holder.join().unwrap();
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(token_status(&client, &base, &token).await, 401);
+
+    // A fresh router ("restart") on the same db: the token stays revoked.
+    let (proxy2, _) = spawn_proxy_on_db(&upstream, 100, Limits::default(), &db).await;
+    assert_eq!(
+        token_status(&client, &format!("http://{proxy2}"), &token).await,
+        401
+    );
+}
+
+/// A session write waiting on a locked database does not delay unrelated
+/// authenticated traffic.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_db_contention_does_not_block_requests() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits).await;
+    let (proxy, _, db) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let db_path = db.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = users::open_for_remove(&db_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // A second login waits on the database; an authenticated GET does not.
+    let c2 = client.clone();
+    let b2 = base.clone();
+    let login = tokio::spawn(async move {
+        c2.post(format!("{b2}/__wsb/login"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "GET stalled {:?} behind the login's db wait",
+        start.elapsed()
+    );
+    assert_eq!(login.await.unwrap(), 303);
+    holder.join().unwrap();
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn wait_ready(client: &reqwest::Client, base: &str) {
+    for _ in 0..100 {
+        if client.get(base).send().await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("serve did not start listening at {base}");
+}
+
+fn spawn_serve(dir: &PathBuf) -> std::process::Child {
+    bin()
+        .arg("serve")
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// A real process restart preserves the persisted creation order: after a
+/// fourth login the oldest session is the one evicted.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_keeps_eviction_order() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let dir = config_dir();
+    let out = run_add_user(&dir, "alice Correct-Horse-Battery-42\n");
+    assert!(out.status.success(), "{out:?}");
+    let (port, monitor_port) = (free_port(), free_port());
+    let config = dir.join("config.toml");
+    edit_config(
+        &config,
+        "listen_addr",
+        &format!("listen_addr = \"127.0.0.1:{port}\""),
+    );
+    edit_config(
+        &config,
+        "monitor_addr",
+        &format!("monitor_addr = \"127.0.0.1:{monitor_port}\""),
+    );
+    edit_config(&config, "upstream", &format!("upstream = \"{upstream}\""));
+    edit_config(&config, "cookie_secure", "cookie_secure = false");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = client();
+
+    let mut child = spawn_serve(&dir);
+    wait_ready(&client, &base).await;
+    let mut tokens = Vec::new();
+    for _ in 0..3 {
+        tokens.push(login_token(&client, &base).await);
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let conn = users::open_for_remove(&dir.join(users::DB_FILE)).unwrap();
+    let created: Vec<i64> = conn
+        .prepare("SELECT created FROM sessions ORDER BY created")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    drop(conn);
+    assert_eq!(created.len(), 3);
+    assert!(
+        created[0] < created[1] && created[1] < created[2],
+        "created stamps distinct and increasing: {created:?}"
+    );
+
+    let mut child = spawn_serve(&dir);
+    wait_ready(&client, &base).await;
+    tokens.push(login_token(&client, &base).await);
+    for (i, token) in tokens.iter().enumerate() {
+        assert_eq!(
+            token_status(&client, &base, token).await,
+            if i == 0 { 401 } else { 200 },
+            "token {i}"
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_db_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = config_dir();
+    // add-user under a permissive umask still creates a 0600 db.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("umask 022; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_web-safe-block"))
+        .arg("add-user")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"alice Correct-Horse-Battery-42\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let db = dir.join(users::DB_FILE);
+    assert_eq!(db.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+    // A looser existing file warns but is never chmodded.
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = run_add_user(&dir, "bob Another Fine Phrase 77!\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("accessible to other users"), "{stderr}");
+    assert!(stderr.contains("mode 0644"), "{stderr}");
+    let out = bin().arg("list-users").current_dir(&dir).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("accessible to other users"), "{stderr}");
+    assert_eq!(db.metadata().unwrap().permissions().mode() & 0o777, 0o644);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fake upstream: reads the request, sends headers plus one body byte,
+/// then holds the connection without sending more.
+fn spawn_stalled_upstream() -> tokio::task::JoinHandle<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut got = Vec::new();
+                    // Read until the request headers are complete.
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                        .await;
+                    // Hold the connection open without sending more.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    })
+}
+
+/// An upstream that stalls mid-body is cut off by the idle body timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_upstream_body_times_out() {
+    let upstream = spawn_stalled_upstream().await.unwrap();
+    let limits = Limits {
+        upstream_body_idle_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "headers arrive immediately");
+    assert!(
+        resp.bytes().await.is_err(),
+        "stalled body fails after the idle timeout"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// Only `max_upstream_requests` requests are in flight upstream at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_permit_caps_concurrency() {
+    let upstream = spawn_stalled_upstream().await.unwrap();
+    let limits = Limits {
+        max_upstream_requests: 1,
+        upstream_body_idle_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    // First request holds the sole permit until its body times out.
+    let (c1, b1, t1) = (client.clone(), base.clone(), token.clone());
+    let stalled = tokio::spawn(async move {
+        let resp = c1
+            .get(format!("{b1}/foo"))
+            .header(header::COOKIE, format!("wsb_session={t1}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.is_err());
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let resp = client
+        .get(format!("{base}/bar"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+
+    stalled.await.unwrap();
+    // The permit was released when the body ended.
+    let resp = client
+        .get(format!("{base}/bar"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "headers arrive once a permit is free");
 }

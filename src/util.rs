@@ -69,6 +69,56 @@ pub(crate) fn html_escape(s: &str) -> String {
         .collect()
 }
 
+/// Rewrite the caching headers of a gated upstream response so a shared
+/// cache (e.g. a CDN) never serves it to another client: drop `public`,
+/// `s-maxage=…` and `proxy-revalidate` directives, ensure `private` is
+/// present, and remove CDN override headers.
+pub(crate) fn rewrite_cache_control(headers: &mut HeaderMap) {
+    for name in [
+        "cdn-cache-control",
+        "cloudflare-cdn-cache-control",
+        "surrogate-control",
+    ] {
+        while headers.remove(name).is_some() {}
+    }
+    let mut directives = Vec::new();
+    for value in headers.get_all(header::CACHE_CONTROL).iter() {
+        if let Ok(s) = value.to_str() {
+            for d in s.split(',') {
+                let d = d.trim();
+                if d.is_empty() {
+                    continue;
+                }
+                let name = d.split('=').next().unwrap_or(d).trim();
+                if name.eq_ignore_ascii_case("public")
+                    || name.eq_ignore_ascii_case("s-maxage")
+                    || name.eq_ignore_ascii_case("proxy-revalidate")
+                {
+                    continue;
+                }
+                directives.push(d.to_string());
+            }
+        }
+    }
+    while headers.remove(header::CACHE_CONTROL).is_some() {}
+    let mut out = String::from("private");
+    for d in directives {
+        if !d
+            .split('=')
+            .next()
+            .unwrap_or(&d)
+            .trim()
+            .eq_ignore_ascii_case("private")
+        {
+            out.push_str(", ");
+            out.push_str(&d);
+        }
+    }
+    if let Ok(v) = HeaderValue::from_str(&out) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
+}
+
 /// True if a Set-Cookie header value sets the session cookie.
 pub(crate) fn sets_session_cookie(value: &str) -> bool {
     match value.split_once('=') {
@@ -77,8 +127,7 @@ pub(crate) fn sets_session_cookie(value: &str) -> bool {
     }
 }
 
-pub(crate) const PAGE_STYLE: &str =
-    "<style>body,input,button{font-size:24pt}</style>\n";
+pub(crate) const PAGE_STYLE: &str = "<style>body,input,button{font-size:24pt}</style>\n";
 
 pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
     let msg = message
@@ -257,6 +306,37 @@ mod tests {
     #[test]
     fn html_escape_cases() {
         assert_eq!(html_escape("a&<b>\"'c"), "a&amp;&lt;b&gt;&quot;&#39;c");
+    }
+
+    #[test]
+    fn rewrite_cache_control_cases() {
+        let case = |input: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = input {
+                h.insert(header::CACHE_CONTROL, HeaderValue::from_str(v).unwrap());
+            }
+            h.insert("cdn-cache-control", HeaderValue::from_static("max-age=600"));
+            h.insert(
+                "cloudflare-cdn-cache-control",
+                HeaderValue::from_static("max-age=600"),
+            );
+            h.insert("surrogate-control", HeaderValue::from_static("max-age=600"));
+            rewrite_cache_control(&mut h);
+            assert!(h.get("cdn-cache-control").is_none());
+            assert!(h.get("cloudflare-cdn-cache-control").is_none());
+            assert!(h.get("surrogate-control").is_none());
+            h.get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(case(None), "private");
+        assert_eq!(case(Some("public, max-age=300")), "private, max-age=300");
+        assert_eq!(case(Some("s-maxage=60, max-age=10")), "private, max-age=10");
+        assert_eq!(case(Some("no-store")), "private, no-store");
+        assert_eq!(case(Some("PUBLIC, proxy-revalidate")), "private");
+        assert_eq!(case(Some("private, max-age=1")), "private, max-age=1");
     }
 
     #[test]

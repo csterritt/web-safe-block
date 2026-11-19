@@ -12,7 +12,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 
 use crate::auth::{login, logout, logout_page};
-use crate::monitor::{Event, EventKind, EventQueue, Outcome};
+use crate::monitor::{Event, EventKind, EventQueue, Outcome, truncate_at};
 use crate::proxy::proxy_or_login;
 use crate::rate_limit::RATE_LIMIT_WINDOW;
 use crate::sessions::reload_sessions;
@@ -24,7 +24,10 @@ use crate::util::{LOGIN_PATH, LOGOUT_PATH, client_key};
 /// be read.
 pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, String> {
     let state = AppState::new(config, events);
-    reload_sessions(&state).map_err(|e| format!("cannot load sessions: {e}"))?;
+    {
+        let mut last = state.session_writes.try_lock().expect("uncontended");
+        *last = reload_sessions(&state).map_err(|e| format!("cannot load sessions: {e}"))?;
+    }
     spawn_purger(state.clone());
     Ok(Router::new()
         .route(LOGIN_PATH, post(login))
@@ -41,17 +44,20 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     let ip = client_key(req.headers(), peer);
-    let method = req.method().to_string();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map_or("/", |pq| pq.as_str())
-        .to_string();
-    let user_agent = req
+    let (method, m1) = truncate_at(req.method().as_str(), 32);
+    let (path, m2) = truncate_at(
+        req.uri().path_and_query().map_or("/", |pq| pq.as_str()),
+        1024,
+    );
+    let (user_agent, m3) = req
         .headers()
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .map_or((None, false), |ua| {
+            let (t, cut) = truncate_at(ua, 512);
+            (Some(t), cut)
+        });
+    let truncated = m1 || m2 || m3;
     let mut resp = next.run(req).await;
     let outcome = resp
         .extensions_mut()
@@ -70,6 +76,7 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
         path,
         user: outcome.user,
         user_agent,
+        truncated,
     });
     resp
 }
@@ -85,9 +92,16 @@ fn spawn_purger(state: AppState) {
         loop {
             tokio::time::sleep(state.config.limits.purge_interval).await;
             // Reloading drops expired rows and picks up changes made by other
-            // processes (a remove-user deletes the user's sessions).
-            if let Err(e) = reload_sessions(&state) {
-                eprintln!("web-safe-block: session reload failed: {e}");
+            // processes (a remove-user deletes the user's sessions). Held
+            // under session_writes so reloads and session writes stay ordered.
+            {
+                let mut last = state.session_writes.lock().await;
+                let st = state.clone();
+                match tokio::task::spawn_blocking(move || reload_sessions(&st)).await {
+                    Ok(Ok(max)) => *last = (*last).max(max),
+                    Ok(Err(e)) => eprintln!("web-safe-block: session reload failed: {e}"),
+                    Err(e) => eprintln!("web-safe-block: session reload failed: {e}"),
+                }
             }
             let now = Instant::now();
             state.failures.lock().unwrap().retain(|_, v| {

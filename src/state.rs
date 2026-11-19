@@ -22,6 +22,10 @@ pub struct Limits {
     pub max_failure_keys: usize,
     pub upstream_connect_timeout: Duration,
     pub upstream_response_timeout: Duration,
+    /// Upstream response body is dropped if no data arrives for this long.
+    pub upstream_body_idle_timeout: Duration,
+    /// At most this many requests are sent upstream concurrently.
+    pub max_upstream_requests: usize,
     /// How often sessions are reloaded from users.db and stale state purged.
     pub purge_interval: Duration,
 }
@@ -34,6 +38,8 @@ impl Default for Limits {
             max_failure_keys: 10_000,
             upstream_connect_timeout: Duration::from_secs(10),
             upstream_response_timeout: Duration::from_secs(60),
+            upstream_body_idle_timeout: Duration::from_secs(60),
+            max_upstream_requests: 256,
             purge_interval: Duration::from_secs(60),
         }
     }
@@ -74,6 +80,13 @@ pub(crate) struct AppState {
     pub failures: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     pub events: Arc<EventQueue>,
     pub client: Client<HttpConnector, Body>,
+    /// Serializes Argon2 hashing so at most one ~12 MiB run happens at a time.
+    pub hash_slot: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every session DB mutation and reload; the value is the last
+    /// issued `created` stamp so stamps are unique and strictly increasing.
+    pub session_writes: Arc<tokio::sync::Mutex<i64>>,
+    /// Bounds concurrent upstream requests; held until the body finishes.
+    pub upstream_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -81,12 +94,16 @@ impl AppState {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
         let client = Client::builder(TokioExecutor::new()).build(connector);
+        let max_upstream_requests = config.limits.max_upstream_requests;
         AppState {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             failures: Arc::new(Mutex::new(HashMap::new())),
             events,
             client,
+            hash_slot: Arc::new(tokio::sync::Mutex::new(())),
+            session_writes: Arc::new(tokio::sync::Mutex::new(0)),
+            upstream_permits: Arc::new(tokio::sync::Semaphore::new(max_upstream_requests)),
         }
     }
 }

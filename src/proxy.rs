@@ -1,19 +1,25 @@
 //! Forwarding authenticated requests to the protected upstream server.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use http_body::Frame;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::app::with_outcome;
 use crate::monitor::EventKind;
 use crate::sessions::valid_session;
 use crate::state::AppState;
 use crate::util::{
-    client_key, html_response, login_page, sanitize_next, sets_session_cookie, strip_hop_by_hop,
-    strip_session_cookie,
+    client_key, html_response, login_page, rewrite_cache_control, sanitize_next,
+    sets_session_cookie, strip_hop_by_hop, strip_session_cookie,
 };
 
 pub(crate) async fn proxy_or_login(
@@ -96,6 +102,20 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
         headers.insert("x-forwarded-host", host);
     }
 
+    // Bound concurrent upstream requests; the permit lives in the response
+    // body until it finishes or is dropped.
+    let permit = match state.upstream_permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "Service Unavailable",
+            )
+                .into_response();
+        }
+    };
+
     let pending = tokio::time::timeout(
         state.config.limits.upstream_response_timeout,
         state.client.request(req),
@@ -122,6 +142,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
 
     let (mut parts, body) = upstream_resp.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    rewrite_cache_control(&mut parts.headers);
     let set_cookies: Vec<HeaderValue> = parts
         .headers
         .get_all(header::SET_COOKIE)
@@ -133,5 +154,69 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     for v in set_cookies {
         parts.headers.append(header::SET_COOKIE, v);
     }
-    Response::from_parts(parts, Body::new(body))
+    Response::from_parts(
+        parts,
+        Body::new(IdleTimeoutBody::new(
+            body,
+            permit,
+            state.config.limits.upstream_body_idle_timeout,
+        )),
+    )
+}
+
+/// An upstream response body that ends with a timeout error if no frame
+/// arrives within `idle`. Holds the concurrency permit until dropped.
+struct IdleTimeoutBody<B> {
+    inner: B,
+    _permit: OwnedSemaphorePermit,
+    idle: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<B> IdleTimeoutBody<B> {
+    fn new(inner: B, permit: OwnedSemaphorePermit, idle: Duration) -> Self {
+        IdleTimeoutBody {
+            inner,
+            _permit: permit,
+            idle,
+            sleep: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+}
+
+impl<B> http_body::Body for IdleTimeoutBody<B>
+where
+    B: http_body::Body + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = B::Data;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let deadline = tokio::time::Instant::now() + self.idle;
+                self.sleep.as_mut().reset(deadline);
+                Poll::Ready(frame.map(|r| r.map_err(io::Error::other)))
+            }
+            Poll::Pending => match self.sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream body idle timeout",
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }

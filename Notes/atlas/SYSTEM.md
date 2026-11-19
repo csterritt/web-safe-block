@@ -29,7 +29,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 | Resource | Bound | Where |
 |---|---|---|
-| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
+| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
 | Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |
 | Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |
 | Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |
@@ -309,7 +309,7 @@ Payload shapes are what the design implies, not measured traffic.
 | 3 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":0}` |
 | 4 | G → U | SELECT by sha512 | `{"pass_phrase":"ddaf35…(128 hex)"}` |
 | 5 | U → G | user row | `{"user_name":"chris","is_admin":false}` |
-| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":108864000}` |
+| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":15552000}` |
 | 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure"}` |
 | 8 | CF → BR | redirect | `{"status":303,"location":"/"}` |
 

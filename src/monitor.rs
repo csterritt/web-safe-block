@@ -20,6 +20,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const PROBE_WAIT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const BUSY_MESSAGE: &[u8] = b"{\"error\":\"another monitor is already connected\"}\n";
+/// Approximate total bytes the queue may retain (counts included, not just
+/// event count): oversized oldest events are dropped first.
+const MAX_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+/// Most events handed to the monitor in one write.
+const MAX_BATCH: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +39,8 @@ pub enum EventKind {
     /// The log-out form was shown.
     LogoutPage,
     Logout,
+    /// The session could not be durably revoked; it remains valid.
+    LogoutError,
     /// Cross-site POST to a `/__wsb/` endpoint; rejected unchanged.
     Forbidden,
     /// Authenticated request forwarded upstream.
@@ -66,11 +73,27 @@ pub struct Event {
     pub path: String,
     pub user: Option<String>,
     pub user_agent: Option<String>,
+    /// True if any field was truncated to its size cap.
+    pub truncated: bool,
+}
+
+/// Cut `s` at `max` bytes, on a char boundary; reports whether it cut.
+pub fn truncate_at(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
 }
 
 #[derive(Default)]
 struct Inner {
     events: VecDeque<Event>,
+    /// Approximate retained bytes across `events`.
+    bytes: usize,
     next_seq: u64,
     /// Events overwritten while a monitor was connected, not yet reported.
     dropped: u64,
@@ -96,20 +119,24 @@ impl EventQueue {
         }
     }
 
-    /// Add an event, overwriting the oldest unconsumed one if the queue is full.
+    /// Add an event, overwriting the oldest unconsumed ones if the queue is
+    /// over its count capacity or its total byte budget.
     pub fn push(&self, mut ev: Event) {
         ev.time = rfc3339(SystemTime::now());
         let mut inner = self.inner.lock().unwrap();
         inner.next_seq += 1;
         ev.seq = inner.next_seq;
-        if inner.events.len() == self.capacity
-            && let Some(old) = inner.events.pop_front()
-            && inner.monitor_connected
-            && old.seq > inner.sent_up_to
-        {
-            inner.dropped += 1;
-        }
         inner.events.push_back(ev);
+        inner.bytes += event_bytes(inner.events.back().unwrap());
+        while !inner.events.is_empty()
+            && (inner.events.len() > self.capacity || inner.bytes > MAX_QUEUE_BYTES)
+        {
+            let old = inner.events.pop_front().unwrap();
+            inner.bytes -= event_bytes(&old);
+            if inner.monitor_connected && old.seq > inner.sent_up_to {
+                inner.dropped += 1;
+            }
+        }
         drop(inner);
         self.ready.notify_one();
     }
@@ -124,7 +151,7 @@ impl EventQueue {
             .wait_timeout_while(inner, timeout, |i| i.events.is_empty() && i.dropped == 0)
             .unwrap();
         let dropped = std::mem::take(&mut inner.dropped);
-        let batch: Vec<Event> = inner.events.iter().cloned().collect();
+        let batch: Vec<Event> = inner.events.iter().take(MAX_BATCH).cloned().collect();
         if let Some(last) = batch.last() {
             inner.sent_up_to = last.seq;
         }
@@ -135,7 +162,8 @@ impl EventQueue {
     pub fn mark_consumed(&self, up_to: u64) {
         let mut inner = self.inner.lock().unwrap();
         while inner.events.front().is_some_and(|e| e.seq <= up_to) {
-            inner.events.pop_front();
+            let ev = inner.events.pop_front().unwrap();
+            inner.bytes -= event_bytes(&ev);
         }
     }
 
@@ -154,6 +182,16 @@ impl EventQueue {
     fn disconnect(&self) {
         self.inner.lock().unwrap().monitor_connected = false;
     }
+}
+
+/// Rough retained size: string field contents plus a fixed per-event overhead.
+fn event_bytes(e: &Event) -> usize {
+    128 + e.time.len()
+        + e.ip.len()
+        + e.method.len()
+        + e.path.len()
+        + e.user.as_deref().map_or(0, str::len)
+        + e.user_agent.as_deref().map_or(0, str::len)
 }
 
 /// Run the monitor on its own OS thread. Each accepted client is served on a
@@ -286,6 +324,7 @@ mod tests {
             path: path.into(),
             user: None,
             user_agent: None,
+            truncated: false,
         }
     }
 
@@ -364,6 +403,64 @@ mod tests {
         assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(at(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(at(1_798_761_599), "2026-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn truncate_at_cases() {
+        assert_eq!(truncate_at("abc", 10), ("abc".to_string(), false));
+        assert_eq!(truncate_at("abcdef", 3), ("abc".to_string(), true));
+        // Cut backs off to a char boundary.
+        let s = "ab\u{1f600}cd"; // emoji is 4 bytes: a(1) b(1) 😀(4) c(1) d(1)
+        let (t, cut) = truncate_at(s, 4);
+        assert!(cut);
+        assert_eq!(t, "ab");
+        assert_eq!(truncate_at(s, 6).0, "ab\u{1f600}");
+        assert_eq!(truncate_at("", 0), ("".to_string(), false));
+    }
+
+    #[test]
+    fn evicts_over_byte_budget() {
+        let q = EventQueue::new(usize::MAX);
+        let big = "x".repeat(1024 * 1024);
+        for _ in 0..5 {
+            let mut e = ev(&big);
+            e.user_agent = Some(big.clone());
+            q.push(e);
+        }
+        // ~2.1 MiB per event: the oldest were evicted to stay under 4 MiB.
+        let (batch, _) = q.pending(Duration::ZERO);
+        assert_eq!(
+            batch.len(),
+            1,
+            "{:?}",
+            batch.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+        assert_eq!(batch[0].seq, 5);
+        q.mark_consumed(5);
+        for i in 0..4 {
+            q.push(ev(&format!("/{i}")));
+        }
+        let (batch, _) = q.pending(Duration::ZERO);
+        assert_eq!(batch.len(), 4, "small events are unaffected");
+    }
+
+    #[test]
+    fn pending_capped_at_max_batch() {
+        let q = EventQueue::new(1000);
+        for i in 0..250 {
+            q.push(ev(&format!("/{i}")));
+        }
+        let (b1, _) = q.pending(Duration::ZERO);
+        assert_eq!(b1.len(), 100);
+        assert_eq!(b1[0].seq, 1);
+        q.mark_consumed(b1.last().unwrap().seq);
+        let (b2, _) = q.pending(Duration::ZERO);
+        assert_eq!(b2.len(), 100);
+        assert_eq!(b2[0].seq, 101);
+        q.mark_consumed(b2.last().unwrap().seq);
+        let (b3, _) = q.pending(Duration::ZERO);
+        assert_eq!(b3.len(), 50);
+        assert_eq!(b3[0].seq, 201);
     }
 
     #[test]

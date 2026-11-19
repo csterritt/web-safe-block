@@ -18,7 +18,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
     user_name     TEXT    NOT NULL REFERENCES users(user_name) ON DELETE CASCADE,
     cookie_string TEXT    NOT NULL UNIQUE,
-    timestamp     INTEGER NOT NULL
+    timestamp     INTEGER NOT NULL,
+    created       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_name)";
 
@@ -95,43 +96,93 @@ pub fn hash_phrase(salt: &str, phrase: &str) -> String {
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; ARGON2_OUT_LEN];
     argon2
-        .hash_password_into(normalize_phrase(phrase).as_bytes(), salt.as_bytes(), &mut out)
+        .hash_password_into(
+            normalize_phrase(phrase).as_bytes(),
+            salt.as_bytes(),
+            &mut out,
+        )
         .expect("fixed-size salt and output are valid");
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// True if a `users` table exists but has no `salt` column, i.e. the file was
-/// created before per-user salts and cannot be migrated.
-fn predates_salts(conn: &Connection) -> rusqlite::Result<bool> {
-    let has_users: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_users == 0 {
-        return Ok(false);
-    }
-    let columns = conn
-        .prepare("PRAGMA table_info(users)")?
+/// Column names of `table`, or an empty Vec if it does not exist.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    conn.prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    Ok(!columns.iter().any(|c| c == "salt"))
+        .collect()
 }
 
-fn predates_salts_err(path: &Path) -> String {
+/// True if the file's schema predates the current one (a `users` table
+/// without `salt`, or a `sessions` table without `created`) and cannot be
+/// migrated.
+fn stale_schema(conn: &Connection) -> rusqlite::Result<bool> {
+    let users = table_columns(conn, "users")?;
+    if !users.is_empty() && !users.iter().any(|c| c == "salt") {
+        return Ok(true);
+    }
+    let sessions = table_columns(conn, "sessions")?;
+    Ok(!sessions.is_empty() && !sessions.iter().any(|c| c == "created"))
+}
+
+fn stale_schema_err(path: &Path) -> String {
     format!(
-        "{} predates per-user salts; move it aside and re-add users with: \
+        "{} predates the current schema (per-user salts, session creation stamps); move it aside and re-add users with: \
          web-safe-block add-user < users.txt",
         path.display()
     )
 }
 
+/// Create an empty db file mode 0600 so SQLite opens it owner-only;
+/// SQLite's unix VFS gives -journal/-wal files the db file's permissions.
+#[cfg(unix)]
+fn create_private_db(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("cannot create {}: {e}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_db(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Warn (never chmod) if an existing db is accessible to group/other users.
+#[cfg(unix)]
+fn warn_if_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(md) = path.metadata() else { return };
+    let mode = md.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "web-safe-block: warning: {} is accessible to other users \
+             (mode {mode:04o}); run: chmod 600 {}",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_exposed(_path: &Path) {}
+
 /// Open (creating if needed) the database for `add-user`.
 pub fn open_for_add(path: &Path) -> Result<Connection, String> {
     let cannot_open = |e: rusqlite::Error| format!("cannot open {}: {e}", path.display());
+    if !path.exists() {
+        create_private_db(path)?;
+    }
+    warn_if_exposed(path);
     let conn = Connection::open(path).map_err(cannot_open)?;
-    if predates_salts(&conn).map_err(cannot_open)? {
-        return Err(predates_salts_err(path));
+    if stale_schema(&conn).map_err(cannot_open)? {
+        return Err(stale_schema_err(path));
     }
     init(&conn).map_err(cannot_open)?;
     Ok(conn)
@@ -145,12 +196,13 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
             path.display()
         ));
     }
+    warn_if_exposed(path);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
         .map_err(|_| format!("{} does not contain a users table", path.display()))?;
-    if predates_salts(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
-        return Err(predates_salts_err(path));
+    if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
+        return Err(stale_schema_err(path));
     }
     init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     Ok(conn)
@@ -240,19 +292,21 @@ pub struct User {
     pub is_admin: bool,
 }
 
-/// A session row: the SHA-256 of the cookie token, its user, and its expiry.
+/// A session row: the SHA-256 of the cookie token, its user, its expiry, and
+/// its creation stamp (unix microseconds, unique and increasing).
 pub struct StoredSession {
     pub cookie_string: String,
     pub user_name: String,
     pub expires: SystemTime,
+    pub created: i64,
 }
 
 /// Access to the users database for `serve`: reads users, writes sessions.
+/// These are blocking calls; async callers should use `spawn_blocking` and
+/// serialize hashing through `AppState::hash_slot`.
 #[derive(Debug)]
 pub struct UserStore {
     conn: Mutex<Connection>,
-    /// Serializes Argon2 runs so at most one ~12 MiB hash runs at a time.
-    hash_slot: Mutex<()>,
 }
 
 impl UserStore {
@@ -263,13 +317,14 @@ impl UserStore {
         if !path.exists() {
             return Err(missing());
         }
+        warn_if_exposed(path);
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .map_err(|_| missing())?;
-        if predates_salts(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
-            return Err(predates_salts_err(path));
+        if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
+            return Err(stale_schema_err(path));
         }
         if count == 0 {
             return Err(format!(
@@ -280,7 +335,6 @@ impl UserStore {
         init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         Ok(UserStore {
             conn: Mutex::new(conn),
-            hash_slot: Mutex::new(()),
         })
     }
 
@@ -295,7 +349,7 @@ impl UserStore {
             .lock()
             .unwrap()
             .prepare(
-                "SELECT cookie_string, user_name, timestamp FROM sessions \
+                "SELECT cookie_string, user_name, timestamp, created FROM sessions \
                  WHERE timestamp > ?1",
             )?
             .query_map([unix_secs(now)], |r| {
@@ -303,6 +357,7 @@ impl UserStore {
                     cookie_string: r.get(0)?,
                     user_name: r.get(1)?,
                     expires: UNIX_EPOCH + Duration::from_secs(r.get::<_, i64>(2)? as u64),
+                    created: r.get(3)?,
                 })
             })?
             .collect()
@@ -316,8 +371,14 @@ impl UserStore {
             tx.execute("DELETE FROM sessions WHERE cookie_string = ?1", [cookie])?;
         }
         tx.execute(
-            "INSERT INTO sessions (user_name, cookie_string, timestamp) VALUES (?1, ?2, ?3)",
-            params![new.user_name, new.cookie_string, unix_secs(new.expires)],
+            "INSERT INTO sessions (user_name, cookie_string, timestamp, created) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                new.user_name,
+                new.cookie_string,
+                unix_secs(new.expires),
+                new.created
+            ],
         )?;
         tx.commit()
     }
@@ -362,14 +423,12 @@ impl UserStore {
                 },
             )
             .optional()?;
-        // The conn lock is released: hashing holds hash_slot instead, so at
-        // most one 12 MiB Argon2 run happens at a time and session writes are
-        // not blocked by it.
-        let _hash_slot = self.hash_slot.lock().unwrap();
+        // Callers serialize hashing (AppState::hash_slot) so at most one
+        // 12 MiB Argon2 run happens at a time.
         match row {
-            Some((name, salt, hash, is_admin)) => Ok(
-                (hash_phrase(&salt, phrase) == hash).then_some(User { name, is_admin }),
-            ),
+            Some((name, salt, hash, is_admin)) => {
+                Ok((hash_phrase(&salt, phrase) == hash).then_some(User { name, is_admin }))
+            }
             None => {
                 let _ = hash_phrase(DUMMY_SALT, phrase);
                 Ok(None)
@@ -407,11 +466,20 @@ mod tests {
     #[test]
     fn hash_is_argon2id_of_normalized() {
         // Deterministic, and the phrase is normalized before hashing.
-        assert_eq!(hash_phrase("aaaaaaaa", "abc"), hash_phrase("aaaaaaaa", "abc"));
-        assert_eq!(hash_phrase("aaaaaaaa", " A b C "), hash_phrase("aaaaaaaa", "abc"));
+        assert_eq!(
+            hash_phrase("aaaaaaaa", "abc"),
+            hash_phrase("aaaaaaaa", "abc")
+        );
+        assert_eq!(
+            hash_phrase("aaaaaaaa", " A b C "),
+            hash_phrase("aaaaaaaa", "abc")
+        );
         assert_eq!(hash_phrase("aaaaaaaa", "abc").len(), 64);
         // Same phrase, different salts -> different hashes.
-        assert_ne!(hash_phrase("aaaaaaaa", "abc"), hash_phrase("bbbbbbbb", "abc"));
+        assert_ne!(
+            hash_phrase("aaaaaaaa", "abc"),
+            hash_phrase("bbbbbbbb", "abc")
+        );
         // Known answer: computed independently via the argon2 crate.
         let params = Params::new(12 * 1024, 3, 1, Some(32)).unwrap();
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -419,7 +487,10 @@ mod tests {
         argon2
             .hash_password_into(b"abc", b"somesalt", &mut expected)
             .unwrap();
-        let expected = expected.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let expected = expected
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert_eq!(hash_phrase("somesalt", "abc"), expected);
     }
 
@@ -472,13 +543,9 @@ mod tests {
         assert!(!err.to_lowercase().contains("staple"));
 
         let rows: Vec<(String, String, String, bool)> = conn
-            .prepare(
-                "SELECT user_name, salt, pass_phrase, is_admin FROM users ORDER BY rowid",
-            )
+            .prepare("SELECT user_name, salt, pass_phrase, is_admin FROM users ORDER BY rowid")
             .unwrap()
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -513,9 +580,9 @@ mod tests {
         .unwrap();
         let store_sessions = |user: &str| {
             conn.execute(
-                "INSERT INTO sessions (user_name, cookie_string, timestamp) \
-                 VALUES (?1, ?2, ?3)",
-                params![user, format!("c-{user}"), 999_999_999_999i64],
+                "INSERT INTO sessions (user_name, cookie_string, timestamp, created) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![user, format!("c-{user}"), 999_999_999_999i64, 1i64],
             )
             .unwrap();
         };
@@ -547,6 +614,7 @@ mod tests {
             } else {
                 SystemTime::now() - Duration::from_secs((-secs_from_now) as u64)
             },
+            created: 1,
         }
     }
 
@@ -555,7 +623,6 @@ mod tests {
         init(&conn).unwrap();
         UserStore {
             conn: Mutex::new(conn),
-            hash_slot: Mutex::new(()),
         }
     }
 
@@ -639,7 +706,7 @@ mod tests {
             open_for_remove(&path).map(|_| ()).unwrap_err(),
             UserStore::open(&path).map(|_| ()).unwrap_err(),
         ] {
-            assert!(err.contains("predates per-user salts"), "{err}");
+            assert!(err.contains("predates the current schema"), "{err}");
             assert!(err.contains("add-user < users.txt"), "{err}");
         }
 
@@ -650,6 +717,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_sessions_table_without_created_rejected() {
+        const OLD_SESSIONS: &str = "CREATE TABLE sessions (
+            user_name     TEXT    NOT NULL,
+            cookie_string TEXT    NOT NULL UNIQUE,
+            timestamp     INTEGER NOT NULL
+        )";
+        let dir = std::env::temp_dir().join(format!("wsb-oldsess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+
+        // A current users table but a sessions table without `created`.
+        let conn = open_for_add(&path).unwrap();
+        add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        conn.execute("DROP TABLE sessions", []).unwrap();
+        conn.execute(OLD_SESSIONS, []).unwrap();
+        drop(conn);
+
+        for err in [
+            open_for_add(&path).map(|_| ()).unwrap_err(),
+            open_for_remove(&path).map(|_| ()).unwrap_err(),
+            UserStore::open(&path).map(|_| ()).unwrap_err(),
+        ] {
+            assert!(err.contains("predates the current schema"), "{err}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -731,7 +832,10 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert_eq!(store.lookup("", "big secret phrase number 99!").unwrap(), None);
+        assert_eq!(
+            store.lookup("", "big secret phrase number 99!").unwrap(),
+            None
+        );
         // Right name with another user's phrase -> None.
         assert_eq!(
             store.lookup("admin1", "another good phrase 77!").unwrap(),
@@ -771,4 +875,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
-

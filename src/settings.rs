@@ -22,8 +22,8 @@ listen_addr = "127.0.0.1:8080"
 # Protected server; must be http:// with no path.
 upstream = "http://127.0.0.1:3000"
 
-# Session lifetime in seconds (6 months).
-session_ttl_secs = 108864000
+# Session lifetime in seconds (180 days, about 6 months).
+session_ttl_secs = 15552000
 
 # Add the Secure flag to the session cookie. Set to false only for plain-http
 # testing on a non-localhost hostname.
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(s.users_db, dir.join("users.db"));
         assert_eq!(s.listen_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(s.upstream, "http://127.0.0.1:3000");
-        assert_eq!(s.session_ttl_secs, 108_864_000);
+        assert_eq!(s.session_ttl_secs / 86_400, 180);
         assert!(s.cookie_secure);
         assert_eq!(s.monitor_addr, "127.0.0.1:8081".parse().unwrap());
         assert_eq!(s.monitor_queue_len, 1000);

@@ -58,7 +58,7 @@ web-safe-block -c /etc/web-safe-block/config.toml serve
 | `users_db`.         | `"users.db"`              | sqlite3 users database. A relative path is relative to the config file's directory. |
 | `listen_addr`.      | `"127.0.0.1:8080"`        | Public-facing address web-safe-block listens on. |
 | `upstream`          | `"http://127.0.0.1:3000"` | Protected server (must be `http://` with no path). |
-| `session_ttl_secs`  | `108864000` (6 months)    | Session lifetime. |
+| `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime. |
 | `cookie_secure`     | `true`                    | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
 | `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor port. Must be a loopback address. |
 | `monitor_queue_len` | `1000`                    | How many unreported events are kept. |
@@ -105,13 +105,13 @@ $ nc 127.0.0.1 8081
 
 - `kind` is one of:
   - `login_page`: unauthenticated request, shown the form.
-  - `login_failed`, `login_succeeded`, `login_error` (user lookup failed), `rate_limited`, `logout_page`, `logout`, `forbidden` (cross-site POST rejected).
+  - `login_failed`, `login_succeeded`, `login_error` (user lookup failed), `rate_limited`, `logout_page`, `logout`, `logout_error` (the session could not be durably revoked and remains valid), `forbidden` (cross-site POST rejected).
   - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502/504.
   - `upgrade`: authenticated request with an `Upgrade` header; answered 501.
   - `reserved`: an unknown `/__wsb/` path.
   - `other`: e.g. wrong method or a malformed form.
-- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page` and `logout`.
-- The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor and marks them consumed only after they have been written.
+- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page`, `logout` and `logout_error`. `truncated` is true when `path` (1024 bytes), `user_agent` (512 bytes) or `method` (32 bytes) was cut to its cap.
+- The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor — at most 100 events per write — and marks them consumed only after they have been written. The queue also has a ~4 MiB total byte budget.
 - When the queue is full, the oldest events are overwritten.
   - With no monitor connected this happens silently. A monitor that connects later first receives whatever is still queued.
   - If events are overwritten before a connected monitor gets them, it receives `{"kind":"dropped","count":N}`.
@@ -121,13 +121,17 @@ $ nc 127.0.0.1 8081
 ### Security notes
 
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
-- The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped.
+- The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped. Gated responses are always marked `Cache-Control: private` (`public`, `s-maxage`, `proxy-revalidate` and CDN override headers are removed) so shared caches cannot serve them to another client. Do NOT configure edge rules that override origin cache-control for this hostname (e.g. Cloudflare Cache Rules with "Ignore cache-control header" or an Edge TTL override); use a cache bypass rule if in doubt.
 - Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP), with a 1s delay on each failure. Because `CF-Connecting-IP` is trusted, don't expose `listen_addr` anywhere except to the tunnel.
-- Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest is dropped) and 10,000 in total are kept.
+- Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest, by a persisted creation stamp, is dropped) and 10,000 in total are kept. Every users.db created before the current schema is rejected, so no sessions outlive the change to 180-day TTLs — users are re-added anyway.
 - Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
-- Upstream requests time out after 10s to connect and 60s waiting for response headers (504).
+- Upstream requests time out after 10s to connect and 60s waiting for response headers (504); a response body that stalls for 60s is cut off with an error. At most 256 requests are in flight upstream at once; further requests are answered 503.
 - Login is by user name (case-insensitive) plus pass phrase. Pass phrases are stored as Argon2id hashes (12 MiB, 3 passes, 1 lane) with a random per-user salt, so identical phrases don't produce identical hashes and precomputed tables don't apply. The slow hash makes offline guessing of a leaked `users.db` far more expensive, though weak phrases can still be guessed, so the strength rules still apply; keep `users.db` private. Logins are hashed one at a time and each briefly uses ~12 MiB.
-- A `users.db` created before per-user salts existed is rejected by every command; move it aside and re-add the users with `add-user`.
+- A `users.db` created before the current schema (per-user salts, session creation stamps) is rejected by every command; move it aside and re-add the users with `add-user`. New databases are created mode `0600`; an existing db accessible to group or other users produces a stderr warning (never a chmod).
 - WebSockets and other protocol upgrades are not supported in v1; authenticated requests with an `Upgrade` header are answered 501 and never forwarded.
 - Paths under `/__wsb/` are reserved and never forwarded.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.
+
+#### Threat model and rotation
+
+A leaked `users.db` gives an attacker salted Argon2id hashes — offline guessing of weak phrases is possible, hence the strength rules — plus session hashes, which are *not* usable as cookies (the cookie is the raw token; only its SHA-256 is stored). To rotate a user, `remove-user name` then `add-user` with a new phrase: the phrase stops working immediately and a running `serve` drops their live sessions within 60 seconds. If the db leaks, rotate every user.
