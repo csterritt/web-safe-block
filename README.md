@@ -14,19 +14,7 @@ This program, `web-safe-block`, is a simple rust program that gates access to a 
 
 It doesn't do TLS termination, so it's meant to be run behind a Cloudflare tunnel or some other such service.
 
-### Pass phrase
-
-Users who can enter the program are added (see 'Usage' section below) with a user name and a pass phrase (hashed with sha-512 for storage). The log in page only takes the pass phrase, for simplicity. One reviewer flagged this, pointing out that if the user database is stolen, the attacker can "quickly" figure out all the pass phrases since there is no per-user salt.
-
-How quickly?
-
-Pass phrases are converted to lower-case, and have all spaces removed (so it's fairly typo-tolerant). Pass phrases must be at least 20 characters long, and have at least one number and one punctuation character in them.
-
-So in all there are about 2,459,680,572,025,003,612,127,586,705,579,442,176 possible pass phrases. Enumerating them at one billion tests per second would take about 77,995,959,285,419,952,185 years.
-
-But no one uses a pass phrase like `23/o42ljk4dv0cv-rj453lj5` (or at least I wouldn't inflict such a phrase on someone). The 'phrase' in 'pass phrase' means 'pick a reasonable sentence' and use that.
-
-So how many such phrases are there? I downloaded a list of the most common 62k words (from Wiktionary) and did a bit of analysis. You need anywhere from 2 to 7 words to make a 20-character phrase. The average number of words is 3.2320154, so 4 words. So 62000 to the 4th power, times ten for the required digit, times 36 for the punctionation mark, is 4,580,664,160,000,000,000,000 which at one billion tests per second would take about 145,251 years to enumerate them all. Well, on *average* you'd probably get a match in half that time.
+Notably, the admin is handled through command-line tools, not through the web interface. So the admin can set up reasonable pass phrases, and there is no facility for users to change their own pass phrases.
 
 ### Usage
 
