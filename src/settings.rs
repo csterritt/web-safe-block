@@ -114,6 +114,11 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if raw.session_ttl_secs == 0 {
         return Err(bad("session_ttl_secs must be at least 1".into()));
     }
+    if raw.session_ttl_secs > 315_360_000 {
+        return Err(bad(
+            "session_ttl_secs must be at most 315360000 (10 years)".into()
+        ));
+    }
     let users_db = match path.parent() {
         Some(dir) if raw.users_db.is_relative() => dir.join(&raw.users_db),
         _ => raw.users_db,
@@ -253,6 +258,11 @@ mod tests {
                 "session_ttl_secs",
                 "session_ttl_secs = 0",
                 "session_ttl_secs",
+            ),
+            (
+                "session_ttl_secs",
+                "session_ttl_secs = 9999999999",
+                "10 years",
             ),
             ("listen_addr", "listen_addr = \"localhost\"", "listen_addr"),
             ("cookie_secure", "cookie_secure = \"yes\"", "cookie_secure"),

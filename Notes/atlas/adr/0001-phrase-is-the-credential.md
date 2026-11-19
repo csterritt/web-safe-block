@@ -1,6 +1,6 @@
 # ADR 0001 — The pass phrase is the whole credential
 
-Status: accepted (2026-11)
+Status: superseded (commit c3f8099). Login is now user name + pass phrase, with per-user salted Argon2id hashes instead of unsalted SHA-512. The history below is kept as written (accepted 2026-11).
 
 ## Decision
 

@@ -2,19 +2,19 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **10 open · 7 resolved**._
+_Question status: **9 open · 8 resolved**._
 
 ## One paragraph
 
-web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in `users.db` — then it mints a session cookie (persisted as a hash in `users.db`) and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions survive a restart.
+web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a small login form until someone submits a user name and pass phrase that verifies against `users.db` — then it mints a session cookie (persisted as a hash in `users.db`) and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions survive a restart.
 
 ## Decisions locked
 
 | Axis | Decision | ADR |
 |---|---|---|
 | Runtime | Rust + axum/hyper on one tokio runtime; a plain OS thread runs the monitor | — |
-| Credential | The pass phrase is the whole credential — it identifies the user; no username on the wire | [0001](./adr/0001-phrase-is-the-credential.md) |
-| Phrase storage | Unsalted SHA-512 of the normalized phrase (per-user salt is impossible when lookup is by phrase alone); ≥20 chars + digit + punctuation enforced at add time | [0001](./adr/0001-phrase-is-the-credential.md) |
+| Credential | User name + pass phrase; names are 1–64 printable ASCII, matched case-insensitively | [0001](./adr/0001-phrase-is-the-credential.md) |
+| Phrase storage | Per-user salted Argon2id (12 MiB, t=3, p=1, 32-byte out) of the normalized phrase, looked up by user name — unknown names still cost one hash against a dummy salt; ≥20 chars + digit + punctuation enforced at add time | [0001](./adr/0001-phrase-is-the-credential.md) |
 | Sessions | Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total; reload on the 60s purge tick picks up remove-user | [0006](./adr/0006-sessions-persisted.md) |
 | Client IP | CF-Connecting-IP is trusted when present — listen_addr must only ever face the tunnel | [0003](./adr/0003-trusted-edge-header.md) |
 | Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file | [0004](./adr/0004-strict-config.md) |
@@ -31,13 +31,13 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 |---|---|---|
 | Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
 | Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |
-| Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |
+| Event queue | `monitor_queue_len` (default 100), oldest overwritten | `src/monitor.rs` `EventQueue` |
 | Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |
-| users.db | one row per user; phrase kept only as SHA-512 hex | `src/users.rs` |
+| users.db | one row per user; phrase kept only as a per-user salted Argon2id hash | `src/users.rs` |
 ## Reading order (the atlas chapters)
 
 1. **The front door** — Every request arrives at one public port; everything else hides behind it. _(adds BR, CF, G)_
-2. **The phrase book** — One secret per person: the phrase is both password and identity. _(adds U)_
+2. **The phrase book** — A name and a secret per person: the phrase proves you, the name says who. _(adds U)_
 3. **The session table** — A correct phrase mints a token; the cookie is your ticket from then on. _(adds S)_
 4. **Through to the app** — Once you're known, the gate rewrites and forwards — the app never sees the login dance. _(adds F, UP)_
 5. **Slowing down guessing** — Wrong phrase? Ten tries per quarter-hour per client — and each miss costs a second. _(adds R)_
@@ -56,12 +56,12 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Anyone on the internet. They see exactly two things from web-safe-block itself: the phrase form, and — once they are in — whatever the protected app serves.
 
-**How it's built.** All it ever needs to send is a `POST /__wsb/login` with a `phrase` field, then carry the `wsb_session` cookie. No JavaScript on our pages; plain forms only.
+**How it's built.** All it ever needs to send is a `POST /__wsb/login` with `user` and `phrase` fields, then carry the `wsb_session` cookie. No JavaScript on our pages; plain forms only.
 
 **Steps in execution.**
 
-1. **Ask** — GET any path — gets the phrase form back until logged in.
-2. **Submit** — POST the phrase to /__wsb/login.
+1. **Ask** — GET any path — gets the login form back until logged in.
+2. **Submit** — POST the user name and phrase to /__wsb/login.
 3. **Carry** — Browser sends wsb_session automatically on later requests.
 
 #### T · TLS terminator
@@ -125,16 +125,16 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 #### R · Failure ledger
 
-**In one line.** Ten failed phrases per quarter-hour per client — and each miss costs a second.
+**In one line.** Ten failed logins per quarter-hour per client — and each miss costs a second.
 
-**What it does.** The brute-force brake. Every wrong phrase is written down against the client's IP; after ten in fifteen minutes the answer is "too many attempts" until the window slides past.
+**What it does.** The brute-force brake. Every failed login is written down against the client's IP; after ten in fifteen minutes the answer is "too many attempts" until the window slides past.
 
-**How it's built.** `HashMap<ip, Vec<Instant>>`. **One attempt is reserved under a single lock** before the database lookup, refunded on a db error, cleared on success — so concurrent guesses can't slip past the limit. Ledger bounded to 10,000 keys; a wrong answer also waits 1s before responding.
+**How it's built.** `HashMap<ip, Vec<Instant>>`. **One attempt is reserved under a single lock** before the database lookup, refunded on a db error and on success — a success only undoes its own reservation, so failures against other names keep counting. Ledger bounded to 10,000 keys; a wrong answer also waits 1s before responding.
 
 **Steps in execution.**
 
 1. **Reserve** — Count this attempt under one lock; refuse if the key already has 10 in-window.
-2. **Judge** — Lookup miss → keep the stamp; db error → refund it; success → clear the key.
+2. **Judge** — Lookup miss → keep the stamp; db error or success → refund it.
 3. **Delay** — Failed logins sleep 1s before the 401.
 
 **Questions.**
@@ -144,24 +144,24 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 #### U · Phrase book
 
-**In one line.** The sqlite file of who may enter — phrase hashes only, never phrases.
+**In one line.** The sqlite file of who may enter — salted phrase hashes only, never phrases.
 
-**What it does.** The list of people allowed in. It stores each user name, the SHA-512 of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "is there anyone with this phrase?" on every login.
+**What it does.** The list of people allowed in. It stores each user name, a random salt, the Argon2id hash of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "does this name + phrase verify?" on every login.
 
-**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. Phrases are **normalized — whitespace stripped, lower-cased** — then hex SHA-512'd. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
+**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. Phrases are **normalized — whitespace stripped, lower-cased** — then hashed with **Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt**. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
 
 **Steps in execution.**
 
 1. **Normalize** — Drop all whitespace, lower-case ("Open Sesame" == "opensesame").
-2. **Hash** — SHA-512 hex — that string is what is stored and searched.
-3. **Lookup** — SELECT user_name, is_admin WHERE pass_phrase = hash.
+2. **Hash** — Argon2id of the normalized phrase under a per-user salt — that hex is what is stored.
+3. **Lookup** — SELECT row WHERE user_name = ?1, then verify the Argon2id hash in constant time.
 4. **Manage** — add-user inserts; remove-user deletes by name; list-users prints names + flags.
 
 **Questions.**
 
 - ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
-- ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
+- ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
 
 ### Through to the app
 
@@ -171,20 +171,20 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app's answer.
 
-**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers, and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
+**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers, and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (`IdleTimeoutBody`) that cuts off stalled streams. At most **256 requests** run upstream at once — extras get 503. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
 
 **Steps in execution.**
 
 1. **Rewrite** — Keep path+query; replace scheme and authority with upstream.
 2. **Scrub** — Session cookie out; hop-by-hop out; client forwarding headers out.
 3. **Stamp** — Write X-Forwarded-For/-Proto/-Host from verified values.
-4. **Send** — 10s connect timeout, 60s to response headers; else 502/504.
+4. **Send** — 10s connect timeout, 60s to response headers; else 502/504; cap 256 concurrent, else 503.
 5. **Return** — Strip hop-by-hop on the way back; drop any wsb_session Set-Cookie.
 
 **Questions.**
 
 - ~~**Q-F1** Trust client-sent X-Forwarded-* / X-Real-IP headers?~~ ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
-- **Q-F2** Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?
+- ~~**Q-F2** Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?~~ ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
 
 #### A · Protected app
 
@@ -304,10 +304,10 @@ Payload shapes are what the design implies, not measured traffic.
 
 | # | From → To | Packet | Representative payload |
 |---|---|---|---|
-| 1 | BR → CF | POST /__wsb/login | `{"form":{"phrase":"correct horse battery staple 42!"}}` |
-| 2 | CF → G | phrase + client IP | `{"headers":{"cf-connecting-ip":"203.0.113.9"}}` |
+| 1 | BR → CF | POST /__wsb/login | `{"form":{"user":"chris","phrase":"correct horse battery staple 42!"}}` |
+| 2 | CF → G | name + phrase + client IP | `{"headers":{"cf-connecting-ip":"203.0.113.9"}}` |
 | 3 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":0}` |
-| 4 | G → U | SELECT by sha512 | `{"pass_phrase":"ddaf35…(128 hex)"}` |
+| 4 | G → U | SELECT by user_name + Argon2id verify | `{"user_name":"chris"}` |
 | 5 | U → G | user row | `{"user_name":"chris","is_admin":false}` |
 | 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":15552000}` |
 | 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure"}` |
@@ -331,12 +331,12 @@ Payload shapes are what the design implies, not measured traffic.
 
 | # | From → To | Packet | Representative payload |
 |---|---|---|---|
-| 1 | BR → G | POST wrong phrase | `{"form":{"phrase":"let me in"}}` |
+| 1 | BR → G | POST wrong phrase | `{"form":{"user":"chris","phrase":"let me in"}}` |
 | 2 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":"n/10"}` |
 | 3 | R → G | under limit | `{"allowed":true}` |
-| 4 | G → U | SELECT by sha512 | `{"pass_phrase":"hash(letmein)"}` |
+| 4 | G → U | SELECT by user_name + Argon2id verify | `{"user_name":"chris"}` |
 | 5 | U → G | miss | `{"found":false}` |
-| 6 | G → BR | 401 after 1s | `{"page":"Incorrect phrase.","kind":"login_failed"}` |
+| 6 | G → BR | 401 after 1s | `{"page":"Incorrect user name or phrase.","kind":"login_failed"}` |
 
 ### Logging out
 
@@ -370,9 +370,9 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - ~~**Q-R2**~~ (R) ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
 - ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** (U) The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
-- ~~**Q-U3**~~ (U) ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
+- ~~**Q-U3**~~ (U) ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
-- **Q-F2** (F) Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?
+- ~~**Q-F2**~~ (F) ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
 - **Q-A1** (A) Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
 - **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
@@ -383,7 +383,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 
 **Platform gives:** axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand.
 
-**We own:** the gate: phrase-only login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.
+**We own:** the gate: user-name + pass-phrase login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.
 
 ## Planned filesystem
 

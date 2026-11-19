@@ -4,7 +4,7 @@ Status: accepted (2026-11)
 
 ## Decision
 
-The monitor is a loopback-only TCP port serving JSON-lines events to exactly one client at a time; additional connections get a busy error and close. The event queue is bounded (`monitor_queue_len`, default 1,000) and overwrites the oldest events when full — reported to a connected monitor as `{"kind":"dropped","count":N}`. Events are marked consumed only after being written to the socket.
+The monitor is a loopback-only TCP port serving JSON-lines events to exactly one client at a time; additional connections get a busy error and close. The event queue is bounded (`monitor_queue_len`, default 100) and overwrites the oldest events when full — reported to a connected monitor as `{"kind":"dropped","count":N}`. Events are marked consumed only after being written to the socket.
 
 ## Why
 

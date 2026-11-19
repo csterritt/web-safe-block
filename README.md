@@ -35,7 +35,6 @@ EOF
 
 # List all users:
 ./target/release/web-safe-block list-users
-EOF
 
 # Run the server
 ./target/release/web-safe-block serve
@@ -51,17 +50,17 @@ web-safe-block -c /etc/web-safe-block/config.toml serve
 
 #### Configuration
 
-`add-user` and `serve` exit with an error if the config file is missing, can't be parsed, is missing any setting, or contains an unknown one.
+Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `serve`) validates the config file first, exiting with an error if it is missing, can't be parsed, is missing any setting, or contains an unknown one.
 
 | Setting | Default | Meaning |
 |---------------------|---------------------------|---|
-| `users_db`.         | `"users.db"`              | sqlite3 users database. A relative path is relative to the config file's directory. |
-| `listen_addr`.      | `"127.0.0.1:8080"`        | Public-facing address web-safe-block listens on. |
+| `users_db`          | `"users.db"`              | sqlite3 users database. A relative path is relative to the config file's directory. |
+| `listen_addr`       | `"127.0.0.1:8080"`        | Public-facing address web-safe-block listens on. |
 | `upstream`          | `"http://127.0.0.1:3000"` | Protected server (must be `http://` with no path). |
-| `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime. |
+| `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime; at most 10 years (315360000). |
 | `cookie_secure`     | `true`                    | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
 | `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor port. Must be a loopback address. |
-| `monitor_queue_len` | `1000`                    | How many unreported events are kept. |
+| `monitor_queue_len` | `100`                     | How many unreported events are kept. |
 
 #### `write-config`
 
@@ -74,7 +73,7 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 - Pass phrases are normalized: all whitespace is removed and the phrase is lower-cased. `Open Sesame` and `opensesame` are the same phrase.
 - New pass phrases must have at least 20 non-whitespace characters, at least one number, and at least one punctuation character. Lines with weaker phrases are reported and skipped.
 - The database stores a random per-user salt and an Argon2id hash (12 MiB, 3 passes, 1 lane) of the normalized phrase, not the phrase itself. Each line therefore takes a noticeable fraction of a second to add.
-- User names must be unique (case-insensitive), including against users already in the database. Pass phrases do not need to be unique.
+- User names must be 1–64 printable ASCII characters (`!`–`~`) and unique (case-insensitive), including against users already in the database. Pass phrases do not need to be unique.
 - A user whose name contains `admin` (any case) is an admin.
 - Blank lines are ignored. Bad lines (no phrase, duplicate name) are reported on stderr and skipped. The other lines are still added, and the command exits with status 1 if anything was skipped.
 
@@ -92,7 +91,7 @@ Speed: one hash took about 16 ms in a release build on the development machine. 
 
 Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
 
-Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected.
+Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. Login form bodies are limited to 4 KiB.
 
 #### Monitor port
 
@@ -106,7 +105,7 @@ $ nc 127.0.0.1 8081
 - `kind` is one of:
   - `login_page`: unauthenticated request, shown the form.
   - `login_failed`, `login_succeeded`, `login_error` (user lookup failed), `rate_limited`, `logout_page`, `logout`, `logout_error` (the session could not be durably revoked and remains valid), `forbidden` (cross-site POST rejected).
-  - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502/504.
+  - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502/503/504.
   - `upgrade`: authenticated request with an `Upgrade` header; answered 501.
   - `reserved`: an unknown `/__wsb/` path.
   - `other`: e.g. wrong method or a malformed form.

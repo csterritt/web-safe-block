@@ -19,7 +19,7 @@ fi
 
 last_dir=$(basename "$(pwd)")
 
-ssh chris@utmbox "cd ${last_dir} && scripts/tar-new.sh /tmp/new-files.tar"
+ssh chris@utmbox "cd $(printf %q "$last_dir") && scripts/tar-new.sh /tmp/new-files.tar"
 
 scp chris@utmbox:/tmp/new-files.tar /tmp/new-files.tar
 scp chris@utmbox:/tmp/deleted-files.txt /tmp/deleted-files.txt

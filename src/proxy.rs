@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use http_body::Frame;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -18,7 +18,7 @@ use crate::monitor::EventKind;
 use crate::sessions::valid_session;
 use crate::state::AppState;
 use crate::util::{
-    client_key, html_response, login_page, rewrite_cache_control, sanitize_next,
+    client_key, html_response, login_page, plain_response, rewrite_cache_control, sanitize_next,
     sets_session_cookie, strip_hop_by_hop, strip_session_cookie,
 };
 
@@ -30,7 +30,7 @@ pub(crate) async fn proxy_or_login(
     // Reserved namespace: never forward /__wsb/* upstream.
     if req.uri().path().starts_with("/__wsb/") {
         return with_outcome(
-            (StatusCode::NOT_FOUND, "Not Found").into_response(),
+            plain_response(StatusCode::NOT_FOUND, "Not Found"),
             EventKind::Reserved,
             None,
         );
@@ -48,7 +48,7 @@ pub(crate) async fn proxy_or_login(
     // Protocol upgrades (e.g. WebSockets) are not supported.
     if req.headers().contains_key(header::UPGRADE) {
         return with_outcome(
-            (StatusCode::NOT_IMPLEMENTED, "Not Implemented").into_response(),
+            plain_response(StatusCode::NOT_IMPLEMENTED, "Not Implemented"),
             EventKind::Upgrade,
             Some(user),
         );
@@ -68,11 +68,15 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     parts.authority = upstream.authority().cloned();
     let new_uri = match Uri::from_parts(parts) {
         Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response(),
+        Err(_) => return plain_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
     };
     *req.uri_mut() = new_uri;
 
+    // Read client IP and Host before stripping: a client-controlled
+    // `Connection` header must not be able to remove them first.
     let headers = req.headers_mut();
+    let key = client_key(headers, Some(peer));
+    let host = headers.get(header::HOST).cloned();
     strip_session_cookie(headers);
     strip_hop_by_hop(headers);
     // The client is untrusted: rebuild forwarding headers from scratch.
@@ -86,7 +90,6 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     ] {
         while headers.remove(name).is_some() {}
     }
-    let key = client_key(headers, Some(peer));
     if let Ok(v) = HeaderValue::from_str(&key) {
         headers.insert("x-forwarded-for", v);
     }
@@ -98,7 +101,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
             "http"
         }),
     );
-    if let Some(host) = headers.get(header::HOST).cloned() {
+    if let Some(host) = host {
         headers.insert("x-forwarded-host", host);
     }
 
@@ -107,12 +110,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     let permit = match state.upstream_permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "Service Unavailable",
-            )
-                .into_response();
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
         }
     };
 
@@ -123,20 +121,10 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     let upstream_resp = match pending.await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "Bad Gateway",
-            )
-                .into_response();
+            return plain_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
         }
         Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "Gateway Timeout",
-            )
-                .into_response();
+            return plain_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
         }
     };
 
@@ -147,7 +135,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
         .headers
         .get_all(header::SET_COOKIE)
         .iter()
-        .filter(|v| v.to_str().map(|s| !sets_session_cookie(s)).unwrap_or(true))
+        .filter(|v| !sets_session_cookie(v.as_bytes()))
         .cloned()
         .collect();
     while parts.headers.remove(header::SET_COOKIE).is_some() {}

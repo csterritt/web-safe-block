@@ -2,9 +2,9 @@
 
 The nouns, one line each. Edited by hand; everything else in this folder is generated.
 
-- **pass phrase** — the only credential: a multi-word secret typed into the login form; identifies the user all by itself (no username on the wire)
+- **pass phrase** — a multi-word secret typed into the login form alongside the user name
 - **normalized phrase** — the phrase with all whitespace removed, lower-cased; "Open Sesame" and "opensesame" are the same phrase
-- **users.db** — the sqlite file holding one row per user (name, hex SHA-512 of the normalized phrase, admin flag) plus a `sessions` table of live session hashes; managed by `add-user`, `remove-user`, and `list-users`
+- **users.db** — the sqlite file holding one row per user (name, random salt, hex Argon2id of the normalized phrase, admin flag) plus a `sessions` table of live session hashes; managed by `add-user`, `remove-user`, and `list-users`
 - **session** — a random 32-byte hex token mapped to a user name and expiry; the browser carries it as the `wsb_session` cookie, the server keeps it as a SHA-256 hash in an in-memory map written through to `users.db`
 - **the gate** — the public listener and its handlers: phrase form, login, logout, session check, forward-or-refuse
 - **upstream** — the protected web server, always `http://` on loopback; only reachable through the gate

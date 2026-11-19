@@ -10,23 +10,31 @@ use serde::Deserialize;
 
 use crate::app::with_outcome;
 use crate::monitor::EventKind;
-use crate::rate_limit::{clear_failures, refund_attempt, reserve_attempt};
-use crate::sessions::{
-    Session, hash_token, insert_session, new_token, reload_sessions, unix_micros, valid_session,
-};
+use crate::rate_limit::{refund_attempt, reserve_attempt};
+use crate::sessions::{Session, evictions, hash_token, new_token, unix_micros, valid_session};
 use crate::state::AppState;
 use crate::users::StoredSession;
 use crate::util::{
     LOGOUT_PATH, PAGE_STYLE, SESSION_COOKIE, clear_cookie_header, client_key, cross_site,
-    html_response, login_page, parse_cookies, sanitize_next, session_cookie_header,
+    html_response, login_page, parse_cookies, plain_response, sanitize_next, session_cookie_header,
 };
 
 pub(crate) fn forbidden() -> Response {
     with_outcome(
-        (StatusCode::FORBIDDEN, "Forbidden").into_response(),
+        plain_response(StatusCode::FORBIDDEN, "Forbidden"),
         EventKind::Forbidden,
         None,
     )
+}
+
+/// A bookmark or refresh of the login URL bounces to the front page,
+/// which answers with the login form until the visitor is authenticated.
+pub(crate) async fn login_redirect() -> Response {
+    let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::LOCATION, HeaderValue::from_static("/"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    with_outcome(resp, EventKind::LoginPage, None)
 }
 
 #[derive(Deserialize)]
@@ -45,7 +53,7 @@ pub(crate) async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let next = sanitize_next(&form.next);
-    if cross_site(&headers) {
+    if cross_site(&headers, state.config.cookie_secure) {
         return forbidden();
     }
     let key = client_key(&headers, Some(peer));
@@ -108,40 +116,47 @@ pub(crate) async fn login(
                 expires,
                 created,
             };
-            let removed = {
-                let mut sessions = state.sessions.lock().unwrap();
-                insert_session(
-                    &mut sessions,
-                    &state.config.limits,
-                    stored.cookie_string.clone(),
-                    Session {
-                        expires,
-                        user: user.name.clone(),
-                        created,
-                    },
-                )
-            };
+            // Plan the evictions first; the map is mutated only once the
+            // rows are durably written, so a failed save evicts nothing.
+            let removed = evictions(
+                &state.sessions.lock().unwrap(),
+                &state.config.limits,
+                &user.name,
+            );
+            let cookie_string = stored.cookie_string.clone();
             let users = state.config.users.clone();
-            let saved =
-                tokio::task::spawn_blocking(move || users.save_session(&stored, &removed)).await;
+            let saved = {
+                let removed = removed.clone();
+                tokio::task::spawn_blocking(move || users.save_session(&stored, &removed)).await
+            };
             if !matches!(saved, Ok(Ok(()))) {
                 match &saved {
                     Ok(Err(e)) => eprintln!("web-safe-block: session save failed: {e}"),
                     Err(e) => eprintln!("web-safe-block: session save failed: {e}"),
                     _ => {}
                 }
-                let st = state.clone();
-                match tokio::task::spawn_blocking(move || reload_sessions(&st)).await {
-                    Ok(Ok(max)) => *last_created = (*last_created).max(max),
-                    Ok(Err(e)) => eprintln!("web-safe-block: session reload failed: {e}"),
-                    Err(e) => eprintln!("web-safe-block: session reload failed: {e}"),
-                }
                 refund_attempt(&mut state.failures.lock().unwrap(), &key);
                 return login_error(&next);
             }
+            {
+                let mut sessions = state.sessions.lock().unwrap();
+                for k in &removed {
+                    sessions.remove(k);
+                }
+                sessions.insert(
+                    cookie_string,
+                    Session {
+                        expires,
+                        user: user.name.clone(),
+                        created,
+                    },
+                );
+            }
             drop(last_created);
             println!("web-safe-block: user '{}' logged in", user.name);
-            clear_failures(&state.failures, &key);
+            // A success undoes only its own reserved attempt; earlier
+            // failures against other names keep counting.
+            refund_attempt(&mut state.failures.lock().unwrap(), &key);
             let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
             let h = resp.headers_mut();
             h.insert(header::LOCATION, HeaderValue::from_str(&next).unwrap());
@@ -193,14 +208,17 @@ pub(crate) async fn logout_page(State(state): State<AppState>, headers: HeaderMa
 /// Acknowledge log-out only once the session is durably revoked in users.db.
 /// On failure the cookie and the in-memory session are kept.
 pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if cross_site(&headers) {
+    if cross_site(&headers, state.config.cookie_secure) {
         return forbidden();
     }
-    let token = parse_cookies(&headers)
+    // Every wsb_session cookie offered is revoked — a path-scoped sibling
+    // cookie may shadow the real one.
+    let hashes: Vec<String> = parse_cookies(&headers)
         .into_iter()
-        .find(|(n, _)| n == SESSION_COOKIE)
-        .map(|(_, t)| t);
-    let Some(token) = token else {
+        .filter(|(n, _)| n == SESSION_COOKIE)
+        .map(|(_, t)| hash_token(&t))
+        .collect();
+    let done = |user: Option<String>| {
         let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
         let h = resp.headers_mut();
         h.insert(header::LOCATION, HeaderValue::from_static("/"));
@@ -208,32 +226,39 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
             header::SET_COOKIE,
             HeaderValue::from_str(&clear_cookie_header(state.config.cookie_secure)).unwrap(),
         );
-        return with_outcome(resp, EventKind::Logout, None);
+        with_outcome(resp, EventKind::Logout, user)
     };
-    let hash = hash_token(&token);
-    let user = state
-        .sessions
-        .lock()
-        .unwrap()
-        .get(&hash)
-        .map(|s| s.user.clone());
     let _writes = state.session_writes.lock().await;
+    // Only hashes the map actually holds can be live sessions; unknown
+    // values need no database write at all.
+    let (present, user) = {
+        let sessions = state.sessions.lock().unwrap();
+        let present: Vec<String> = hashes
+            .iter()
+            .filter(|h| sessions.contains_key(*h))
+            .cloned()
+            .collect();
+        let user = present
+            .first()
+            .and_then(|h| sessions.get(h))
+            .map(|s| s.user.clone());
+        (present, user)
+    };
+    if present.is_empty() {
+        return done(None);
+    }
     let users = state.config.users.clone();
     let gone = {
-        let hash = hash.clone();
-        tokio::task::spawn_blocking(move || users.delete_sessions(&[hash])).await
+        let present = present.clone();
+        tokio::task::spawn_blocking(move || users.delete_sessions(&present)).await
     };
     match gone {
         Ok(Ok(())) => {
-            state.sessions.lock().unwrap().remove(&hash);
-            let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
-            let h = resp.headers_mut();
-            h.insert(header::LOCATION, HeaderValue::from_static("/"));
-            h.insert(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&clear_cookie_header(state.config.cookie_secure)).unwrap(),
-            );
-            with_outcome(resp, EventKind::Logout, user)
+            let mut sessions = state.sessions.lock().unwrap();
+            for h in &present {
+                sessions.remove(h);
+            }
+            done(user)
         }
         result => {
             match &result {

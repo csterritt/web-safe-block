@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::header;
+use axum::http::{HeaderValue, header};
 use axum::response::{AppendHeaders, IntoResponse};
 use axum::routing::any;
 use sha2::{Digest, Sha256};
@@ -63,8 +63,37 @@ async fn spawn_upstream(hits: Arc<AtomicUsize>) -> String {
             "cached body",
         )
     }
+    // Echo the forwarding headers the gate stamped.
+    async fn echo_headers(req: Request) -> String {
+        let h = req.headers();
+        let get = |n: &str| {
+            h.get(n)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        format!("{}|{}", get("x-forwarded-for"), get("x-forwarded-host"))
+    }
+    // Set-Cookie for wsb_session containing a non-UTF-8 (obs-text) byte.
+    async fn raw_cookie() -> impl IntoResponse {
+        (
+            AppendHeaders([
+                (
+                    header::SET_COOKIE,
+                    HeaderValue::from_bytes(b"wsb_session=evil; a=\xff").unwrap(),
+                ),
+                (
+                    header::SET_COOKIE,
+                    HeaderValue::from_static("app=1; Path=/"),
+                ),
+            ]),
+            "raw",
+        )
+    }
     let app = Router::new()
         .route("/cached", axum::routing::get(cached))
+        .route("/headers", axum::routing::get(echo_headers))
+        .route("/rawcookie", axum::routing::get(raw_cookie))
         .fallback(any(handler))
         .with_state(hits);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -327,7 +356,7 @@ async fn monitor_reports() {
     get("/__wsb/nope").await.unwrap();
     check("reserved", 404, "/__wsb/nope", None);
     get("/__wsb/login").await.unwrap();
-    check("other", 405, "/__wsb/login", None);
+    check("login_page", 303, "/__wsb/login", None);
 
     // Reconnect: consumed events are not redelivered.
     drop(m);
@@ -1565,4 +1594,172 @@ async fn upstream_permit_caps_concurrency() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "headers arrive once a permit is free");
+}
+
+#[tokio::test]
+async fn connection_header_cannot_strip_forwarding() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    // Connection tokens must not remove CF-Connecting-IP or Host before
+    // the gate reads them.
+    let resp = client
+        .get(format!("{base}/headers"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .header(header::CONNECTION, "cf-connecting-ip, host")
+        .header("CF-Connecting-IP", "203.0.113.5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let (xff, xfh) = body.split_once('|').unwrap();
+    assert_eq!(xff, "203.0.113.5", "{body}");
+    assert!(!xfh.is_empty(), "x-forwarded-host forwarded: {body}");
+}
+
+#[tokio::test]
+async fn successful_login_does_not_reset_failures() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let db = temp_dir().join(users::DB_FILE);
+    let conn = users::open_for_add(&db).unwrap();
+    users::add_users(
+        &conn,
+        "alice Correct-Horse-Battery-42\nbob Another-Good-Phrase-77!\n".as_bytes(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    drop(conn);
+    let (proxy, _) = spawn_proxy_on_db(&upstream, 100, Limits::default(), &db).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let ip = "203.0.113.42";
+    let login = |body: &str| {
+        client
+            .post(format!("{base}/__wsb/login"))
+            .header("CF-Connecting-IP", ip)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body.to_string())
+            .send()
+    };
+
+    // 9 failures against alice from one IP.
+    for _ in 0..9 {
+        let resp = login("user=alice&phrase=wrong&next=%2F").await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    // A successful bob login keeps alice's failure count.
+    let resp = login("user=bob&phrase=Another-Good-Phrase-77!&next=%2F")
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    // The next failure is the 10th in the window; the one after is 429.
+    let resp = login("user=alice&phrase=wrong&next=%2F").await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let resp = login("user=alice&phrase=wrong&next=%2F").await.unwrap();
+    assert_eq!(resp.status(), 429);
+}
+
+#[tokio::test]
+async fn multiple_session_cookies() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let t1 = login_token(&client, &base).await;
+    let t2 = login_token(&client, &base).await;
+
+    // A stale/unknown cookie shadowing a valid one still authenticates.
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(
+            header::COOKIE,
+            format!("wsb_session=deadbeef; wsb_session={t1}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Logout revokes every wsb_session cookie offered.
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(
+            header::COOKIE,
+            format!("wsb_session={t1}; wsb_session={t2}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    for t in [&t1, &t2] {
+        assert_eq!(token_status(&client, &base, t).await, 401, "{t}");
+    }
+}
+
+#[tokio::test]
+async fn obs_text_session_set_cookie_stripped() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let resp = client
+        .get(format!("{base}/rawcookie"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    for v in resp.headers().get_all(header::SET_COOKIE) {
+        assert!(
+            !v.as_bytes().starts_with(b"wsb_session"),
+            "obs-text wsb_session Set-Cookie forwarded: {v:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn login_get_redirects_and_body_limit() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    // GET on the login path redirects to / with no-store.
+    let resp = client
+        .get(format!("{base}/__wsb/login"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+
+    // A login body over 4 KiB is refused before the handler runs, and
+    // does not consume a rate-limit attempt.
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(format!("user=alice&phrase=wrong&next={}", "a".repeat(5000)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
 }

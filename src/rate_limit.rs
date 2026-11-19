@@ -1,7 +1,6 @@
 //! Bounded per-client login failure tracking for the login endpoint.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(crate) const RATE_LIMIT_MAX_FAILURES: usize = 10;
@@ -33,12 +32,12 @@ pub(crate) fn reserve_attempt(
             !v.is_empty()
         });
         if failures.len() >= max_keys
-            && let Some(oldest) = failures
+            && let Some(victim) = failures
                 .iter()
-                .max_by_key(|(_, v)| v.last().map(|t| now.duration_since(*t)).unwrap_or_default())
+                .min_by(|(_, v1), (_, v2)| (v1.len(), v1.last()).cmp(&(v2.len(), v2.last())))
                 .map(|(k, _)| k.clone())
         {
-            failures.remove(&oldest);
+            failures.remove(&victim);
         }
     }
     let v = failures.entry(key.to_string()).or_default();
@@ -57,10 +56,6 @@ pub(crate) fn refund_attempt(failures: &mut HashMap<String, Vec<Instant>>, key: 
             failures.remove(key);
         }
     }
-}
-
-pub(crate) fn clear_failures(failures: &Mutex<HashMap<String, Vec<Instant>>>, key: &str) {
-    failures.lock().unwrap().remove(key);
 }
 
 #[cfg(test)]
@@ -93,5 +88,26 @@ mod tests {
         // Refund removes the newest timestamp and the key when empty.
         refund_attempt(&mut failures, "new");
         assert!(!failures.contains_key("new"));
+    }
+
+    #[test]
+    fn eviction_prefers_fewest_timestamps() {
+        let max_keys = 3;
+        let mut failures = HashMap::new();
+        // A throttled key keeps its budget: it is never the eviction victim.
+        for _ in 0..RATE_LIMIT_MAX_FAILURES {
+            assert!(reserve_attempt(&mut failures, max_keys, "throttled"));
+        }
+        assert!(!reserve_attempt(&mut failures, max_keys, "throttled"));
+        assert!(reserve_attempt(&mut failures, max_keys, "one-a"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(reserve_attempt(&mut failures, max_keys, "one-b"));
+        assert!(reserve_attempt(&mut failures, max_keys, "new"));
+        assert!(failures.contains_key("throttled"), "{failures:?}");
+        assert!(
+            !failures.contains_key("one-a"),
+            "oldest 1-failure key evicted"
+        );
+        assert!(failures.contains_key("one-b"));
     }
 }

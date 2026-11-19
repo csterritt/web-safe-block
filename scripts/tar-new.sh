@@ -42,14 +42,18 @@ esac
 deleted_files=()
 while IFS= read -r line; do
   deleted_files+=("$line")
-done < <(git status -sb | sed 1d | egrep '^D |^ D' | /home/chris/chz 1)
+done < <(git status -sb | sed 1d | grep -E '^D |^ D' | /home/chris/chz 1)
 
 files=()
 while IFS= read -r line; do
   files+=("$line")
-done < <(git status -sb | sed 1d | egrep -v '^D |^ D' | /home/chris/chz 1)
+done < <(git status -sb | sed 1d | grep -Ev '^D |^ D' | /home/chris/chz 1)
 
-printf '%s\n' "${deleted_files[@]}" > /tmp/deleted-files.txt
+if [[ ${#deleted_files[@]} -eq 0 ]]; then
+  : > /tmp/deleted-files.txt
+else
+  printf '%s\n' "${deleted_files[@]}" > /tmp/deleted-files.txt
+fi
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No new or modified files to archive."

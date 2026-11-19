@@ -20,7 +20,12 @@ commands:
 The config file defaults to ./config.toml.";
 
 fn main() -> ExitCode {
-    let Some((config_path, command, name)) = parse_args(std::env::args().skip(1)) else {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let Some((config_path, command, name)) = parse_args(args.into_iter()) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -157,13 +162,6 @@ fn serve(settings: Settings) -> ExitCode {
         Err(e) => return fail(format!("cannot start runtime: {e}")),
     };
     rt.block_on(async move {
-        println!(
-            "web-safe-block: listening on {listen}, upstream {}, users {}, session TTL {}s, cookie_secure={}",
-            config.upstream,
-            settings.users_db.display(),
-            config.session_ttl.as_secs(),
-            config.cookie_secure
-        );
         let listener = match tokio::net::TcpListener::bind(listen).await {
             Ok(l) => l,
             Err(e) => return fail(format!("failed to bind {listen}: {e}")),
@@ -172,13 +170,43 @@ fn serve(settings: Settings) -> ExitCode {
             Ok(r) => r,
             Err(e) => return fail(e),
         };
+        println!(
+            "web-safe-block: listening on {listen}, upstream {}, users {}, session TTL {}s, cookie_secure={}",
+            settings.upstream,
+            settings.users_db.display(),
+            settings.session_ttl_secs,
+            settings.cookie_secure
+        );
         let service: IntoMakeServiceWithConnectInfo<_, SocketAddr> =
             router.into_make_service_with_connect_info();
-        match axum::serve(listener, service).await {
+        match axum::serve(listener, service)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("server error: {e}")),
         }
     })
+}
+
+/// Resolve on Ctrl-C or (unix) SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

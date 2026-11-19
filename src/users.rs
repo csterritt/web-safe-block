@@ -23,10 +23,21 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_name)";
 
+/// Wait up to 5s on a locked database; set right after opening so the very
+/// first queries also wait.
+fn busy_timeout(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))
+}
+
 /// Foreign keys, a write busy timeout, and every table the file should have.
 fn init(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))?;
+    busy_timeout(conn)?;
     conn.execute_batch(&format!("PRAGMA foreign_keys = ON;\n{SCHEMA}"))
+}
+
+/// True for sqlite's "no such table" error (vs. locking or corruption).
+fn is_no_table(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(_, Some(m)) if m.contains("no such table"))
 }
 
 fn unix_secs(t: SystemTime) -> i64 {
@@ -181,6 +192,7 @@ pub fn open_for_add(path: &Path) -> Result<Connection, String> {
     }
     warn_if_exposed(path);
     let conn = Connection::open(path).map_err(cannot_open)?;
+    busy_timeout(&conn).map_err(cannot_open)?;
     if stale_schema(&conn).map_err(cannot_open)? {
         return Err(stale_schema_err(path));
     }
@@ -199,8 +211,15 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
     warn_if_exposed(path);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    busy_timeout(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
-        .map_err(|_| format!("{} does not contain a users table", path.display()))?;
+        .map_err(|e| {
+            if is_no_table(&e) {
+                format!("{} does not contain a users table", path.display())
+            } else {
+                format!("cannot open {}: {e}", path.display())
+            }
+        })?;
     if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
         return Err(stale_schema_err(path));
     }
@@ -210,8 +229,15 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
 
 /// Remove the user `name` and their sessions; returns whether a row was deleted.
 pub fn remove_user(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let name = name.trim();
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM sessions WHERE user_name = ?1", [name])?;
+    // Sessions.user_name has BINARY collation; match the stored spelling so
+    // a differently-cased argument still deletes the user's sessions.
+    tx.execute(
+        "DELETE FROM sessions WHERE user_name = \
+         (SELECT user_name FROM users WHERE user_name = ?1)",
+        [name],
+    )?;
     let removed = tx.execute("DELETE FROM users WHERE user_name = ?1", [name])?;
     tx.commit()?;
     Ok(removed > 0)
@@ -236,6 +262,7 @@ pub fn add_users(
     input: impl BufRead,
     err: &mut impl Write,
 ) -> rusqlite::Result<(usize, usize)> {
+    let tx = conn.unchecked_transaction()?;
     let (mut added, mut skipped) = (0, 0);
     for (i, line) in input.lines().enumerate() {
         let line_no = i + 1;
@@ -250,11 +277,15 @@ pub fn add_users(
         let mut words = line.split_whitespace();
         let Some(name) = words.next() else { continue };
         let phrase: String = words.collect();
-        let problem = if phrase.is_empty() {
+        let problem = if name.len() > 64 || !name.chars().all(|c| c.is_ascii_graphic()) {
+            Some(format!(
+                "user name '{name}' must be 1-64 printable ASCII characters"
+            ))
+        } else if phrase.is_empty() {
             Some(format!("user '{name}' has no pass phrase"))
         } else if let Some(p) = phrase_problem(&phrase) {
             Some(format!("pass phrase for '{name}' {p}"))
-        } else if exists(conn, "user_name", name)? {
+        } else if exists(&tx, "user_name", name)? {
             Some(format!("user '{name}' already exists"))
         } else {
             None
@@ -266,13 +297,14 @@ pub fn add_users(
         }
         let is_admin = name.to_lowercase().contains("admin");
         let salt = new_salt();
-        conn.execute(
+        tx.execute(
             "INSERT INTO users (user_name, salt, pass_phrase, is_admin) \
              VALUES (?1, ?2, ?3, ?4)",
             params![name, salt, hash_phrase(&salt, &phrase), is_admin],
         )?;
         added += 1;
     }
+    tx.commit()?;
     Ok((added, skipped))
 }
 
@@ -320,9 +352,16 @@ impl UserStore {
         warn_if_exposed(path);
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        busy_timeout(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-            .map_err(|_| missing())?;
+            .map_err(|e| {
+                if is_no_table(&e) {
+                    missing()
+                } else {
+                    format!("cannot open {}: {e}", path.display())
+                }
+            })?;
         if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
             return Err(stale_schema_err(path));
         }
@@ -427,7 +466,7 @@ impl UserStore {
         // 12 MiB Argon2 run happens at a time.
         match row {
             Some((name, salt, hash, is_admin)) => {
-                Ok((hash_phrase(&salt, phrase) == hash).then_some(User { name, is_admin }))
+                Ok(hex_eq(&hash_phrase(&salt, phrase), &hash).then_some(User { name, is_admin }))
             }
             None => {
                 let _ = hash_phrase(DUMMY_SALT, phrase);
@@ -435,6 +474,15 @@ impl UserStore {
             }
         }
     }
+}
+
+/// Constant-time comparison of two same-format hash strings (hex).
+fn hex_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 #[cfg(test)]
@@ -567,6 +615,23 @@ mod tests {
         assert_ne!(rows[0].2, rows[1].2);
         assert_eq!(rows[2].0, "SuperAdmin");
         assert!(rows[2].3);
+    }
+
+    #[test]
+    fn add_users_rejects_bad_names() {
+        let conn = mem_db();
+        let long = "x".repeat(65);
+        let input = format!(
+            "{long} Correct Horse Battery Staple 42!\n\
+             bad\x07name Correct Horse Battery Staple 42!\n\
+             naïf Correct Horse Battery Staple 42!\n\
+             good-name Correct Horse Battery Staple 42!\n"
+        );
+        let mut err = Vec::new();
+        let (added, skipped) = add_users(&conn, input.as_bytes(), &mut err).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!((added, skipped), (1, 3), "{err}");
+        assert!(err.contains("1-64 printable ASCII"), "{err}");
     }
 
     #[test]

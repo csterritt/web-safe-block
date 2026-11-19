@@ -36,68 +36,95 @@ pub(crate) fn hash_token(token: &str) -> String {
 }
 
 /// The user name of a valid, unexpired session, if the request has one.
+/// Every `wsb_session` cookie is checked: the first that resolves wins
+/// (a path-scoped cookie may shadow the real one). Expired ones seen on
+/// the way are dropped lazily.
 pub(crate) fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let token = parse_cookies(headers)
+    let tokens: Vec<String> = parse_cookies(headers)
         .into_iter()
-        .find(|(n, _)| n == SESSION_COOKIE)?
-        .1;
-    let key = hash_token(&token);
+        .filter(|(n, _)| n == SESSION_COOKIE)
+        .map(|(_, t)| t)
+        .collect();
     let mut sessions = state.sessions.lock().unwrap();
-    match sessions.get(&key) {
-        Some(s) if s.expires > SystemTime::now() => Some(s.user.clone()),
-        Some(_) => {
-            sessions.remove(&key);
-            None
+    let now = SystemTime::now();
+    for token in tokens {
+        let key = hash_token(&token);
+        match sessions.get(&key) {
+            Some(s) if s.expires > now => return Some(s.user.clone()),
+            Some(_) => {
+                sessions.remove(&key);
+            }
+            None => {}
         }
-        None => None,
     }
+    None
+}
+
+/// The keys `insert_session` would remove for a new session by `user`,
+/// without touching the map: expired entries (only when a cap is hit),
+/// then the user's earliest-created until under the per-user cap, then the
+/// globally earliest-created until under the total cap.
+pub(crate) fn evictions(
+    sessions: &HashMap<String, Session>,
+    limits: &Limits,
+    user: &str,
+) -> Vec<String> {
+    let now = SystemTime::now();
+    let mut removed: Vec<String> = Vec::new();
+    let mut len = sessions.len();
+    let mut user_count = sessions.values().filter(|s| s.user == user).count();
+    if len >= limits.max_sessions || user_count >= limits.max_sessions_per_user {
+        for (k, s) in sessions {
+            if s.expires <= now {
+                removed.push(k.clone());
+            }
+        }
+        len -= removed.len();
+        user_count -= sessions
+            .iter()
+            .filter(|(k, s)| s.user == user && removed.contains(*k))
+            .count();
+    }
+    while user_count >= limits.max_sessions_per_user {
+        let Some(oldest) = sessions
+            .iter()
+            .filter(|(k, s)| s.user == user && !removed.contains(*k))
+            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        removed.push(oldest);
+        user_count -= 1;
+        len -= 1;
+    }
+    while len >= limits.max_sessions {
+        let Some(oldest) = sessions
+            .iter()
+            .filter(|(k, _)| !removed.contains(*k))
+            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        removed.push(oldest);
+        len -= 1;
+    }
+    removed
 }
 
 /// Insert a session under `key`, evicting to stay within the per-user and
 /// global caps. Returns the key of every entry it removed.
+#[cfg(test)]
 pub(crate) fn insert_session(
     sessions: &mut HashMap<String, Session>,
     limits: &Limits,
     key: String,
     session: Session,
 ) -> Vec<String> {
-    let now = SystemTime::now();
-    let mut removed = Vec::new();
-    let user_count = |sessions: &HashMap<String, Session>| {
-        sessions.values().filter(|s| s.user == session.user).count()
-    };
-    if sessions.len() >= limits.max_sessions || user_count(sessions) >= limits.max_sessions_per_user
-    {
-        sessions.retain(|k, s| {
-            let keep = s.expires > now;
-            if !keep {
-                removed.push(k.clone());
-            }
-            keep
-        });
-    }
-    while user_count(sessions) >= limits.max_sessions_per_user {
-        let Some(oldest) = sessions
-            .iter()
-            .filter(|(_, s)| s.user == session.user)
-            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        sessions.remove(&oldest);
-        removed.push(oldest);
-    }
-    while sessions.len() >= limits.max_sessions {
-        let Some(oldest) = sessions
-            .iter()
-            .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        sessions.remove(&oldest);
-        removed.push(oldest);
+    let removed = evictions(sessions, limits, &session.user);
+    for k in &removed {
+        sessions.remove(k);
     }
     sessions.insert(key, session);
     removed
@@ -110,7 +137,10 @@ pub(crate) fn insert_session(
 /// `session_writes`; the map lock is only taken for the final swap.
 pub(crate) fn reload_sessions(state: &AppState) -> rusqlite::Result<i64> {
     let now = SystemTime::now();
-    state.config.users.delete_expired_sessions(now)?;
+    // A failed delete (locked/read-only db) must not prevent the reload.
+    if let Err(e) = state.config.users.delete_expired_sessions(now) {
+        eprintln!("web-safe-block: expired-session delete failed: {e}");
+    }
     let stored = state.config.users.load_sessions(now)?;
     let mut max_created = 0i64;
     let mut sessions = state.sessions.lock().unwrap();

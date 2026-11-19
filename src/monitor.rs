@@ -201,7 +201,11 @@ pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::
         .name("wsb-monitor".into())
         .spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+                let Ok(mut stream) = stream else {
+                    // accept() can fail fast (e.g. fd exhaustion); don't spin.
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
                 if !events.try_connect() {
                     let _ = stream.write_all(BUSY_MESSAGE);
                     continue;

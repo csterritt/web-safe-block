@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::get;
 
-use crate::auth::{login, logout, logout_page};
+use crate::auth::{login, login_redirect, logout, logout_page};
 use crate::monitor::{Event, EventKind, EventQueue, Outcome, truncate_at};
 use crate::proxy::proxy_or_login;
 use crate::rate_limit::RATE_LIMIT_WINDOW;
@@ -30,7 +30,12 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, S
     }
     spawn_purger(state.clone());
     Ok(Router::new()
-        .route(LOGIN_PATH, post(login))
+        .route(
+            LOGIN_PATH,
+            get(login_redirect)
+                .post(login)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
         .route(LOGOUT_PATH, get(logout_page).post(logout))
         .fallback(proxy_or_login)
         .layer(middleware::from_fn_with_state(state.clone(), record_event))

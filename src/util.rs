@@ -27,16 +27,28 @@ pub(crate) fn parse_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Remove `SESSION_COOKIE` from the Cookie header(s), rebuilding a single
-/// Cookie header (or removing it entirely if nothing remains).
+/// Cookie header (or removing it entirely if nothing remains). Works on raw
+/// bytes so a non-UTF-8 Cookie header keeps its other cookies.
 pub(crate) fn strip_session_cookie(headers: &mut HeaderMap) {
-    let remaining: Vec<String> = parse_cookies(headers)
-        .into_iter()
-        .filter(|(name, _)| name != SESSION_COOKIE)
-        .map(|(n, v)| format!("{n}={v}"))
-        .collect();
+    let mut remaining: Vec<Vec<u8>> = Vec::new();
+    for hv in headers.get_all(header::COOKIE).iter() {
+        for part in hv.as_bytes().split(|b| *b == b';') {
+            let part = part.trim_ascii();
+            if part.is_empty() {
+                continue;
+            }
+            let name = match part.iter().position(|b| *b == b'=') {
+                Some(eq) => part[..eq].trim_ascii(),
+                None => part,
+            };
+            if name != SESSION_COOKIE.as_bytes() {
+                remaining.push(part.to_vec());
+            }
+        }
+    }
     while headers.remove(header::COOKIE).is_some() {}
     if !remaining.is_empty()
-        && let Ok(v) = HeaderValue::from_str(&remaining.join("; "))
+        && let Ok(v) = HeaderValue::from_bytes(&remaining.join(b"; ".as_slice()))
     {
         headers.insert(header::COOKIE, v);
     }
@@ -44,7 +56,8 @@ pub(crate) fn strip_session_cookie(headers: &mut HeaderMap) {
 
 /// Sanitize a `next` redirect target; falls back to `/`.
 pub(crate) fn sanitize_next(next: &str) -> String {
-    let ok = next.starts_with('/')
+    let ok = next.len() <= 2048
+        && next.starts_with('/')
         && !next.starts_with("//")
         && !next.starts_with("/\\")
         && !next.starts_with("/__wsb/")
@@ -119,15 +132,16 @@ pub(crate) fn rewrite_cache_control(headers: &mut HeaderMap) {
     }
 }
 
-/// True if a Set-Cookie header value sets the session cookie.
-pub(crate) fn sets_session_cookie(value: &str) -> bool {
-    match value.split_once('=') {
-        Some((name, _)) => name.trim() == SESSION_COOKIE,
+/// True if a Set-Cookie header value (raw bytes) sets the session cookie.
+pub(crate) fn sets_session_cookie(value: &[u8]) -> bool {
+    match value.iter().position(|b| *b == b'=') {
+        Some(eq) => value[..eq].trim_ascii() == SESSION_COOKIE.as_bytes(),
         None => false,
     }
 }
 
-pub(crate) const PAGE_STYLE: &str = "<style>body,input,button{font-size:24pt}input{border:1px solid #000}</style>\n";
+pub(crate) const PAGE_STYLE: &str =
+    "<style>body,input,button{font-size:24pt}input{border:1px solid #000}</style>\n";
 
 pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
     let msg = message
@@ -152,6 +166,15 @@ pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    resp
+}
+
+/// A plain-text gate answer, marked no-store.
+pub(crate) fn plain_response(status: StatusCode, text: &'static str) -> Response {
+    let mut resp = (status, text).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
@@ -185,7 +208,9 @@ pub(crate) fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> Strin
 }
 
 /// True if a POST came from another site, per Sec-Fetch-Site or Origin.
-pub(crate) fn cross_site(headers: &HeaderMap) -> bool {
+/// When `secure` (cookie_secure), the Origin scheme must be https; plain
+/// http deployments also accept http.
+pub(crate) fn cross_site(headers: &HeaderMap, secure: bool) -> bool {
     if let Some(v) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return !(v.trim().eq_ignore_ascii_case("same-origin")
             || v.trim().eq_ignore_ascii_case("none"));
@@ -195,13 +220,21 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> bool {
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let authority = origin
-            .parse::<Uri>()
-            .ok()
-            .and_then(|u| u.authority().map(|a| a.as_str().to_string()));
-        return match authority {
-            Some(a) => !a.eq_ignore_ascii_case(host.trim()),
-            None => true,
+        return match origin.parse::<Uri>() {
+            Ok(u) => {
+                let scheme_ok = match u.scheme_str() {
+                    Some(s) => {
+                        s.eq_ignore_ascii_case("https")
+                            || (!secure && s.eq_ignore_ascii_case("http"))
+                    }
+                    None => false,
+                };
+                !scheme_ok
+                    || !u
+                        .authority()
+                        .is_some_and(|a| a.as_str().eq_ignore_ascii_case(host.trim()))
+            }
+            Err(_) => true,
         };
     }
     false
@@ -214,7 +247,12 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
         if let Ok(s) = hv.to_str() {
             for n in s.split(',') {
                 let n = n.trim();
-                if !n.is_empty() {
+                // Host and Content-Length are request framing, never
+                // hop-by-hop: a client cannot strip them via Connection.
+                if !n.is_empty()
+                    && !n.eq_ignore_ascii_case("host")
+                    && !n.eq_ignore_ascii_case("content-length")
+                {
                     names.push(n.to_string());
                 }
             }
@@ -293,6 +331,24 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_cookie_header_keeps_its_cookies() {
+        let mut h = HeaderMap::new();
+        h.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"a=1; wsb_session=x; b=\xff").unwrap(),
+        );
+        strip_session_cookie(&mut h);
+        assert_eq!(h.get(header::COOKIE).unwrap().as_bytes(), b"a=1; b=\xff");
+        let mut h = HeaderMap::new();
+        h.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"wsb_session=x; \xff").unwrap(),
+        );
+        strip_session_cookie(&mut h);
+        assert!(h.get(header::COOKIE).is_some(), "nameless part kept");
+    }
+
+    #[test]
     fn sanitize_next_cases() {
         assert_eq!(sanitize_next("/a?b=1"), "/a?b=1");
         assert_eq!(sanitize_next("//evil.com"), "/");
@@ -301,6 +357,10 @@ mod tests {
         assert_eq!(sanitize_next(""), "/");
         assert_eq!(sanitize_next("/__wsb/login"), "/");
         assert_eq!(sanitize_next("/a\nb"), "/");
+        let long = format!("/{}", "x".repeat(2048));
+        assert_eq!(sanitize_next(&long), "/");
+        let just = format!("/{}", "x".repeat(2047));
+        assert_eq!(sanitize_next(&just), just);
     }
 
     #[test]
@@ -341,9 +401,12 @@ mod tests {
 
     #[test]
     fn set_cookie_name_matching() {
-        assert!(sets_session_cookie("wsb_session=x; Path=/"));
-        assert!(sets_session_cookie(" wsb_session =x"));
-        assert!(!sets_session_cookie("wsb_session2=x"));
+        assert!(sets_session_cookie(b"wsb_session=x; Path=/"));
+        assert!(sets_session_cookie(b" wsb_session =x"));
+        assert!(!sets_session_cookie(b"wsb_session2=x"));
+        // Non-UTF-8 (obs-text) bytes in the value do not hide the name.
+        assert!(sets_session_cookie(b"wsb_session=x; a=\xff"));
+        assert!(!sets_session_cookie(b"other=\xff"));
     }
 
     #[test]
@@ -358,28 +421,43 @@ mod tests {
             }
             m
         };
-        assert!(!cross_site(&h(&[("sec-fetch-site", "same-origin")])));
-        assert!(!cross_site(&h(&[("sec-fetch-site", "none")])));
-        assert!(cross_site(&h(&[("sec-fetch-site", "cross-site")])));
-        assert!(cross_site(&h(&[("sec-fetch-site", "same-site")])));
-        assert!(!cross_site(&h(&[
-            ("origin", "http://example.com"),
-            ("host", "example.com")
-        ])));
-        assert!(!cross_site(&h(&[
-            ("origin", "http://Example.com:8443"),
-            ("host", "example.com:8443")
-        ])));
-        assert!(cross_site(&h(&[
-            ("origin", "http://evil.example"),
-            ("host", "example.com")
-        ])));
-        assert!(cross_site(&h(&[
-            ("origin", "null"),
-            ("host", "example.com")
-        ])));
-        assert!(cross_site(&h(&[("origin", "http://nohost.example"),])));
-        assert!(!cross_site(&h(&[])));
+        assert!(!cross_site(&h(&[("sec-fetch-site", "same-origin")]), false));
+        assert!(!cross_site(&h(&[("sec-fetch-site", "none")]), false));
+        assert!(cross_site(&h(&[("sec-fetch-site", "cross-site")]), false));
+        assert!(cross_site(&h(&[("sec-fetch-site", "same-site")]), false));
+        assert!(!cross_site(
+            &h(&[("origin", "http://example.com"), ("host", "example.com")]),
+            false
+        ));
+        assert!(!cross_site(
+            &h(&[
+                ("origin", "http://Example.com:8443"),
+                ("host", "example.com:8443")
+            ]),
+            false
+        ));
+        assert!(cross_site(
+            &h(&[("origin", "http://evil.example"), ("host", "example.com")]),
+            false
+        ));
+        assert!(cross_site(
+            &h(&[("origin", "null"), ("host", "example.com")]),
+            false
+        ));
+        assert!(cross_site(
+            &h(&[("origin", "http://nohost.example")]),
+            false
+        ));
+        assert!(!cross_site(&h(&[]), false));
+        // Secure (https) deployment: an http Origin is cross-site.
+        assert!(!cross_site(
+            &h(&[("origin", "https://example.com"), ("host", "example.com")]),
+            true
+        ));
+        assert!(cross_site(
+            &h(&[("origin", "http://example.com"), ("host", "example.com")]),
+            true
+        ));
     }
 
     #[test]
