@@ -41,7 +41,7 @@ impl Default for Limits {
 
 #[derive(Clone)]
 pub struct Config {
-    /// Users that may log in, looked up by normalized pass phrase.
+    /// Users that may log in, looked up by user name and pass phrase.
     pub users: Arc<UserStore>,
     /// Upstream base URI (http scheme + host + optional port).
     pub upstream: Uri,

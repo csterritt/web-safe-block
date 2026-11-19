@@ -84,10 +84,9 @@ fn write_config(path: &Path) -> ExitCode {
 }
 
 fn add_user(settings: Settings) -> ExitCode {
-    let db = &settings.users_db;
-    let conn = match users::open_for_add(db) {
+    let conn = match users::open_for_add(&settings.users_db) {
         Ok(c) => c,
-        Err(e) => return fail(format!("cannot open {}: {e}", db.display())),
+        Err(e) => return fail(e),
     };
     match users::add_users(&conn, std::io::stdin().lock(), &mut std::io::stderr()) {
         Ok((added, skipped)) => {

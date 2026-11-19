@@ -233,7 +233,7 @@ async fn monitor_reports() {
             .header("CF-Connecting-IP", "198.51.100.7")
             .header(header::USER_AGENT, "wsb-test")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(format!("phrase={phrase}&next=%2F"))
+            .body(format!("user=alice&phrase={phrase}&next=%2F"))
             .send()
     };
 
@@ -344,29 +344,41 @@ async fn end_to_end() {
     let resp = client.get(format!("{base}/foo?x=1")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
     let body = resp.text().await.unwrap();
+    assert!(body.contains("name=\"user\""), "body: {body}");
     assert!(body.contains("name=\"phrase\""), "body: {body}");
     assert!(body.contains("Submit"));
     assert!(body.contains("/foo?x=1"));
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-    // b. wrong phrase -> 401 "Incorrect phrase", no Set-Cookie
+    // b. wrong phrase -> 401 "Incorrect user name or phrase", no Set-Cookie
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=wrong&next=%2F")
+        .body("user=alice&phrase=wrong&next=%2F")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
     assert!(set_cookie_values(&resp).is_empty());
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Incorrect phrase"));
+    assert!(body.contains("Incorrect user name or phrase"));
+
+    // b2. correct phrase with the wrong user name -> 401 too
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("user=carol&phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert!(set_cookie_values(&resp).is_empty());
 
     // c. correct phrase (padded) -> 303 + session cookie
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=++CORRECT-HORSE-BATTERY-42++%0A&next=%2Ffoo%3Fx%3D1")
+        .body("user=alice&phrase=++CORRECT-HORSE-BATTERY-42++%0A&next=%2Ffoo%3Fx%3D1")
         .send()
         .await
         .unwrap();
@@ -474,7 +486,7 @@ async fn rate_limit() {
             .post(format!("{base}/__wsb/login"))
             .header("CF-Connecting-IP", ip)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body("phrase=wrong&next=%2F")
+            .body("user=alice&phrase=wrong&next=%2F")
             .send()
             .await
             .unwrap();
@@ -485,7 +497,7 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", ip)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -498,7 +510,7 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", "203.0.113.100")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -519,7 +531,7 @@ async fn rate_limit_is_atomic() {
                 .post(format!("{base}/__wsb/login"))
                 .header("CF-Connecting-IP", "203.0.113.77")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body("phrase=wrong&next=%2F")
+                .body("user=alice&phrase=wrong&next=%2F")
                 .send()
                 .await
                 .unwrap()
@@ -552,7 +564,7 @@ async fn per_user_session_cap() {
         let resp = client
             .post(format!("{base}/__wsb/login"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body("phrase=Correct-Horse-Battery-42&next=%2F")
+            .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
             .send()
             .await
             .unwrap();
@@ -587,7 +599,7 @@ async fn login_token(client: &reqwest::Client, base: &str) -> String {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -724,7 +736,7 @@ async fn stalled_upstream_times_out() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -756,7 +768,7 @@ async fn cross_site_posts_rejected() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -788,7 +800,7 @@ async fn cross_site_posts_rejected() {
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("origin", "http://evil.example")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();
@@ -997,44 +1009,55 @@ fn cli_add_user() {
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("added 2 user(s), skipped 0"));
 
-    // second run: duplicate name and duplicate (normalized) phrase are skipped
+    // second run: duplicate names (any case) are skipped; a shared phrase is fine
     let out = run_add_user(
         &dir,
-        "alice Another Good Phrase 77!\ncarol OPENSESAME NUMBER FORTY 4!\ndave Fine But Good Enough 88!\n",
+        "alice Another Good Phrase 77!\nALICE Another Fine Phrase 88!\ncarol OPENSESAME NUMBER FORTY 4!\ndave Fine But Good Enough 88!\n",
     );
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("user 'alice' already exists"), "{stderr}");
-    assert!(
-        stderr.contains("pass phrase for 'carol' is already in use"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("added 1 user(s), skipped 2"), "{stderr}");
+    assert!(stderr.contains("user 'ALICE' already exists"), "{stderr}");
+    assert!(stderr.contains("added 2 user(s), skipped 2"), "{stderr}");
 
     let store = UserStore::open(&dir.join(users::DB_FILE)).unwrap();
     assert!(
         store
-            .lookup("big secret phrase number 99!")
+            .lookup("admin-bob", "big secret phrase number 99!")
             .unwrap()
             .unwrap()
             .is_admin
     );
     assert!(
         !store
-            .lookup("open sesame number forty 4!")
+            .lookup("alice", "open sesame number forty 4!")
             .unwrap()
             .unwrap()
             .is_admin
     );
+    // carol shares alice's phrase and logs in with it too.
     assert_eq!(
         store
-            .lookup("fine but good enough 88!")
+            .lookup("carol", "open sesame number forty 4!")
+            .unwrap()
+            .unwrap()
+            .name,
+        "carol"
+    );
+    assert_eq!(
+        store
+            .lookup("dave", "fine but good enough 88!")
             .unwrap()
             .unwrap()
             .name,
         "dave"
     );
-    assert!(store.lookup("another good phrase 77!").unwrap().is_none());
+    assert!(
+        store
+            .lookup("alice", "another good phrase 77!")
+            .unwrap()
+            .is_none()
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1068,10 +1091,15 @@ fn cli_remove_user() {
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("removed user 'alice'"));
     let store = UserStore::open(&dir.join(users::DB_FILE)).unwrap();
-    assert!(store.lookup("correct-horse-battery-42").unwrap().is_none());
     assert!(
         store
-            .lookup("big secret phrase number 99!")
+            .lookup("alice", "correct-horse-battery-42")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .lookup("admin-bob", "big secret phrase number 99!")
             .unwrap()
             .is_some()
     );
@@ -1120,7 +1148,7 @@ async fn upgrade_requests_get_501() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
         .unwrap();

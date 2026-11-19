@@ -3,14 +3,16 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use argon2::{Algorithm, Argon2, Params, Version};
+use rand::Rng;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use sha2::{Digest, Sha512};
 
 pub const DB_FILE: &str = "users.db";
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
-    user_name   TEXT    NOT NULL UNIQUE,
-    pass_phrase TEXT    NOT NULL UNIQUE,
+    user_name   TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    salt        TEXT    NOT NULL,
+    pass_phrase TEXT    NOT NULL,
     is_admin    BOOLEAN NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -63,18 +65,75 @@ pub fn phrase_problem(phrase: &str) -> Option<String> {
     }
 }
 
-/// Hex SHA-512 of the normalized phrase; this is what is stored in the database.
-pub fn hash_phrase(s: &str) -> String {
-    Sha512::digest(normalize_phrase(s).as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// 16 random bytes as hex; a fresh per-user salt for `add-user`.
+pub fn new_salt() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Argon2id parameters: OWASP's 12 MiB / t=3, p=1 option, chosen because the
+/// target server has ~67 MB free.
+const ARGON2_M_COST_KIB: u32 = 12 * 1024;
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+const ARGON2_OUT_LEN: usize = 32;
+
+/// Fixed salt hashed for unknown user names so lookup time is uniform.
+const DUMMY_SALT: &str = "00000000000000000000000000000000";
+
+/// Argon2id (version 0x13) of the normalized phrase with the per-user salt,
+/// as lowercase hex; this is what is stored in the database.
+pub fn hash_phrase(salt: &str, phrase: &str) -> String {
+    let params = Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(ARGON2_OUT_LEN),
+    )
+    .expect("fixed argon2 parameters are valid");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; ARGON2_OUT_LEN];
+    argon2
+        .hash_password_into(normalize_phrase(phrase).as_bytes(), salt.as_bytes(), &mut out)
+        .expect("fixed-size salt and output are valid");
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// True if a `users` table exists but has no `salt` column, i.e. the file was
+/// created before per-user salts and cannot be migrated.
+fn predates_salts(conn: &Connection) -> rusqlite::Result<bool> {
+    let has_users: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_users == 0 {
+        return Ok(false);
+    }
+    let columns = conn
+        .prepare("PRAGMA table_info(users)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(!columns.iter().any(|c| c == "salt"))
+}
+
+fn predates_salts_err(path: &Path) -> String {
+    format!(
+        "{} predates per-user salts; move it aside and re-add users with: \
+         web-safe-block add-user < users.txt",
+        path.display()
+    )
 }
 
 /// Open (creating if needed) the database for `add-user`.
-pub fn open_for_add(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    init(&conn)?;
+pub fn open_for_add(path: &Path) -> Result<Connection, String> {
+    let cannot_open = |e: rusqlite::Error| format!("cannot open {}: {e}", path.display());
+    let conn = Connection::open(path).map_err(cannot_open)?;
+    if predates_salts(&conn).map_err(cannot_open)? {
+        return Err(predates_salts_err(path));
+    }
+    init(&conn).map_err(cannot_open)?;
     Ok(conn)
 }
 
@@ -90,6 +149,9 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
         .map_err(|_| format!("{} does not contain a users table", path.display()))?;
+    if predates_salts(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
+        return Err(predates_salts_err(path));
+    }
     init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     Ok(conn)
 }
@@ -142,8 +204,6 @@ pub fn add_users(
             Some(format!("pass phrase for '{name}' {p}"))
         } else if exists(conn, "user_name", name)? {
             Some(format!("user '{name}' already exists"))
-        } else if exists(conn, "pass_phrase", &hash_phrase(&phrase))? {
-            Some(format!("pass phrase for '{name}' is already in use"))
         } else {
             None
         };
@@ -153,9 +213,11 @@ pub fn add_users(
             continue;
         }
         let is_admin = name.to_lowercase().contains("admin");
+        let salt = new_salt();
         conn.execute(
-            "INSERT INTO users (user_name, pass_phrase, is_admin) VALUES (?1, ?2, ?3)",
-            params![name, hash_phrase(&phrase), is_admin],
+            "INSERT INTO users (user_name, salt, pass_phrase, is_admin) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, salt, hash_phrase(&salt, &phrase), is_admin],
         )?;
         added += 1;
     }
@@ -189,6 +251,8 @@ pub struct StoredSession {
 #[derive(Debug)]
 pub struct UserStore {
     conn: Mutex<Connection>,
+    /// Serializes Argon2 runs so at most one ~12 MiB hash runs at a time.
+    hash_slot: Mutex<()>,
 }
 
 impl UserStore {
@@ -204,6 +268,9 @@ impl UserStore {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .map_err(|_| missing())?;
+        if predates_salts(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
+            return Err(predates_salts_err(path));
+        }
         if count == 0 {
             return Err(format!(
                 "users database {} has no users; {hint}",
@@ -213,6 +280,7 @@ impl UserStore {
         init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         Ok(UserStore {
             conn: Mutex::new(conn),
+            hash_slot: Mutex::new(()),
         })
     }
 
@@ -272,21 +340,41 @@ impl UserStore {
         )
     }
 
-    pub fn lookup(&self, phrase: &str) -> rusqlite::Result<Option<User>> {
-        self.conn
+    /// The user named `user_name` (case-insensitive) if `phrase` matches their
+    /// salted hash; None for an unknown name or wrong phrase. Always runs one
+    /// Argon2 hash so response time doesn't reveal whether the name exists.
+    pub fn lookup(&self, user_name: &str, phrase: &str) -> rusqlite::Result<Option<User>> {
+        let row = self
+            .conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT user_name, is_admin FROM users WHERE pass_phrase = ?1",
-                [hash_phrase(phrase)],
+                "SELECT user_name, salt, pass_phrase, is_admin FROM users \
+                 WHERE user_name = ?1",
+                [user_name.trim()],
                 |r| {
-                    Ok(User {
-                        name: r.get(0)?,
-                        is_admin: r.get(1)?,
-                    })
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
                 },
             )
-            .optional()
+            .optional()?;
+        // The conn lock is released: hashing holds hash_slot instead, so at
+        // most one 12 MiB Argon2 run happens at a time and session writes are
+        // not blocked by it.
+        let _hash_slot = self.hash_slot.lock().unwrap();
+        match row {
+            Some((name, salt, hash, is_admin)) => Ok(
+                (hash_phrase(&salt, phrase) == hash).then_some(User { name, is_admin }),
+            ),
+            None => {
+                let _ = hash_phrase(DUMMY_SALT, phrase);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -317,10 +405,22 @@ mod tests {
     }
 
     #[test]
-    fn hash_is_sha512_of_normalized() {
-        // SHA-512("abc")
-        assert!(hash_phrase(" A b C ").starts_with("ddaf35a193617aba"));
-        assert_eq!(hash_phrase("abc").len(), 128);
+    fn hash_is_argon2id_of_normalized() {
+        // Deterministic, and the phrase is normalized before hashing.
+        assert_eq!(hash_phrase("aaaaaaaa", "abc"), hash_phrase("aaaaaaaa", "abc"));
+        assert_eq!(hash_phrase("aaaaaaaa", " A b C "), hash_phrase("aaaaaaaa", "abc"));
+        assert_eq!(hash_phrase("aaaaaaaa", "abc").len(), 64);
+        // Same phrase, different salts -> different hashes.
+        assert_ne!(hash_phrase("aaaaaaaa", "abc"), hash_phrase("bbbbbbbb", "abc"));
+        // Known answer: computed independently via the argon2 crate.
+        let params = Params::new(12 * 1024, 3, 1, Some(32)).unwrap();
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut expected = [0u8; 32];
+        argon2
+            .hash_password_into(b"abc", b"somesalt", &mut expected)
+            .unwrap();
+        let expected = expected.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hash_phrase("somesalt", "abc"), expected);
     }
 
     #[test]
@@ -357,32 +457,49 @@ mod tests {
                      \n\
                      bob correct horse battery staple 42!\n\
                      alice Another Valid Phrase 99!\n\
+                     ALICE Yet Another Valid Phrase 88!\n\
                      carol\n\
                      mallory weak\n\
                      SuperAdmin  Very  Long  Admin  Pass  Phrase 9!\n";
         let mut err = Vec::new();
         let (added, skipped) = add_users(&conn, input.as_bytes(), &mut err).unwrap();
         let err = String::from_utf8(err).unwrap();
-        assert_eq!((added, skipped), (2, 4), "{err}");
-        assert!(err.contains("line 3: skipped: pass phrase for 'bob' is already in use"));
+        assert_eq!((added, skipped), (3, 4), "{err}");
         assert!(err.contains("line 4: skipped: user 'alice' already exists"));
-        assert!(err.contains("line 5: skipped: user 'carol' has no pass phrase"));
-        assert!(err.contains("line 6: skipped: pass phrase for 'mallory' is too weak"));
+        assert!(err.contains("line 5: skipped: user 'ALICE' already exists"));
+        assert!(err.contains("line 6: skipped: user 'carol' has no pass phrase"));
+        assert!(err.contains("line 7: skipped: pass phrase for 'mallory' is too weak"));
         assert!(!err.to_lowercase().contains("staple"));
 
-        let rows: Vec<(String, String, bool)> = conn
-            .prepare("SELECT user_name, pass_phrase, is_admin FROM users ORDER BY rowid")
+        let rows: Vec<(String, String, String, bool)> = conn
+            .prepare(
+                "SELECT user_name, salt, pass_phrase, is_admin FROM users ORDER BY rowid",
+            )
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].0, "alice");
-        assert_eq!(rows[0].1, hash_phrase("correcthorsebatterystaple42!"));
-        assert!(!rows[0].2);
-        assert_eq!(rows[1].0, "SuperAdmin");
-        assert!(rows[1].2);
+        assert_eq!(rows[0].1.len(), 32, "salt is 16 hex bytes");
+        assert_eq!(
+            rows[0].2,
+            hash_phrase(&rows[0].1, "correcthorsebatterystaple42!")
+        );
+        assert!(!rows[0].3);
+        // bob may share alice's phrase, but his salt and hash differ.
+        assert_eq!(rows[1].0, "bob");
+        assert_eq!(
+            rows[1].2,
+            hash_phrase(&rows[1].1, "correct horse battery staple 42!")
+        );
+        assert_ne!(rows[0].1, rows[1].1);
+        assert_ne!(rows[0].2, rows[1].2);
+        assert_eq!(rows[2].0, "SuperAdmin");
+        assert!(rows[2].3);
     }
 
     #[test]
@@ -438,6 +555,7 @@ mod tests {
         init(&conn).unwrap();
         UserStore {
             conn: Mutex::new(conn),
+            hash_slot: Mutex::new(()),
         }
     }
 
@@ -495,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn old_database_gains_sessions_table() {
+    fn old_database_without_salts_rejected() {
         const OLD_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
             user_name   TEXT    NOT NULL UNIQUE,
             pass_phrase TEXT    NOT NULL UNIQUE,
@@ -506,7 +624,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(DB_FILE);
 
-        // A database from before the sessions table existed.
+        // A database from before per-user salts existed cannot be migrated.
         let conn = Connection::open(&path).unwrap();
         conn.execute(OLD_SCHEMA, []).unwrap();
         conn.execute(
@@ -514,15 +632,24 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(!has_table(&conn, "sessions"));
         drop(conn);
 
-        let store = UserStore::open(&path).unwrap();
-        assert!(store.load_sessions(SystemTime::now()).unwrap().is_empty());
-        drop(store);
+        for err in [
+            open_for_add(&path).map(|_| ()).unwrap_err(),
+            open_for_remove(&path).map(|_| ()).unwrap_err(),
+            UserStore::open(&path).map(|_| ()).unwrap_err(),
+        ] {
+            assert!(err.contains("predates per-user salts"), "{err}");
+            assert!(err.contains("add-user < users.txt"), "{err}");
+        }
 
-        let conn = open_for_remove(&path).unwrap();
-        assert!(has_table(&conn, "sessions"));
+        // The database is left untouched.
+        let conn = Connection::open(&path).unwrap();
+        assert!(!has_table(&conn, "sessions"));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -568,15 +695,57 @@ mod tests {
         .unwrap();
         drop(conn);
 
+        let conn = open_for_add(&path).unwrap();
+        add_users(
+            &conn,
+            "Alice Another Good Phrase 77!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
         let store = UserStore::open(&path).unwrap();
+        // Right name + right phrase -> the stored name.
         assert_eq!(
-            store.lookup("  BIG secret phrase number 99! ").unwrap(),
+            store
+                .lookup("admin1", "  BIG secret phrase number 99! ")
+                .unwrap(),
             Some(User {
                 name: "admin1".into(),
                 is_admin: true
             })
         );
-        assert_eq!(store.lookup("bigsecret!").unwrap(), None);
+        // Name matching ignores case and surrounding whitespace.
+        assert_eq!(
+            store
+                .lookup("  ADMIN1  ", "big secret phrase number 99!")
+                .unwrap(),
+            Some(User {
+                name: "admin1".into(),
+                is_admin: true
+            })
+        );
+        // Wrong name with a right phrase -> None.
+        assert_eq!(
+            store
+                .lookup("carol", "big secret phrase number 99!")
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.lookup("", "big secret phrase number 99!").unwrap(), None);
+        // Right name with another user's phrase -> None.
+        assert_eq!(
+            store.lookup("admin1", "another good phrase 77!").unwrap(),
+            None
+        );
+        // Alice's own phrase works for her.
+        assert_eq!(
+            store.lookup("alice", "another good phrase 77!").unwrap(),
+            Some(User {
+                name: "Alice".into(),
+                is_admin: false
+            })
+        );
+        assert_eq!(store.lookup("admin1", "bigsecret!").unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -598,7 +767,8 @@ mod tests {
             .unwrap()
             .execute("DROP TABLE users", [])
             .unwrap();
-        assert!(store.lookup("anything at all 1!").is_err());
+        assert!(store.lookup("alice", "anything at all 1!").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+

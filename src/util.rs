@@ -77,12 +77,15 @@ pub(crate) fn sets_session_cookie(value: &str) -> bool {
     }
 }
 
+pub(crate) const PAGE_STYLE: &str =
+    "<style>body,input,button{font-size:24pt}</style>\n";
+
 pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
     let msg = message
         .map(|m| format!("<p>{}</p>\n", html_escape(m)))
         .unwrap_or_default();
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Login</title>\n</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"phrase\">Phrase</label>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autofocus>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<label for=\"phrase\">Pass phrase</label>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
         html_escape(next)
     )
 }

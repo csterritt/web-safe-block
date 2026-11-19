@@ -10,7 +10,7 @@ I'd like to host some open-source programs, but I don't know if they have securi
 
 I'd also like to serve a simple program to allow some friends to search the articles for a neighborhood magazine - and these folks are pretty tech challenged. So it has to be simple to use.
 
-This program, `web-safe-block`, is a simple rust program that gates access to a server process. `web-safe-block` listens on one port for incoming connections, and presents for any URL, from memory, a tiny (333 bytes) log-in page. Users enter a pass-phrase (more about that below) and from then on, they're forwarded directly to another port, which is where the actual application listens, but only for local connections.
+This program, `web-safe-block`, is a simple rust program that gates access to a server process. `web-safe-block` listens on one port for incoming connections, and presents for any URL, from memory, a tiny (580 bytes) log-in page. Users enter a user name and a pass phrase (more about that below) and from then on, they're forwarded directly to another port, which is where the actual application listens, but only for local connections.
 
 It doesn't do TLS termination, so it's meant to be run behind a Cloudflare tunnel or some other such service.
 
@@ -73,10 +73,12 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 
 - Pass phrases are normalized: all whitespace is removed and the phrase is lower-cased. `Open Sesame` and `opensesame` are the same phrase.
 - New pass phrases must have at least 20 non-whitespace characters, at least one number, and at least one punctuation character. Lines with weaker phrases are reported and skipped.
-- The database stores the hex SHA-512 of the normalized phrase, not the phrase itself.
-- User names and pass phrases must both be unique, including against users already in the database.
+- The database stores a random per-user salt and an Argon2id hash (12 MiB, 3 passes, 1 lane) of the normalized phrase, not the phrase itself. Each line therefore takes a noticeable fraction of a second to add.
+- User names must be unique (case-insensitive), including against users already in the database. Pass phrases do not need to be unique.
 - A user whose name contains `admin` (any case) is an admin.
-- Blank lines are ignored. Bad lines (no phrase, duplicate name, phrase already in use) are reported on stderr and skipped. The other lines are still added, and the command exits with status 1 if anything was skipped.
+- Blank lines are ignored. Bad lines (no phrase, duplicate name) are reported on stderr and skipped. The other lines are still added, and the command exits with status 1 if anything was skipped.
+
+Speed: one hash took about 16 ms in a release build on the development machine. That's quicker than password hashes are usually tuned for, so it's worth timing on your actual server. If it's also fast there, you can raise the passes (ARGON2_T_COST in `src/users.rs`) rather than the memory.
 
 #### `remove-user`
 
@@ -124,7 +126,8 @@ $ nc 127.0.0.1 8081
 - Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest is dropped) and 10,000 in total are kept.
 - Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
 - Upstream requests time out after 10s to connect and 60s waiting for response headers (504).
-- Pass phrases are stored as unsalted SHA-512 hashes (lookup is by phrase alone, so a per-user salt isn't possible). This keeps phrases out of plain view if `users.db` leaks, but short or common phrases can still be brute-forced. `add-user` therefore enforces a minimum strength (see above). Keep `users.db` private.
+- Login is by user name (case-insensitive) plus pass phrase. Pass phrases are stored as Argon2id hashes (12 MiB, 3 passes, 1 lane) with a random per-user salt, so identical phrases don't produce identical hashes and precomputed tables don't apply. The slow hash makes offline guessing of a leaked `users.db` far more expensive, though weak phrases can still be guessed, so the strength rules still apply; keep `users.db` private. Logins are hashed one at a time and each briefly uses ~12 MiB.
+- A `users.db` created before per-user salts existed is rejected by every command; move it aside and re-add the users with `add-user`.
 - WebSockets and other protocol upgrades are not supported in v1; authenticated requests with an `Upgrade` header are answered 501 and never forwarded.
 - Paths under `/__wsb/` are reserved and never forwarded.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["form"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1"] }
@@ -19,3 +20,9 @@ toml = "1.2.1"
 [dev-dependencies]
 reqwest = "0.13.5"
 sha2 = "0.11.1"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

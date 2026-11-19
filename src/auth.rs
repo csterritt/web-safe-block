@@ -17,8 +17,8 @@ use crate::sessions::{
 use crate::state::AppState;
 use crate::users::StoredSession;
 use crate::util::{
-    LOGOUT_PATH, SESSION_COOKIE, clear_cookie_header, client_key, cross_site, html_response,
-    login_page, parse_cookies, sanitize_next, session_cookie_header,
+    LOGOUT_PATH, PAGE_STYLE, SESSION_COOKIE, clear_cookie_header, client_key, cross_site,
+    html_response, login_page, parse_cookies, sanitize_next, session_cookie_header,
 };
 
 pub(crate) fn forbidden() -> Response {
@@ -31,6 +31,8 @@ pub(crate) fn forbidden() -> Response {
 
 #[derive(Deserialize)]
 pub(crate) struct LoginForm {
+    #[serde(default)]
+    user: String,
     phrase: String,
     #[serde(default)]
     next: String,
@@ -61,24 +63,33 @@ pub(crate) async fn login(
             None,
         );
     }
-    match state.config.users.lookup(&form.phrase) {
+    let users = state.config.users.clone();
+    let (user_name, phrase) = (form.user.clone(), form.phrase.clone());
+    let looked_up =
+        tokio::task::spawn_blocking(move || users.lookup(&user_name, &phrase)).await;
+    match looked_up {
         Err(e) => {
             eprintln!("web-safe-block: user lookup failed: {e}");
             refund_attempt(&mut state.failures.lock().unwrap(), &key);
             login_error(&next)
         }
-        Ok(None) => {
+        Ok(Err(e)) => {
+            eprintln!("web-safe-block: user lookup failed: {e}");
+            refund_attempt(&mut state.failures.lock().unwrap(), &key);
+            login_error(&next)
+        }
+        Ok(Ok(None)) => {
             tokio::time::sleep(state.config.fail_delay).await;
             with_outcome(
                 html_response(
                     StatusCode::UNAUTHORIZED,
-                    login_page(Some("Incorrect phrase."), &next),
+                    login_page(Some("Incorrect user name or phrase."), &next),
                 ),
                 EventKind::LoginFailed,
                 None,
             )
         }
-        Ok(Some(user)) => {
+        Ok(Ok(Some(user))) => {
             println!("web-safe-block: user '{}' logged in", user.name);
             let token = new_token();
             let expires = SystemTime::now() + state.config.session_ttl;
@@ -144,7 +155,7 @@ fn login_error(next: &str) -> Response {
 pub(crate) async fn logout_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = valid_session(&state, &headers);
     let body = format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Log out</title>\n</head>\n<body>\n<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Log out</title>\n{PAGE_STYLE}</head>\n<body>\n<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
     );
     with_outcome(
         html_response(StatusCode::OK, body),
