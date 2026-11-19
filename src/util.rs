@@ -127,7 +127,7 @@ pub(crate) fn sets_session_cookie(value: &str) -> bool {
     }
 }
 
-pub(crate) const PAGE_STYLE: &str = "<style>body,input,button{font-size:24pt}</style>\n";
+pub(crate) const PAGE_STYLE: &str = "<style>body,input,button{font-size:24pt}input{border:1px solid #000}</style>\n";
 
 pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
     let msg = message

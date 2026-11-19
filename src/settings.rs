@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(s.session_ttl_secs / 86_400, 180);
         assert!(s.cookie_secure);
         assert_eq!(s.monitor_addr, "127.0.0.1:8081".parse().unwrap());
-        assert_eq!(s.monitor_queue_len, 1000);
+        assert_eq!(s.monitor_queue_len, 100);
 
         let err = write_default(&path).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
