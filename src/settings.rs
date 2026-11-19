@@ -33,7 +33,7 @@ cookie_secure = true
 monitor_addr = "127.0.0.1:8081"
 
 # How many unreported events the monitor queue keeps.
-monitor_queue_len = 1000
+monitor_queue_len = 100
 "#;
 
 #[derive(Debug, Deserialize)]
