@@ -249,7 +249,7 @@ export const FLOWS = [
     ['G', 'R', 'reserve attempt', { key: '203.0.113.9', in_window: 0 }, 'xy'],
     ['G', 'U', 'SELECT by sha512', { pass_phrase: 'ddaf35…(128 hex)' }, 'yx'],
     ['U', 'G', 'user row', { user_name: 'chris', is_admin: false }, 'xy'],
-    ['G', 'S', 'insert session (map + users.db)', { token: '9f3a…(32B hex)', stored: 'sha256(9f3a…)', user: 'chris', ttl_secs: 604800 }, 'xy'],
+    ['G', 'S', 'insert session (map + users.db)', { token: '9f3a…(32B hex)', stored: 'sha256(9f3a…)', user: 'chris', ttl_secs: 108864000 }, 'xy'],
     ['G', 'CF', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure' }, 'yx'],
     ['CF', 'BR', 'redirect', { status: 303, location: '/' }, 'yx'],
   ] },
@@ -312,7 +312,7 @@ export const CH = [
     story: `<p>The gate keeps a <mark>small table — hashed token → user + expiry</mark> — capped at 3 sessions per user and 10,000 total. Every login writes through to the <code>sessions</code> table in users.db (SHA-256 of the token only), and serve reloads it at startup and every minute — restart no longer logs anyone out.</p>`,
     flow: [
       ['BR', 'G', 'POST phrase', { form: { phrase: '…' } }],
-      ['G', 'S', 'insert hash', { cookie_string: 'sha256(9f3a…)', user: 'chris', ttl_secs: 604800 }],
+      ['G', 'S', 'insert hash', { cookie_string: 'sha256(9f3a…)', user: 'chris', ttl_secs: 108864000 }],
       ['G', 'BR', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…' }],
       ['BR', 'G', 'next request + cookie', { cookie: 'wsb_session=9f3a…' }],
       ['G', 'S', 'lookup', { token: '9f3a…' }],

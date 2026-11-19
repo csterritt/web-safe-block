@@ -309,7 +309,7 @@ Payload shapes are what the design implies, not measured traffic.
 | 3 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":0}` |
 | 4 | G → U | SELECT by sha512 | `{"pass_phrase":"ddaf35…(128 hex)"}` |
 | 5 | U → G | user row | `{"user_name":"chris","is_admin":false}` |
-| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":604800}` |
+| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":108864000}` |
 | 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure"}` |
 | 8 | CF → BR | redirect | `{"status":303,"location":"/"}` |
 
