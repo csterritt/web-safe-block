@@ -9,7 +9,7 @@ Facts the atlas is drawn from, gathered 2026-11-17. File-by-file.
 ## src/lib.rs (926 lines)
 - Router: `POST /__wsb/login` → `login`; `GET|POST /__wsb/logout` → page/handler; fallback `proxy_or_login`; `record_event` middleware wraps everything.
 - Reserved: any other `/__wsb/*` path → 404, kind `reserved`.
-- Sessions: `HashMap<String, Session>` in a Mutex; token = 32 random bytes hex; caps 10/user, 10k total, earliest-expiry eviction; purger task every 60s.
+- Sessions: `HashMap<String, Session>` in a Mutex keyed by SHA-256 of the token; token = 32 random bytes hex; caps 3/user, 10k total, earliest-expiry eviction; written through to the `sessions` table in users.db, reloaded at startup and every 60s by the purger task (see update 2026-11 below).
 - Rate limit: `failures` map ip → Vec<Instant>; `reserve_attempt` counts under one lock before lookup; `refund_attempt` on db error; `clear_failures` on success; 10 in 15min → 429; failures also wait `fail_delay` = 1s → 401. Max 10k keys, oldest-key eviction.
 - Client IP: `CF-Connecting-IP` header if it parses, else peer addr, else "unknown".
 - CSRF: `cross_site()` checks `Sec-Fetch-Site` (only same-origin/none allowed), else `Origin` authority vs `Host`. Applied to login + logout POSTs → 403 `forbidden`.
@@ -22,7 +22,7 @@ Facts the atlas is drawn from, gathered 2026-11-17. File-by-file.
 - `hash_phrase`: SHA-512 hex of normalized phrase — that's what's stored.
 - Policy: ≥20 non-whitespace chars, ≥1 digit, ≥1 ASCII punctuation.
 - `add_users`: stdin lines, first word = name, rest = phrase; per-line skip reporting; name & phrase-hash UNIQUE (also checked against db); `is_admin` = name contains "admin" case-insensitive.
-- `UserStore::open`: READ_ONLY sqlite; errors if file missing or table empty. `lookup` → `rusqlite::Result<Option<User>>` — errors propagate (login returns 500 `login_error` + refunds the attempt).
+- `UserStore::open`: READ_WRITE sqlite (serve writes the sessions table); errors if file missing or table empty. `lookup` → `rusqlite::Result<Option<User>>` — errors propagate (login returns 500 `login_error` + refunds the attempt).
 
 ## src/monitor.rs (378 lines)
 - `EventQueue`: `VecDeque` + `Condvar`; `push` stamps seq + rfc3339 time; full → pop oldest, count `dropped` only if monitor connected AND seq > sent_up_to.
@@ -39,7 +39,7 @@ All eight findings appear addressed in current code: X-Forwarded-* rebuilt (F1),
 
 ## Known gaps the atlas tracks as questions
 - No `remove-user`/rotation CLI (Q-U1); `is_admin` stored but unused (Q-U2).
-- Sessions volatile on restart (Q-S1 → ghost P).
+- Sessions volatile on restart (Q-S1 → ghost P). *Resolved 2026-11: sessions persisted in users.db (ADR 0006); ghost P removed.*
 - WebSocket upgrades stripped → apps can't do WS (Q-W1 → ghost W).
 - CF-Connecting-IP trusted unconditionally (Q-T1); IP-keyed limiter shares budget across NATs (Q-R1).
 - No mid-body upstream timeout (Q-F2); monitor has no auth beyond loopback (Q-M1); unconnected drops uncounted (Q-Q1); config-only settings (Q-C1); csrf check posture (Q-G2); https/unix upstream (Q-A1).
@@ -60,9 +60,18 @@ The gate code split into per-concern modules; `lib.rs` is now only module declar
 Public API unchanged; tests moved next to the code they cover.
 
 ### New commands
-- `remove-user NAME` — opens users.db read-write (`open_for_remove`: errors if missing or lacking the users table), `DELETE WHERE user_name`; exit 2 missing arg, exit 1 unknown name. Live sessions are unaffected (in-memory; expire on TTL or restart).
+- `remove-user NAME` — opens users.db read-write (`open_for_remove`: errors if missing or lacking the users table), `DELETE WHERE user_name`; exit 2 missing arg, exit 1 unknown name. As of the sessions-persistence change it also deletes the user's rows from `sessions` in the same transaction; a running serve notices on its next 60s reload.
 - `list-users` — `UserStore::list()` = `SELECT user_name, is_admin … ORDER BY user_name`; prints `name<TAB>true|false` on stdout. Errors on missing/empty db (same open as `serve`).
 - `parse_args` now accepts one optional positional arg.
 
 ### Upgrade attempts → 501
 `proxy_or_login` answers `501 Not Implemented` for any authenticated request with an `Upgrade` header — checked after the `/__wsb/` reserved check and after the session check, so the event carries the user name. New `EventKind::Upgrade` serializes as `upgrade`. Unauthenticated requests still get the 401 login page. Integration test `upgrade_requests_get_501` asserts nothing reaches upstream.
+
+## Update 2026-11 — sessions persisted in users.db (ADR 0006)
+
+Resolves Q-S1; the ghost P "saved sessions" node is built and removed from the map.
+
+- `users.rs` — schema gains `sessions(user_name REFERENCES users ON DELETE CASCADE, cookie_string UNIQUE, timestamp)` + index; `init()` sets `PRAGMA foreign_keys` + 5s busy timeout and creates both tables (called from `open_for_add`, `open_for_remove`, `UserStore::open` — old DBs get the table on first open). `UserStore::open` is now READ_WRITE. `remove_user` deletes sessions + user in one transaction. New `StoredSession` API: `load_sessions`, `save_session` (insert + evictions in one tx), `delete_sessions`, `delete_expired_sessions`.
+- `sessions.rs` — `Session.expires` is `SystemTime`; `hash_token` = hex SHA-256 (the map key and `cookie_string`; raw tokens never stored); `insert_session` returns evicted keys; `reload_sessions` rebuilds the map from live DB rows.
+- `auth.rs` — login inserts under the sessions lock and saves to the DB before replying (save failure → refund + 500 `login_error`); logout deletes the hash from map and DB.
+- `state.rs`/`app.rs` — `max_sessions_per_user` default 3; `Limits.purge_interval` (default 60s) drives the purger, which reloads sessions from the DB each tick (picking up `remove-user` deletions) instead of just sweeping memory. `build_router` returns `Result<Router, String>` and loads sessions at startup.

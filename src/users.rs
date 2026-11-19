@@ -1,6 +1,7 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha512};
@@ -11,7 +12,23 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
     user_name   TEXT    NOT NULL UNIQUE,
     pass_phrase TEXT    NOT NULL UNIQUE,
     is_admin    BOOLEAN NOT NULL
-)";
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    user_name     TEXT    NOT NULL REFERENCES users(user_name) ON DELETE CASCADE,
+    cookie_string TEXT    NOT NULL UNIQUE,
+    timestamp     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_name)";
+
+/// Foreign keys, a write busy timeout, and every table the file should have.
+fn init(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.execute_batch(&format!("PRAGMA foreign_keys = ON;\n{SCHEMA}"))
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
 
 /// Remove all whitespace and lower-case the phrase.
 pub fn normalize_phrase(s: &str) -> String {
@@ -57,7 +74,7 @@ pub fn hash_phrase(s: &str) -> String {
 /// Open (creating if needed) the database for `add-user`.
 pub fn open_for_add(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute(SCHEMA, [])?;
+    init(&conn)?;
     Ok(conn)
 }
 
@@ -73,13 +90,17 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
         .map_err(|_| format!("{} does not contain a users table", path.display()))?;
+    init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     Ok(conn)
 }
 
-/// Remove the user `name`; returns whether a row was deleted.
+/// Remove the user `name` and their sessions; returns whether a row was deleted.
 pub fn remove_user(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
-    conn.execute("DELETE FROM users WHERE user_name = ?1", [name])
-        .map(|removed| removed > 0)
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM sessions WHERE user_name = ?1", [name])?;
+    let removed = tx.execute("DELETE FROM users WHERE user_name = ?1", [name])?;
+    tx.commit()?;
+    Ok(removed > 0)
 }
 
 /// Every user, sorted by name.
@@ -157,7 +178,14 @@ pub struct User {
     pub is_admin: bool,
 }
 
-/// Read-only access to the users database for `serve`.
+/// A session row: the SHA-256 of the cookie token, its user, and its expiry.
+pub struct StoredSession {
+    pub cookie_string: String,
+    pub user_name: String,
+    pub expires: SystemTime,
+}
+
+/// Access to the users database for `serve`: reads users, writes sessions.
 #[derive(Debug)]
 pub struct UserStore {
     conn: Mutex<Connection>,
@@ -171,7 +199,7 @@ impl UserStore {
         if !path.exists() {
             return Err(missing());
         }
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
@@ -182,6 +210,7 @@ impl UserStore {
                 path.display()
             ));
         }
+        init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         Ok(UserStore {
             conn: Mutex::new(conn),
         })
@@ -190,6 +219,57 @@ impl UserStore {
     /// Every user, sorted by name.
     pub fn list(&self) -> rusqlite::Result<Vec<User>> {
         list_users(&self.conn.lock().unwrap())
+    }
+
+    /// Every session whose expiry is still in the future.
+    pub fn load_sessions(&self, now: SystemTime) -> rusqlite::Result<Vec<StoredSession>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT cookie_string, user_name, timestamp FROM sessions \
+                 WHERE timestamp > ?1",
+            )?
+            .query_map([unix_secs(now)], |r| {
+                Ok(StoredSession {
+                    cookie_string: r.get(0)?,
+                    user_name: r.get(1)?,
+                    expires: UNIX_EPOCH + Duration::from_secs(r.get::<_, i64>(2)? as u64),
+                })
+            })?
+            .collect()
+    }
+
+    /// Insert `new` and delete each `removed` cookie string, in one transaction.
+    pub fn save_session(&self, new: &StoredSession, removed: &[String]) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for cookie in removed {
+            tx.execute("DELETE FROM sessions WHERE cookie_string = ?1", [cookie])?;
+        }
+        tx.execute(
+            "INSERT INTO sessions (user_name, cookie_string, timestamp) VALUES (?1, ?2, ?3)",
+            params![new.user_name, new.cookie_string, unix_secs(new.expires)],
+        )?;
+        tx.commit()
+    }
+
+    /// Delete the sessions with these cookie strings, if they exist.
+    pub fn delete_sessions(&self, cookie_strings: &[String]) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("DELETE FROM sessions WHERE cookie_string = ?1")?;
+        for cookie in cookie_strings {
+            stmt.execute([cookie])?;
+        }
+        Ok(())
+    }
+
+    /// Delete sessions at or past their expiry; returns how many were removed.
+    pub fn delete_expired_sessions(&self, now: SystemTime) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM sessions WHERE timestamp <= ?1",
+            [unix_secs(now)],
+        )
     }
 
     pub fn lookup(&self, phrase: &str) -> rusqlite::Result<Option<User>> {
@@ -216,8 +296,18 @@ mod tests {
 
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute(SCHEMA, []).unwrap();
+        init(&conn).unwrap();
         conn
+    }
+
+    fn has_table(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
     }
 
     #[test]
@@ -304,7 +394,21 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
+        let store_sessions = |user: &str| {
+            conn.execute(
+                "INSERT INTO sessions (user_name, cookie_string, timestamp) \
+                 VALUES (?1, ?2, ?3)",
+                params![user, format!("c-{user}"), 999_999_999_999i64],
+            )
+            .unwrap();
+        };
+        store_sessions("alice");
+        store_sessions("bob");
         assert!(remove_user(&conn, "alice").unwrap());
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "bob's session survives");
         assert!(!remove_user(&conn, "alice").unwrap());
         assert!(!remove_user(&conn, "carol").unwrap());
         let names: Vec<String> = conn
@@ -315,6 +419,111 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(names, ["bob"]);
+    }
+
+    fn session(user: &str, cookie: &str, secs_from_now: i64) -> StoredSession {
+        StoredSession {
+            cookie_string: cookie.to_string(),
+            user_name: user.to_string(),
+            expires: if secs_from_now >= 0 {
+                SystemTime::now() + Duration::from_secs(secs_from_now as u64)
+            } else {
+                SystemTime::now() - Duration::from_secs((-secs_from_now) as u64)
+            },
+        }
+    }
+
+    fn mem_store() -> UserStore {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        UserStore {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn session_roundtrip() {
+        let store = mem_store();
+        let conn = store.conn.lock().unwrap();
+        add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
+
+        store
+            .save_session(&session("alice", "live", 600), &[])
+            .unwrap();
+        store
+            .save_session(&session("alice", "dead", -10), &[])
+            .unwrap();
+        let loaded = store.load_sessions(SystemTime::now()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cookie_string, "live");
+        assert_eq!(loaded[0].user_name, "alice");
+
+        // Replacing removes the old rows in the same transaction.
+        store
+            .save_session(&session("alice", "newer", 600), &["live".into()])
+            .unwrap();
+        let loaded = store.load_sessions(SystemTime::now()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cookie_string, "newer");
+
+        store
+            .delete_sessions(&["newer".into(), "absent".into()])
+            .unwrap();
+        assert!(store.load_sessions(SystemTime::now()).unwrap().is_empty());
+
+        store
+            .save_session(&session("alice", "gone", -1), &[])
+            .unwrap();
+        // "dead" (saved above) and "gone" are both expired.
+        assert_eq!(store.delete_expired_sessions(SystemTime::now()).unwrap(), 2);
+        assert_eq!(store.delete_expired_sessions(SystemTime::now()).unwrap(), 0);
+    }
+
+    #[test]
+    fn session_for_missing_user_fails() {
+        let store = mem_store();
+        assert!(
+            store.save_session(&session("ghost", "c", 60), &[]).is_err(),
+            "foreign key enforced"
+        );
+    }
+
+    #[test]
+    fn old_database_gains_sessions_table() {
+        const OLD_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
+            user_name   TEXT    NOT NULL UNIQUE,
+            pass_phrase TEXT    NOT NULL UNIQUE,
+            is_admin    BOOLEAN NOT NULL
+        )";
+        let dir = std::env::temp_dir().join(format!("wsb-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+
+        // A database from before the sessions table existed.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(OLD_SCHEMA, []).unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, pass_phrase, is_admin) VALUES ('alice', 'h', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(!has_table(&conn, "sessions"));
+        drop(conn);
+
+        let store = UserStore::open(&path).unwrap();
+        assert!(store.load_sessions(SystemTime::now()).unwrap().is_empty());
+        drop(store);
+
+        let conn = open_for_remove(&path).unwrap();
+        assert!(has_table(&conn, "sessions"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

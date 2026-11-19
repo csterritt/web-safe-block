@@ -2,11 +2,11 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **11 open · 6 resolved**._
+_Question status: **10 open · 7 resolved**._
 
 ## One paragraph
 
-web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in `users.db` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions vanish on restart.
+web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in `users.db` — then it mints a session cookie (persisted as a hash in `users.db`) and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions survive a restart.
 
 ## Decisions locked
 
@@ -15,7 +15,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Runtime | Rust + axum/hyper on one tokio runtime; a plain OS thread runs the monitor | — |
 | Credential | The pass phrase is the whole credential — it identifies the user; no username on the wire | [0001](./adr/0001-phrase-is-the-credential.md) |
 | Phrase storage | Unsalted SHA-512 of the normalized phrase (per-user salt is impossible when lookup is by phrase alone); ≥20 chars + digit + punctuation enforced at add time | [0001](./adr/0001-phrase-is-the-credential.md) |
-| Sessions | In-memory token→user map, 10/user and 10k total, TTL from config; lost on restart by design | [0002](./adr/0002-sessions-in-memory.md) |
+| Sessions | Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total; reload on the 60s purge tick picks up remove-user | [0006](./adr/0006-sessions-persisted.md) |
 | Client IP | CF-Connecting-IP is trusted when present — listen_addr must only ever face the tunnel | [0003](./adr/0003-trusted-edge-header.md) |
 | Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file | [0004](./adr/0004-strict-config.md) |
 | Monitor | One loopback JSON-lines client at a time; bounded queue overwrites the oldest events | [0005](./adr/0005-one-monitor.md) |
@@ -29,7 +29,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 | Resource | Bound | Where |
 |---|---|---|
-| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/state.rs` `Limits` + `src/sessions.rs` |
+| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
 | Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |
 | Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |
 | Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |
@@ -43,7 +43,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 5. **Slowing down guessing** — Wrong phrase? Ten tries per quarter-hour per client — and each miss costs a second. _(adds R)_
 6. **Watching the door** — Every request leaves a one-line trace on a loopback port. _(adds EQ, MO)_
 7. **Running it** — Five commands: write-config, add-user, remove-user, list-users, serve. _(adds OP, C)_
-8. **Not switched on** — Designed for, not built. _(adds WS, PS)_
+8. **Not switched on** — Designed for, not built. _(adds WS)_
 9. **The whole system** — Everything at once, for free exploration.
 
 ## Structures
@@ -106,21 +106,22 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 #### S · Session table
 
-**In one line.** The gate's memory: random token → user + expiry, in RAM only.
+**In one line.** The gate's memory: hashed token → user + expiry, cached in RAM and persisted in users.db.
 
-**What it does.** A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. Restart the process and everyone is logged out.
+**What it does.** A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. A restart reloads the live sessions — nobody is logged out.
 
-**How it's built.** `HashMap<String, Session>` behind a `Mutex`. Tokens are **32 random bytes, hex**. Caps: 10 sessions per user and 10,000 total — the earliest-expiring entry is evicted; a background task purges expired rows every 60s.
+**How it's built.** `HashMap<String, Session>` behind a `Mutex`, written through to the `sessions` table in `users.db` on every login. Tokens are **32 random bytes, hex**; only their **SHA-256 hash** is stored — the raw token exists solely in the Set-Cookie header. Caps: 3 sessions per user and 10,000 total — the earliest-expiring entry is evicted from map and table together. The 60s purge tick re-reads the table, dropping expired rows and picking up sessions deleted by `remove-user`.
 
 **Steps in execution.**
 
-1. **Insert** — new_token() → Session{user, expires}; evict oldest to stay inside caps.
-2. **Check** — Valid + unexpired → user name; expired → removed on sight.
-3. **Sweep** — Purger task drops expired entries every 60 seconds.
+1. **Insert** — new_token() → hash → Session{user, expires}; evict oldest to stay inside caps; write hash + expiry to users.db.
+2. **Check** — Cookie → SHA-256 → lookup; valid + unexpired → user name.
+3. **Reload** — Every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.
 
 **Questions.**
 
-- **Q-S1** Sessions die on restart — acceptable while this guards one box, or should they persist? (see ghost P)
+- ~~**Q-S1** Sessions die on restart — acceptable while this guards one box, or should they persist?~~ ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
+- **Q-S2** A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
 
 #### R · Failure ledger
 
@@ -147,7 +148,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The list of people allowed in. It stores each user name, the SHA-512 of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "is there anyone with this phrase?" on every login.
 
-**How it's built.** `users.db`: `UserStore` opens it read-only for `serve` and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes one row. Phrases are **normalized — whitespace stripped, lower-cased** — then hex SHA-512'd. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
+**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. Phrases are **normalized — whitespace stripped, lower-cased** — then hex SHA-512'd. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
 
 **Steps in execution.**
 
@@ -158,7 +159,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.
+- ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
 
@@ -295,23 +296,6 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 - ~~**Q-W1** Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?~~ ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
 
-#### P · Saved sessions _(not switched on)_
-
-**In one line.** Designed for, not built: sessions that survive a restart.
-
-**What it does.** Today, restarting web-safe-block logs everyone out, because the session table lives only in memory. This ghost is a small persistent store — a file or a sqlite table — written on login and read on boot.
-
-**How it's built.** A write-through table next to `users.db`, or a second file, holding `{token, user, expiry}`; `serve` would reload unexpired rows at startup. The caps and the 60s sweep stay the same.
-
-**Steps in execution.**
-
-1. **Write-through** — Insert session → also append/update the store.
-2. **Reload** — On boot, load rows with expiry in the future.
-
-**Questions.**
-
-- **Q-P1** Worth doing? It trades "restart clears the decks" (a nice property after an incident) for nobody being logged out on deploys.
-
 ## Flows (representative packets)
 
 Payload shapes are what the design implies, not measured traffic.
@@ -325,7 +309,7 @@ Payload shapes are what the design implies, not measured traffic.
 | 3 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":0}` |
 | 4 | G → U | SELECT by sha512 | `{"pass_phrase":"ddaf35…(128 hex)"}` |
 | 5 | U → G | user row | `{"user_name":"chris","is_admin":false}` |
-| 6 | G → S | insert session | `{"token":"9f3a…(32B hex)","user":"chris","ttl_secs":604800}` |
+| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":604800}` |
 | 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure"}` |
 | 8 | CF → BR | redirect | `{"status":303,"location":"/"}` |
 
@@ -380,10 +364,11 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - **Q-T1** (T) If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel's peer address?
 - ~~**Q-G1**~~ (G) ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
 - **Q-G2** (G) Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
-- **Q-S1** (S) Sessions die on restart — acceptable while this guards one box, or should they persist? (see ghost P)
+- ~~**Q-S1**~~ (S) ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
+- **Q-S2** (S) A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
 - **Q-R1** (R) Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
 - ~~**Q-R2**~~ (R) ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
-- ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.
+- ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** (U) The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3**~~ (U) ✓ Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
@@ -393,13 +378,12 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
 - **Q-M1** (M) The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?
 - ~~**Q-W1**~~ (W) ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
-- **Q-P1** (P) Worth doing? It trades "restart clears the decks" (a nice property after an incident) for nobody being logged out on deploys.
 
 ## What the platform gives vs what we own
 
 **Platform gives:** axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand.
 
-**We own:** the gate: phrase-only login, in-memory sessions, the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.
+**We own:** the gate: phrase-only login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.
 
 ## Planned filesystem
 

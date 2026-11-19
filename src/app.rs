@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
@@ -15,21 +15,23 @@ use crate::auth::{login, logout, logout_page};
 use crate::monitor::{Event, EventKind, EventQueue, Outcome};
 use crate::proxy::proxy_or_login;
 use crate::rate_limit::RATE_LIMIT_WINDOW;
+use crate::sessions::reload_sessions;
 use crate::state::{AppState, Config};
 use crate::util::{LOGIN_PATH, LOGOUT_PATH, client_key};
 
-const PURGE_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Build the public-facing router. Every request is reported to `events`.
-pub fn build_router(config: Config, events: Arc<EventQueue>) -> Router {
+/// Loads the persisted sessions before serving; errors if users.db cannot
+/// be read.
+pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, String> {
     let state = AppState::new(config, events);
+    reload_sessions(&state).map_err(|e| format!("cannot load sessions: {e}"))?;
     spawn_purger(state.clone());
-    Router::new()
+    Ok(Router::new()
         .route(LOGIN_PATH, post(login))
         .route(LOGOUT_PATH, get(logout_page).post(logout))
         .fallback(proxy_or_login)
         .layer(middleware::from_fn_with_state(state.clone(), record_event))
-        .with_state(state)
+        .with_state(state))
 }
 
 /// Push one event per request, using the `Outcome` the handler attached.
@@ -81,13 +83,13 @@ pub(crate) fn with_outcome(mut resp: Response, kind: EventKind, user: Option<Str
 fn spawn_purger(state: AppState) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(PURGE_INTERVAL).await;
+            tokio::time::sleep(state.config.limits.purge_interval).await;
+            // Reloading drops expired rows and picks up changes made by other
+            // processes (a remove-user deletes the user's sessions).
+            if let Err(e) = reload_sessions(&state) {
+                eprintln!("web-safe-block: session reload failed: {e}");
+            }
             let now = Instant::now();
-            state
-                .sessions
-                .lock()
-                .unwrap()
-                .retain(|_, s| s.expires > now);
             state.failures.lock().unwrap().retain(|_, v| {
                 v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
                 !v.is_empty()

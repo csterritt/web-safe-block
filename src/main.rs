@@ -110,7 +110,9 @@ fn remove_user(settings: Settings, name: &str) -> ExitCode {
     };
     match users::remove_user(&conn, name) {
         Ok(true) => {
-            eprintln!("web-safe-block: removed user '{name}'");
+            eprintln!(
+                "web-safe-block: removed user '{name}'; a running serve drops their sessions within 60 seconds"
+            );
             ExitCode::SUCCESS
         }
         Ok(false) => fail(format!("no user named '{name}'")),
@@ -167,8 +169,12 @@ fn serve(settings: Settings) -> ExitCode {
             Ok(l) => l,
             Err(e) => return fail(format!("failed to bind {listen}: {e}")),
         };
+        let router = match web_safe_block::build_router(config, events) {
+            Ok(r) => r,
+            Err(e) => return fail(e),
+        };
         let service: IntoMakeServiceWithConnectInfo<_, SocketAddr> =
-            web_safe_block::build_router(config, events).into_make_service_with_connect_info();
+            router.into_make_service_with_connect_info();
         match axum::serve(listener, service).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("server error: {e}")),

@@ -11,6 +11,7 @@ use axum::extract::Request;
 use axum::http::header;
 use axum::response::{AppendHeaders, IntoResponse};
 use axum::routing::any;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use web_safe_block::monitor::{self, EventQueue};
 use web_safe_block::users::{self, UserStore};
@@ -70,7 +71,8 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-fn user_store() -> UserStore {
+/// Fresh users.db containing alice; returns its path.
+fn user_db() -> PathBuf {
     let path = temp_dir().join(users::DB_FILE);
     let conn = users::open_for_add(&path).unwrap();
     users::add_users(
@@ -79,7 +81,8 @@ fn user_store() -> UserStore {
         &mut Vec::new(),
     )
     .unwrap();
-    UserStore::open(&path).unwrap()
+    drop(conn);
+    path
 }
 
 fn bin() -> Command {
@@ -92,21 +95,23 @@ async fn spawn_proxy(upstream: &str) -> SocketAddr {
 
 /// Start the proxy plus a monitor thread; returns (proxy addr, monitor addr).
 async fn spawn_proxy_with_monitor(upstream: &str, queue_len: usize) -> (SocketAddr, SocketAddr) {
-    spawn_proxy_full(upstream, queue_len, Limits::default()).await
+    let (proxy, monitor, _db) = spawn_proxy_full(upstream, queue_len, Limits::default()).await;
+    (proxy, monitor)
 }
 
-/// Start the proxy with custom limits; returns (proxy addr, monitor addr).
-async fn spawn_proxy_full(
+/// Start the proxy on an existing users.db; returns (proxy addr, monitor addr).
+async fn spawn_proxy_on_db(
     upstream: &str,
     queue_len: usize,
     limits: Limits,
+    db: &std::path::Path,
 ) -> (SocketAddr, SocketAddr) {
     let events = Arc::new(EventQueue::new(queue_len));
     let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let monitor_addr = monitor_listener.local_addr().unwrap();
     monitor::spawn_monitor(monitor_listener, events.clone());
     let config = Config {
-        users: Arc::new(user_store()),
+        users: Arc::new(UserStore::open(db).unwrap()),
         upstream: upstream.parse().unwrap(),
         session_ttl: Duration::from_secs(600),
         cookie_secure: false,
@@ -116,9 +121,22 @@ async fn spawn_proxy_full(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let service = web_safe_block::build_router(config, events)
+        .unwrap()
         .into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
     (addr, monitor_addr)
+}
+
+/// Start the proxy with custom limits on a fresh database;
+/// returns (proxy addr, monitor addr, users.db path).
+async fn spawn_proxy_full(
+    upstream: &str,
+    queue_len: usize,
+    limits: Limits,
+) -> (SocketAddr, SocketAddr, PathBuf) {
+    let db = user_db();
+    let (addr, monitor_addr) = spawn_proxy_on_db(upstream, queue_len, limits, &db).await;
+    (addr, monitor_addr, db)
 }
 
 struct MonitorClient(BufReader<std::net::TcpStream>);
@@ -526,7 +544,7 @@ async fn per_user_session_cap() {
         max_sessions_per_user: 2,
         ..Limits::default()
     };
-    let (proxy, _) = spawn_proxy_full(&upstream, 100, limits).await;
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
     let base = format!("http://{proxy}");
     let client = client();
     let mut tokens = Vec::new();
@@ -564,6 +582,127 @@ async fn per_user_session_cap() {
     }
 }
 
+/// POST the login form; returns the raw wsb_session token.
+async fn login_token(client: &reqwest::Client, base: &str) -> String {
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    set_cookie_values(&resp)[0]
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("wsb_session=")
+        .unwrap()
+        .to_string()
+}
+
+async fn token_status(client: &reqwest::Client, base: &str, token: &str) -> u16 {
+    client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+fn sha256_hex(s: &str) -> String {
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn sessions_survive_restart() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let db = user_db();
+    let (proxy, _) = spawn_proxy_on_db(&upstream, 100, Limits::default(), &db).await;
+    let client = client();
+    let token = login_token(&client, &format!("http://{proxy}")).await;
+    assert_eq!(
+        token_status(&client, &format!("http://{proxy}"), &token).await,
+        200
+    );
+
+    // A second router on the same database — a "restart" — accepts the token.
+    let (proxy2, _) = spawn_proxy_on_db(&upstream, 100, Limits::default(), &db).await;
+    assert_eq!(
+        token_status(&client, &format!("http://{proxy2}"), &token).await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn fourth_login_evicts_oldest() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, _, db) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let mut tokens = Vec::new();
+    for _ in 0..4 {
+        tokens.push(login_token(&client, &base).await);
+    }
+    for (i, token) in tokens.iter().enumerate() {
+        let status = token_status(&client, &base, token).await;
+        assert_eq!(status, if i == 0 { 401 } else { 200 }, "token {i}");
+    }
+
+    // The table holds the three newest sessions as SHA-256 hashes only.
+    let conn = users::open_for_remove(&db).unwrap();
+    let mut rows: Vec<(String, String)> = conn
+        .prepare("SELECT user_name, cookie_string FROM sessions")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+    assert_eq!(rows.len(), 3);
+    let hashes: Vec<String> = tokens[1..].iter().map(|t| sha256_hex(t)).collect();
+    for (user, cookie) in &rows {
+        assert_eq!(user, "alice");
+        assert!(hashes.contains(cookie), "{cookie} not a live token hash");
+    }
+    assert!(!rows.iter().any(|(_, c)| *c == sha256_hex(&tokens[0])));
+    // No raw token is ever stored.
+    for token in &tokens {
+        assert!(!rows.iter().any(|(_, c)| c == token));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_user_invalidates_sessions() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let limits = Limits {
+        purge_interval: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    let (proxy, _, db) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+    assert_eq!(token_status(&client, &base, &token).await, 200);
+
+    let conn = users::open_for_remove(&db).unwrap();
+    assert!(users::remove_user(&conn, "alice").unwrap());
+    drop(conn);
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(token_status(&client, &base, &token).await, 401);
+    let conn = users::open_for_remove(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stalled_upstream_times_out() {
     // Accept connections but never respond.
@@ -579,7 +718,7 @@ async fn stalled_upstream_times_out() {
         upstream_response_timeout: Duration::from_millis(300),
         ..Limits::default()
     };
-    let (proxy, _) = spawn_proxy_full(&upstream, 100, limits).await;
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
     let base = format!("http://{proxy}");
     let client = client();
     let resp = client

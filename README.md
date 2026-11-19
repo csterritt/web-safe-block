@@ -66,7 +66,7 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 
 ### `remove-user`
 
-`web-safe-block remove-user <user-name>` deletes that user from the users database. It exits with an error if the database is missing or there is no such user. The user's pass phrase stops working immediately; sessions they already hold stay valid until they expire or `serve` restarts.
+`web-safe-block remove-user <user-name>` deletes that user and their sessions from the users database. It exits with an error if the database is missing or there is no such user. The user's pass phrase stops working immediately; a running `serve` drops their live sessions within 60 seconds.
 
 ### `list-users`
 
@@ -107,7 +107,7 @@ $ nc 127.0.0.1 8081
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
 - The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped.
 - Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP), with a 1s delay on each failure. Because `CF-Connecting-IP` is trusted, don't expose `listen_addr` anywhere except to the tunnel.
-- Sessions live in memory and are lost on restart. At most 10 live sessions per user (the oldest is dropped) and 10,000 in total are kept.
+- Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest is dropped) and 10,000 in total are kept.
 - Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
 - Upstream requests time out after 10s to connect and 60s waiting for response headers (504).
 - Pass phrases are stored as unsalted SHA-512 hashes (lookup is by phrase alone, so a per-user salt isn't possible). This keeps phrases out of plain view if `users.db` leaks, but short or common phrases can still be brute-forced. `add-user` therefore enforces a minimum strength (see above); users added before that policy existed are not re-checked. Keep `users.db` private.

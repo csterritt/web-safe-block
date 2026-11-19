@@ -22,16 +22,19 @@ pub struct Limits {
     pub max_failure_keys: usize,
     pub upstream_connect_timeout: Duration,
     pub upstream_response_timeout: Duration,
+    /// How often sessions are reloaded from users.db and stale state purged.
+    pub purge_interval: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_sessions: 10_000,
-            max_sessions_per_user: 10,
+            max_sessions_per_user: 3,
             max_failure_keys: 10_000,
             upstream_connect_timeout: Duration::from_secs(10),
             upstream_response_timeout: Duration::from_secs(60),
+            purge_interval: Duration::from_secs(60),
         }
     }
 }

@@ -13,13 +13,13 @@ export const META = {
     { k: 'Seats', v: '1 public port · 1 monitor' },
   ],
   intro: `_**This file is the living source of truth for the design.** The interactive atlas (\`atlas.html\`) is built from the same data; edit this file and rebuild, never the outputs._`,
-  onePara: `web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in \`users.db\` — then it mints an in-memory session cookie and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions vanish on restart.`,
+  onePara: `web-safe-block is a small Rust program that parks itself in front of a web server you don't fully trust. The internet reaches only its public port (through a TLS terminator such as Cloudflare Tunnel); it answers every request with a one-field phrase form until someone submits a phrase that hashes to a row in \`users.db\` — then it mints a session cookie (persisted as a hash in \`users.db\`) and becomes a plain reverse proxy to the protected app on loopback. A second, loopback-only port streams one JSON line per request to a single watcher. v1 answers protocol upgrades with a 501 instead of relaying them, and sessions survive a restart.`,
   costModel: [
     'Bounds, not dollars — this is one process on one box. Every in-memory structure is capped:',
     '',
     '| Resource | Bound | Where |',
     '|---|---|---|',
-    '| Sessions | 10 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d) | `src/state.rs` `Limits` + `src/sessions.rs` |',
+    '| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 7d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |',
     '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |',
     '| Event queue | `monitor_queue_len` (default 1,000), oldest overwritten | `src/monitor.rs` `EventQueue` |',
     '| Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |',
@@ -27,7 +27,7 @@ export const META = {
   ],
   deepDive: '',
   platformGives: 'axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand.',
-  weOwn: 'the gate: phrase-only login, in-memory sessions, the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.',
+  weOwn: 'the gate: phrase-only login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.',
   filesystem: `web-safe-block/
   src/
     main.rs       commands: write-config · add-user · remove-user · list-users · serve
@@ -51,7 +51,7 @@ export const DECISIONS = [
   { axis: 'Runtime', decision: 'Rust + axum/hyper on one tokio runtime; a plain OS thread runs the monitor', adr: '—' },
   { axis: 'Credential', decision: 'The pass phrase is the whole credential — it identifies the user; no username on the wire', adr: '[0001](./adr/0001-phrase-is-the-credential.md)' },
   { axis: 'Phrase storage', decision: 'Unsalted SHA-512 of the normalized phrase (per-user salt is impossible when lookup is by phrase alone); ≥20 chars + digit + punctuation enforced at add time', adr: '[0001](./adr/0001-phrase-is-the-credential.md)' },
-  { axis: 'Sessions', decision: 'In-memory token→user map, 10/user and 10k total, TTL from config; lost on restart by design', adr: '[0002](./adr/0002-sessions-in-memory.md)' },
+  { axis: 'Sessions', decision: 'Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total; reload on the 60s purge tick picks up remove-user', adr: '[0006](./adr/0006-sessions-persisted.md)' },
   { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted when present — listen_addr must only ever face the tunnel', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
   { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file', adr: '[0004](./adr/0004-strict-config.md)' },
   { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; bounded queue overwrites the oldest events', adr: '[0005](./adr/0005-one-monitor.md)' },
@@ -109,16 +109,17 @@ export const NODES = [
       'Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?',
     ] },
   { id: 'S', code: 'S', name: 'Session table', short: 'SESSIONS', group: 'gate', gx: 6, gy: 7, w: 2, d: 2, h: 22, kind: 'store',
-    one: 'The gate\'s memory: random token → user + expiry, in RAM only.',
-    what: 'A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. Restart the process and everyone is logged out.',
-    how: '<code>HashMap&lt;String, Session&gt;</code> behind a <code>Mutex</code>. Tokens are <mark>32 random bytes, hex</mark>. Caps: 10 sessions per user and 10,000 total — the earliest-expiring entry is evicted; a background task purges expired rows every 60s.',
+    one: 'The gate\'s memory: hashed token → user + expiry, cached in RAM and persisted in users.db.',
+    what: 'A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. A restart reloads the live sessions — nobody is logged out.',
+    how: '<code>HashMap&lt;String, Session&gt;</code> behind a <code>Mutex</code>, written through to the <code>sessions</code> table in <code>users.db</code> on every login. Tokens are <mark>32 random bytes, hex</mark>; only their <mark>SHA-256 hash</mark> is stored — the raw token exists solely in the Set-Cookie header. Caps: 3 sessions per user and 10,000 total — the earliest-expiring entry is evicted from map and table together. The 60s purge tick re-reads the table, dropping expired rows and picking up sessions deleted by <code>remove-user</code>.',
     steps: [
-      ['Insert', 'new_token() → Session{user, expires}; evict oldest to stay inside caps.'],
-      ['Check', 'Valid + unexpired → user name; expired → removed on sight.'],
-      ['Sweep', 'Purger task drops expired entries every 60 seconds.'],
+      ['Insert', 'new_token() → hash → Session{user, expires}; evict oldest to stay inside caps; write hash + expiry to users.db.'],
+      ['Check', 'Cookie → SHA-256 → lookup; valid + unexpired → user name.'],
+      ['Reload', 'Every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.'],
     ],
     cond: [
-      'Sessions die on restart — acceptable while this guards one box, or should they persist? (see ghost P)',
+      { q: 'Sessions die on restart — acceptable while this guards one box, or should they persist?', r: 'Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).' },
+      'A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?',
     ] },
   { id: 'R', code: 'R', name: 'Failure ledger', short: 'THROTTLE', group: 'gate', gx: 8.5, gy: 7, w: 2, d: 2, h: 22, kind: 'store',
     one: 'Ten failed phrases per quarter-hour per client — and each miss costs a second.',
@@ -136,7 +137,7 @@ export const NODES = [
   { id: 'U', code: 'U', name: 'Phrase book', short: 'USERS.DB', group: 'gate', gx: 10, gy: 0.5, w: 2, d: 2, h: 22, kind: 'store',
     one: 'The sqlite file of who may enter — phrase hashes only, never phrases.',
     what: 'The list of people allowed in. It stores each user name, the SHA-512 of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "is there anyone with this phrase?" on every login.',
-    how: '<code>users.db</code>: <code>UserStore</code> opens it read-only for <code>serve</code> and <code>list-users</code>; <code>add-user</code> creates and writes it, <code>remove-user NAME</code> deletes one row. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hex SHA-512\'d. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.',
+    how: '<code>users.db</code>: <code>UserStore</code> opens it read-write for <code>serve</code> (it also writes the <code>sessions</code> table there) and <code>list-users</code>; <code>add-user</code> creates and writes it, <code>remove-user NAME</code> deletes the user and their sessions in one transaction. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hex SHA-512\'d. Name and phrase hash are both UNIQUE. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.',
     steps: [
       ['Normalize', 'Drop all whitespace, lower-case ("Open Sesame" == "opensesame").'],
       ['Hash', 'SHA-512 hex — that string is what is stored and searched.'],
@@ -144,7 +145,7 @@ export const NODES = [
       ['Manage', 'add-user inserts; remove-user deletes by name; list-users prints names + flags.'],
     ],
     cond: [
-      { q: 'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?', r: 'remove-user NAME deletes the row and list-users shows who is in (2026-11-17). Caveat kept: sessions already held keep working until their TTL or a restart — it revokes the phrase, not live sessions. Phrase rotation is still add-then-remove.' },
+      { q: 'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?', r: 'remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.' },
       'The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?',
       { q: 'Why not a per-user salt on the hash?', r: 'Lookup is by phrase alone — the phrase identifies the user, so there is no name to salt against before hashing. Strength is enforced at add time instead (README security notes).' },
     ] },
@@ -238,17 +239,6 @@ export const NODES = [
     cond: [
       { q: 'Until then: should v1 answer upgrade attempts with a clear 501 instead of forwarding a stripped request that fails mysteriously?', r: 'Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).' },
     ] },
-  { id: 'PS', code: 'P', name: 'Saved sessions', short: 'SAVED SESS', group: 'off', ghost: true, gx: 4.5, gy: 9.5, w: 2, d: 2, h: 20, kind: 'store',
-    one: 'Designed for, not built: sessions that survive a restart.',
-    what: 'Today, restarting web-safe-block logs everyone out, because the session table lives only in memory. This ghost is a small persistent store — a file or a sqlite table — written on login and read on boot.',
-    how: 'A write-through table next to <code>users.db</code>, or a second file, holding <code>{token, user, expiry}</code>; <code>serve</code> would reload unexpired rows at startup. The caps and the 60s sweep stay the same.',
-    steps: [
-      ['Write-through', 'Insert session → also append/update the store.'],
-      ['Reload', 'On boot, load rows with expiry in the future.'],
-    ],
-    cond: [
-      'Worth doing? It trades "restart clears the decks" (a nice property after an incident) for nobody being logged out on deploys.',
-    ] },
 ];
 
 // Flows for the final "whole system" chapter. Hop = [from, to, label, payload, bend('xy'|'yx')]
@@ -259,7 +249,7 @@ export const FLOWS = [
     ['G', 'R', 'reserve attempt', { key: '203.0.113.9', in_window: 0 }, 'xy'],
     ['G', 'U', 'SELECT by sha512', { pass_phrase: 'ddaf35…(128 hex)' }, 'yx'],
     ['U', 'G', 'user row', { user_name: 'chris', is_admin: false }, 'xy'],
-    ['G', 'S', 'insert session', { token: '9f3a…(32B hex)', user: 'chris', ttl_secs: 604800 }, 'xy'],
+    ['G', 'S', 'insert session (map + users.db)', { token: '9f3a…(32B hex)', stored: 'sha256(9f3a…)', user: 'chris', ttl_secs: 604800 }, 'xy'],
     ['G', 'CF', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure' }, 'yx'],
     ['CF', 'BR', 'redirect', { status: 303, location: '/' }, 'yx'],
   ] },
@@ -319,10 +309,10 @@ export const CH = [
     ] },
   { id: 'session', title: 'The session table', reveal: ['S'],
     lede: `A correct phrase mints a token; the cookie is your ticket from then on.`,
-    story: `<p>The gate keeps a <mark>small in-memory table</mark> — random token → user + expiry — capped at 10 sessions per user and 10,000 total, swept every minute. Restart clears it; everyone logs in again.</p>`,
+    story: `<p>The gate keeps a <mark>small table — hashed token → user + expiry</mark> — capped at 3 sessions per user and 10,000 total. Every login writes through to the <code>sessions</code> table in users.db (SHA-256 of the token only), and serve reloads it at startup and every minute — restart no longer logs anyone out.</p>`,
     flow: [
       ['BR', 'G', 'POST phrase', { form: { phrase: '…' } }],
-      ['G', 'S', 'insert token', { token: '9f3a…', user: 'chris', ttl_secs: 604800 }],
+      ['G', 'S', 'insert hash', { cookie_string: 'sha256(9f3a…)', user: 'chris', ttl_secs: 604800 }],
       ['G', 'BR', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…' }],
       ['BR', 'G', 'next request + cookie', { cookie: 'wsb_session=9f3a…' }],
       ['G', 'S', 'lookup', { token: '9f3a…' }],
@@ -371,9 +361,9 @@ export const CH = [
       ['C', 'U', 'DELETE row', { changes: 1 }],
       ['OP', 'MO', 'nc 127.0.0.1:8081', { connect: 'monitor stream' }],
     ] },
-  { id: 'later', title: 'Not switched on', reveal: ['WS', 'PS'],
+  { id: 'later', title: 'Not switched on', reveal: ['WS'],
     lede: `Designed for, not built.`,
-    story: `<p>Two sketches sit on the map as <mark>dashed ghosts</mark>: a WebSocket relay (today the gate answers upgrade attempts 501) and saved sessions (today a restart logs everyone out).</p>`,
+    story: `<p>One sketch sits on the map as a <mark>dashed ghost</mark>: a WebSocket relay — today the gate answers upgrade attempts 501. (Saved sessions were built: see the session table and ADR 0006.)</p>`,
     flow: [
       ['BR', 'G', 'GET /ws + Upgrade', { headers: { upgrade: 'websocket', cookie: 'wsb_session=9f3a…' } }],
       ['G', 'S', 'session check', { token: '9f3a…' }],
@@ -399,14 +389,14 @@ export const HOW_HTML = `<div class="eyebrow">web-safe-block · v0.1</div><h1 cl
     rate_limit.rs per-IP failure ledger ops
     state.rs      Config · Limits · AppState
     util.rs       cookie/header/HTML helpers
-    users.rs      users.db schema + phrase policy
+    users.rs      users.db schema (users + sessions) + phrase policy
     monitor.rs    EventQueue + monitor thread
     settings.rs   strict config.toml
   tests/proxy.rs  end-to-end against a real upstream
   Notes/atlas/    this atlas</pre>
 <h3 class="sec">Runtime shape</h3><pre>one process
   tokio runtime ─ public listener (axum + hyper)
-                └ purger task (sessions + failures, 60s)
+                └ purger task (session reload + failures, 60s)
   OS thread     ─ monitor listener + per-client threads
   hyper client  ─ upstream, 10s connect / 60s headers</pre>
 <h3 class="sec">Ports</h3><pre>listen_addr   127.0.0.1:8080  public (via tunnel)

@@ -1,6 +1,6 @@
 # ADR 0002 — Sessions live in memory only
 
-Status: accepted (2026-11)
+Status: superseded by [0006](./0006-sessions-persisted.md) (2026-11)
 
 ## Decision
 
