@@ -148,7 +148,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The list of people allowed in. It stores each user name, a random salt, the Argon2id hash of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "does this name + phrase verify?" on every login.
 
-**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. Phrases are **normalized — whitespace stripped, lower-cased** — then hashed with **Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt**. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
+**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. It runs in **WAL mode** — users.db-wal/-shm are part of the database — for Litestream backups. Phrases are **normalized — whitespace stripped, lower-cased** — then hashed with **Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt**. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
 
 **Steps in execution.**
 

@@ -23,16 +23,29 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_name)";
 
-/// Wait up to 5s on a locked database; set right after opening so the very
-/// first queries also wait.
-fn busy_timeout(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))
+/// Per-connection setup for a file database: a busy timeout (set first so
+/// the WAL pragma also waits) and WAL journal mode, which puts live data in
+/// users.db-wal/-shm as well — required for Litestream backups.
+fn configure(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let mode: String =
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!(
+                "WAL journal mode could not be enabled (got {mode:?})"
+            )),
+        ));
+    }
+    Ok(())
 }
 
 /// Foreign keys, a write busy timeout, and every table the file should have.
 fn init(conn: &Connection) -> rusqlite::Result<()> {
-    busy_timeout(conn)?;
-    conn.execute_batch(&format!("PRAGMA foreign_keys = ON;\n{SCHEMA}"))
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout = 5000;\nPRAGMA foreign_keys = ON;\n{SCHEMA}"
+    ))
 }
 
 /// True for sqlite's "no such table" error (vs. locking or corruption).
@@ -137,14 +150,15 @@ fn stale_schema(conn: &Connection) -> rusqlite::Result<bool> {
 
 fn stale_schema_err(path: &Path) -> String {
     format!(
-        "{} predates the current schema (per-user salts, session creation stamps); move it aside and re-add users with: \
+        "{} predates the current schema (per-user salts, session creation stamps); stop serve, move users.db together with \
+         users.db-wal and users.db-shm aside, and re-add users with: \
          web-safe-block add-user < users.txt",
         path.display()
     )
 }
 
 /// Create an empty db file mode 0600 so SQLite opens it owner-only;
-/// SQLite's unix VFS gives -journal/-wal files the db file's permissions.
+/// SQLite's unix VFS gives -wal/-shm files the db file's permissions.
 #[cfg(unix)]
 fn create_private_db(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -192,7 +206,7 @@ pub fn open_for_add(path: &Path) -> Result<Connection, String> {
     }
     warn_if_exposed(path);
     let conn = Connection::open(path).map_err(cannot_open)?;
-    busy_timeout(&conn).map_err(cannot_open)?;
+    configure(&conn).map_err(cannot_open)?;
     if stale_schema(&conn).map_err(cannot_open)? {
         return Err(stale_schema_err(path));
     }
@@ -211,7 +225,7 @@ pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
     warn_if_exposed(path);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    busy_timeout(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    configure(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
         .map_err(|e| {
             if is_no_table(&e) {
@@ -352,7 +366,7 @@ impl UserStore {
         warn_if_exposed(path);
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        busy_timeout(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        configure(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .map_err(|e| {
@@ -915,6 +929,38 @@ mod tests {
             })
         );
         assert_eq!(store.lookup("admin1", "bigsecret!").unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_dbs_use_wal_journal_mode() {
+        let dir = std::env::temp_dir().join(format!("wsb-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+        let _ = std::fs::remove_file(&path);
+
+        let mode: String = open_for_add(&path)
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        let conn = open_for_add(&path).unwrap();
+        add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
+        let store = UserStore::open(&path).unwrap();
+        let mode: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

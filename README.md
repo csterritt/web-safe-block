@@ -93,6 +93,10 @@ Runs the proxy. It exits with an error if the users database is missing or has n
 
 Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. Login form bodies are limited to 4 KiB.
 
+#### Backups
+
+`users.db` runs in WAL mode, so `users.db-wal` and `users.db-shm` sit next to it and are part of the database (created with the db's permissions — keep them private). It must live on a local filesystem (no NFS/SMB). Back it up with Litestream or `sqlite3 users.db ".backup out.db"` — never a plain `cp` of `users.db` alone, which can copy a mid-write snapshot. Litestream must run as a user that can read and write these `0600` files.
+
 #### Monitor port
 
 `serve` also listens on `monitor_addr` (loopback only) and reports every request to the public port as one JSON object per line:
