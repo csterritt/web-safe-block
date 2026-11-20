@@ -9,7 +9,7 @@ export const META = {
   outDir: '.',                            // generated files land in Notes/atlas/, next to this source
   stats: [
     { k: 'System', v: 'rust · axum 0.8 + hyper 1' },
-    { k: 'Source', v: '~3,300 LOC' },
+    { k: 'Source', v: '~3,600 LOC · ~1,800 tests' },
     { k: 'Seats', v: '1 public port · 1 monitor' },
   ],
   intro: `_**This file is the living source of truth for the design.** The interactive atlas (\`atlas.html\`) is built from the same data; edit this file and rebuild, never the outputs._`,
@@ -19,14 +19,16 @@ export const META = {
     '',
     '| Resource | Bound | Where |',
     '|---|---|---|',
-    '| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |',
-    '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |',
-    '| Event queue | `monitor_queue_len` (default 100), oldest overwritten | `src/monitor.rs` `EventQueue` |',
-    '| Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |',
-    '| users.db | one row per user; phrase kept only as a per-user salted Argon2id hash | `src/users.rs` |',
+    '| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); earliest-created evicted; persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |',
+    '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window; fullest ledger evicts the fewest-stamp key | `src/rate_limit.rs` `reserve_attempt` |',
+    '| Argon2 memory | one ~12 MiB hash at a time, on the blocking pool | `src/state.rs` `hash_slot` + `src/auth.rs` |',
+    '| Login POST body | 4,096 B | `src/app.rs` `DefaultBodyLimit` |',
+    '| Event queue | `monitor_queue_len` (default 100) events *and* ~4 MiB retained, oldest overwritten | `src/monitor.rs` `EventQueue` |',
+    '| Upstream waits | 10s to connect, 60s for response headers, 60s body-idle; 256 requests upstream at once | `src/proxy.rs` `forward` |',
+    '| users.db | one row per user; phrase kept only as a per-user salted Argon2id hash; 5s busy timeout | `src/users.rs` |',
   ],
   deepDive: '',
-  platformGives: 'axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand.',
+  platformGives: 'axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand, argon2, sha2, serde + serde_json, toml.',
   weOwn: 'the gate: user-name + pass-phrase login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.',
   filesystem: `web-safe-block/
   src/
@@ -51,12 +53,14 @@ export const DECISIONS = [
   { axis: 'Runtime', decision: 'Rust + axum/hyper on one tokio runtime; a plain OS thread runs the monitor', adr: '—' },
   { axis: 'Credential', decision: 'User name + pass phrase; names are 1–64 printable ASCII, matched case-insensitively', adr: '[0001](./adr/0001-phrase-is-the-credential.md)' },
   { axis: 'Phrase storage', decision: 'Per-user salted Argon2id (12 MiB, t=3, p=1, 32-byte out) of the normalized phrase, looked up by user name — unknown names still cost one hash against a dummy salt; ≥20 chars + digit + punctuation enforced at add time', adr: '[0001](./adr/0001-phrase-is-the-credential.md)' },
-  { axis: 'Sessions', decision: 'Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total; reload on the 60s purge tick picks up remove-user', adr: '[0006](./adr/0006-sessions-persisted.md)' },
-  { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted when present — listen_addr must only ever face the tunnel', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
-  { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file', adr: '[0004](./adr/0004-strict-config.md)' },
-  { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; bounded queue overwrites the oldest events', adr: '[0005](./adr/0005-one-monitor.md)' },
+  { axis: 'Sessions', decision: 'Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total with earliest-created evicted; the db write lands before the map mutates; reload at startup and on the 60s purge tick picks up remove-user', adr: '[0006](./adr/0006-sessions-persisted.md)' },
+  { axis: 'Hash work', decision: 'Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time', adr: '—' },
+  { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted when it parses as an IP, else the TCP peer — listen_addr must only ever face the tunnel', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
+  { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y', adr: '[0004](./adr/0004-strict-config.md)' },
+  { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten', adr: '[0005](./adr/0005-one-monitor.md)' },
   { axis: 'Upstream', decision: 'http:// only, no path — the protected app stays on loopback', adr: '—' },
   { axis: 'Reserved paths', decision: '/__wsb/* is never forwarded; cross-site POSTs to it are rejected', adr: '—' },
+  { axis: 'Shared caches', decision: 'Upstream Cache-Control is rewritten to private (public/s-maxage/proxy-revalidate and CDN override headers dropped) — a shared cache must never serve a gated page', adr: '—' },
   { axis: 'Protocol upgrades', decision: 'An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost)', adr: '—' },
 ];
 
@@ -84,7 +88,7 @@ export const NODES = [
   { id: 'CF', code: 'T', name: 'TLS terminator', short: 'TUNNEL', group: 'edge', gx: 3.5, gy: 4.5, w: 2, d: 2, h: 40, kind: 'box',
     one: 'Cloudflare Tunnel (or any TLS front) — the only road in.',
     what: 'TLS is not web-safe-block\'s job. A tunnel or reverse proxy holds the certificate and forwards plain http to the public port, stamping the real client IP in a header.',
-    how: 'Forwards to <code>listen_addr</code> (default <code>127.0.0.1:8080</code>) and sets <code>CF-Connecting-IP</code>, which the gate reads <mark>and trusts</mark> for client IP, rate limiting, and event logs.',
+    how: 'Forwards to <code>listen_addr</code> (default <code>127.0.0.1:8080</code>) and sets <code>CF-Connecting-IP</code>, which the gate reads <mark>and trusts when it parses as an IP</mark> (else the TCP peer) for client IP, rate limiting, and event logs.',
     steps: [
       ['Terminate', 'TLS ends here; onward hop is plain http.'],
       ['Stamp', 'Adds CF-Connecting-IP with the real client address.'],
@@ -97,34 +101,37 @@ export const NODES = [
   { id: 'G', code: 'G', name: 'The gate', short: 'GATE', group: 'gate', gx: 7, gy: 3, w: 3, d: 2.5, h: 56, kind: 'gate',
     one: 'The public listener: login page, session check, reserved endpoints, upgrade refusal, then forward-or-refuse.',
     what: 'One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.',
-    how: '<code>axum</code> router in <code>src/app.rs</code>: <code>POST /__wsb/login</code> and <code>GET|POST /__wsb/logout</code> live in <code>src/auth.rs</code>, fallback <code>proxy_or_login</code> in <code>src/proxy.rs</code>. Any other <code>/__wsb/*</code> path is a 404 <mark>reserved</mark>. Cross-site POSTs are refused via <code>Sec-Fetch-Site</code>, then <code>Origin</code>. Authenticated requests with an <code>Upgrade</code> header get <mark>501</mark>, kind <code>upgrade</code>. Every request exits through <code>record_event</code> middleware.',
+    how: '<code>axum</code> router in <code>src/app.rs</code>: <code>GET|POST /__wsb/login</code> (GET just 303s to /; POST bodies capped at 4 KiB) and <code>GET|POST /__wsb/logout</code> live in <code>src/auth.rs</code>, fallback <code>proxy_or_login</code> in <code>src/proxy.rs</code>. Any other <code>/__wsb/*</code> path is a 404 <mark>reserved</mark>. The login form carries a sanitized <code>next</code> so a successful login returns you to what you asked for. Cross-site POSTs are refused via <code>Sec-Fetch-Site</code> (<code>same-origin</code>/<code>none</code> pass), then an <code>Origin</code> that must match Host — https when cookies are Secure. Phrase checks run on the blocking pool, <mark>one Argon2 hash at a time</mark> (<code>hash_slot</code>). Authenticated requests with an <code>Upgrade</code> header get <mark>501</mark>, kind <code>upgrade</code>. Every request exits through <code>record_event</code> middleware; gate pages are <code>no-store</code> and frame-denied.',
     steps: [
       ['Route', '/__wsb/ endpoints handled here; unknown ones are 404 reserved.'],
-      ['Authenticate', 'Parse cookies → wsb_session → sessions table → user.'],
+      ['Authenticate', 'Check every wsb_session cookie offered — first valid wins; expired ones drop lazily.'],
       ['Decide', 'Login page (401), the login/logout handlers, 501 for upgrade attempts, or hand to the forwarder.'],
       ['Report', 'Attach an Outcome; middleware pushes one event per request.'],
     ],
     cond: [
       { q: 'Should GET /__wsb/logout end the session?', r: 'No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).' },
       'Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?',
+      'A client that disconnects mid-login drops the hash_slot guard while its Argon2 run continues — rapid resets can stack many 12 MiB hashes in parallel and OOM the box (review-4 finding 1). Move an owned guard inside the blocking task?',
+      'A non-UTF-8 byte in any sibling cookie makes parse_cookies skip the whole Cookie header — a valid wsb_session is ignored (lockout loop) and logout then revokes nothing server-side (review-4 finding 3). Parse cookies on raw bytes like strip_session_cookie does?',
     ] },
   { id: 'S', code: 'S', name: 'Session table', short: 'SESSIONS', group: 'gate', gx: 6, gy: 7, w: 2, d: 2, h: 22, kind: 'store',
     one: 'The gate\'s memory: hashed token → user + expiry, cached in RAM and persisted in users.db.',
     what: 'A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. A restart reloads the live sessions — nobody is logged out.',
-    how: '<code>HashMap&lt;String, Session&gt;</code> behind a <code>Mutex</code>, written through to the <code>sessions</code> table in <code>users.db</code> on every login. Tokens are <mark>32 random bytes, hex</mark>; only their <mark>SHA-256 hash</mark> is stored — the raw token exists solely in the Set-Cookie header. Caps: 3 sessions per user and 10,000 total — the earliest-expiring entry is evicted from map and table together. The 60s purge tick re-reads the table, dropping expired rows and picking up sessions deleted by <code>remove-user</code>.',
+    how: '<code>HashMap&lt;String, Session&gt;</code> behind a <code>Mutex</code>, write-through to the <code>sessions</code> table in <code>users.db</code>. Tokens are <mark>32 random bytes, hex</mark>; only their <mark>SHA-256 hash</mark> is stored — the raw token exists solely in the Set-Cookie header. Each session also gets a unique, increasing <code>created</code> stamp (unix µs, persisted) — when a cap is hit, expired entries drop first, then <mark>the earliest-created is evicted</mark>, so expiry changes can\'t reshuffle the order. On login the db write (insert + evictions, one transaction) lands <mark>before</mark> the map mutates; a failed save evicts nothing. Caps: 3 per user and 10,000 total. Every <code>wsb_session</code> cookie offered is checked — the first valid wins; expired ones drop lazily. The table is reloaded at startup and every 60s, dropping expired rows and picking up sessions deleted by <code>remove-user</code>.',
     steps: [
-      ['Insert', 'new_token() → hash → Session{user, expires}; evict oldest to stay inside caps; write hash + expiry to users.db.'],
-      ['Check', 'Cookie → SHA-256 → lookup; valid + unexpired → user name.'],
-      ['Reload', 'Every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.'],
+      ['Insert', 'new_token() → hash → Session{user, expires, created}; plan evictions (earliest-created first); write rows to users.db, then mutate the map.'],
+      ['Check', 'Each offered cookie → SHA-256 → lookup; valid + unexpired → user name.'],
+      ['Reload', 'At startup and every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.'],
     ],
     cond: [
       { q: 'Sessions die on restart — acceptable while this guards one box, or should they persist?', r: 'Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).' },
       'A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?',
+      'A client that disconnects while a session write is in flight drops the session_writes guard but not the blocking db call — the table can commit a session the map never learns, or keep rows the write evicted, until the next reload (review-4 finding 1). Move the owned guard and the map mutation inside the blocking task?',
     ] },
   { id: 'R', code: 'R', name: 'Failure ledger', short: 'THROTTLE', group: 'gate', gx: 8.5, gy: 7, w: 2, d: 2, h: 22, kind: 'store',
     one: 'Ten failed logins per quarter-hour per client — and each miss costs a second.',
     what: 'The brute-force brake. Every failed login is written down against the client\'s IP; after ten in fifteen minutes the answer is "too many attempts" until the window slides past.',
-    how: '<code>HashMap&lt;ip, Vec&lt;Instant&gt;&gt;</code>. <mark>One attempt is reserved under a single lock</mark> before the database lookup, refunded on a db error and on success — a success only undoes its own reservation, so failures against other names keep counting. Ledger bounded to 10,000 keys; a wrong answer also waits 1s before responding.',
+    how: '<code>HashMap&lt;ip, Vec&lt;Instant&gt;&gt;</code>. <mark>One attempt is reserved under a single lock</mark> before the database lookup, refunded on a db error and on success — a success only undoes its own reservation, so failures against other names keep counting. Over the limit the answer is <mark>429</mark> with the login page. Ledger bounded to 10,000 keys — when full, the key with the fewest in-window stamps (then oldest last failure) is evicted, so a throttled key keeps its budget. A wrong answer also waits 1s before responding.',
     steps: [
       ['Reserve', 'Count this attempt under one lock; refuse if the key already has 10 in-window.'],
       ['Judge', 'Lookup miss → keep the stamp; db error or success → refund it.'],
@@ -133,27 +140,29 @@ export const NODES = [
     cond: [
       'Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?',
       { q: 'Should failures count the attempt before the lookup (atomically)?', r: 'Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).' },
+      'Keyed on the full IP — an IPv6 client rotating host bits inside its /64 gets a fresh 10-attempt budget every request (review-4 finding 4). Key IPv6 on the /64 prefix, or add a per-user-name throttle?',
     ] },
   { id: 'U', code: 'U', name: 'Phrase book', short: 'USERS.DB', group: 'gate', gx: 10, gy: 0.5, w: 2, d: 2, h: 22, kind: 'store',
     one: 'The sqlite file of who may enter — salted phrase hashes only, never phrases.',
     what: 'The list of people allowed in. It stores each user name, a random salt, the Argon2id hash of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "does this name + phrase verify?" on every login.',
-    how: '<code>users.db</code>: <code>UserStore</code> opens it read-write for <code>serve</code> (it also writes the <code>sessions</code> table there) and <code>list-users</code>; <code>add-user</code> creates and writes it, <code>remove-user NAME</code> deletes the user and their sessions in one transaction. It runs in <mark>WAL mode</mark> — users.db-wal/-shm are part of the database — for Litestream backups. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hashed with <mark>Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt</mark>. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.',
+    how: '<code>users.db</code>: <code>UserStore</code> opens it read-write for <code>serve</code> (it also writes the <code>sessions</code> table there — which carries a <code>created</code> stamp and cascades on user delete) and <code>list-users</code>; <code>add-user</code> creates and writes it, <code>remove-user NAME</code> deletes the user and their sessions in one transaction. It runs in <mark>WAL mode</mark> — users.db-wal/-shm are part of the database — for Litestream backups, with a 5s busy timeout. A db that predates the schema (users without <code>salt</code>, sessions without <code>created</code>) is <mark>refused, not migrated</mark>; new files are created mode 0600 and an over-exposed one earns a warning. Phrases are <mark>normalized — whitespace stripped, lower-cased</mark> — then hashed with <mark>Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt</mark>, serialized so at most one hash runs at a time. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 non-whitespace chars, a digit, and punctuation.',
     steps: [
       ['Normalize', 'Drop all whitespace, lower-case ("Open Sesame" == "opensesame").'],
       ['Hash', 'Argon2id of the normalized phrase under a per-user salt — that hex is what is stored.'],
       ['Lookup', 'SELECT row WHERE user_name = ?1, then verify the Argon2id hash in constant time.'],
-      ['Manage', 'add-user inserts; remove-user deletes by name; list-users prints names + flags.'],
+      ['Manage', 'add-user inserts; remove-user deletes the row and its sessions; list-users prints names + flags.'],
     ],
     cond: [
       { q: 'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?', r: 'remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.' },
       'The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?',
       { q: 'Why not a per-user salt on the hash?', r: 'Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).' },
+      'add-user holds the WAL write lock across stdin reads and every Argon2 hash — a large batch stalls serve logins past the 5s busy timeout, and the deferred read-then-write can fail SQLITE_BUSY outright (review-4 finding 2). Hash first, then insert in one immediate transaction?',
     ] },
   // ---- Through to the app ----
   { id: 'F', code: 'F', name: 'Forwarder', short: 'FORWARDER', group: 'relay', gx: 10.5, gy: 3, w: 2.5, d: 2, h: 44, kind: 'box',
     one: 'Rewrites the request, scrubs it, sends it upstream, brings the answer back.',
     what: 'Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app\'s answer.',
-    how: '<code>hyper-util</code> client in <code>forward()</code> (<code>src/proxy.rs</code>). Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers, and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (<code>IdleTimeoutBody</code>) that cuts off stalled streams. At most <mark>256 requests</mark> run upstream at once — extras get 503. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.',
+    how: '<code>hyper-util</code> client in <code>forward()</code> (<code>src/proxy.rs</code>). Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers (a client <code>Connection</code> header can\'t remove Host or Content-Length), and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (<code>IdleTimeoutBody</code>) that cuts off stalled streams. At most <mark>256 requests</mark> run upstream at once — extras get 503 — and the permit is held until the response body finishes. Upstream Cache-Control is <mark>rewritten to private</mark> (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.',
     steps: [
       ['Rewrite', 'Keep path+query; replace scheme and authority with upstream.'],
       ['Scrub', 'Session cookie out; hop-by-hop out; client forwarding headers out.'],
@@ -164,6 +173,7 @@ export const NODES = [
     cond: [
       { q: 'Trust client-sent X-Forwarded-* / X-Real-IP headers?', r: 'No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).' },
       { q: 'Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?', r: 'Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).' },
+      'The body-idle timer only runs while downstream polls frames — a slow-reading client can hold an upstream permit indefinitely (review-4 finding 5). Idle the connection, not just the upstream read?',
     ] },
   { id: 'UP', code: 'A', name: 'Protected app', short: 'UPSTREAM', group: 'relay', gx: 14, gy: 3, w: 3, d: 2.5, h: 18, kind: 'slab',
     one: 'The web server being sheltered — bound to loopback, reachable only through the gate.',
@@ -184,7 +194,7 @@ export const NODES = [
     steps: [
       ['Configure', 'write-config emits a commented config.toml; refuses to overwrite.'],
       ['Populate', 'add-user reads "name pass phrase…" lines from stdin.'],
-      ['Maintain', 'list-users shows names + admin flags; remove-user NAME deletes a row.'],
+      ['Maintain', 'list-users shows names + admin flags; remove-user NAME deletes the user and their sessions.'],
       ['Run', 'serve binds the public port and the monitor port.'],
       ['Watch', 'nc to the monitor port for a live event stream.'],
     ],
@@ -192,13 +202,13 @@ export const NODES = [
   { id: 'C', code: 'C', name: 'CLI & config', short: 'CLI+CONFIG', group: 'ops', gx: 2, gy: 0.5, w: 2.5, d: 2, h: 30, kind: 'cards',
     one: 'Five commands and one strict config file.',
     what: 'The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.',
-    how: '<code>src/main.rs</code> + <code>src/settings.rs</code>. Seven settings, <mark>all required, unknown keys denied</mark>: users_db, listen_addr, upstream, session_ttl_secs, cookie_secure, monitor_addr (loopback only), monitor_queue_len. Relative users_db resolves against the config file\'s directory.',
+    how: '<code>src/main.rs</code> + <code>src/settings.rs</code>. Seven settings, <mark>all required, unknown keys denied</mark>: users_db, listen_addr (a literal IP:port), upstream, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file\'s directory.',
     steps: [
       ['write-config', 'Emit defaults with comments; refuse to overwrite an existing file.'],
-      ['add-user', 'Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped.'],
-      ['remove-user NAME', 'Deletes the row; errors if the name is not found.'],
+      ['add-user', 'Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped; any skip fails the exit code.'],
+      ['remove-user NAME', 'Deletes the row and its sessions in one transaction; errors if the name is not found.'],
       ['list-users', 'Print user_name + is_admin, sorted by name.'],
-      ['serve', 'Load config + users.db (must exist and be non-empty), bind both ports.'],
+      ['serve', 'Load config + users.db (must exist, be current schema, and be non-empty), bind both ports.'],
     ],
     cond: [
       'Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?',
@@ -206,7 +216,7 @@ export const NODES = [
   { id: 'EQ', code: 'Q', name: 'Event queue', short: 'EVENT QUEUE', group: 'ops', gx: 9.5, gy: 9.5, w: 2, d: 2, h: 18, kind: 'store',
     one: 'A bounded ring of "what just happened" — handlers push without blocking.',
     what: 'Every request — page shown, login won or lost, request proxied — becomes one small record. The queue holds the most recent ones until a monitor comes to read them; when it fills, the oldest are overwritten.',
-    how: '<code>VecDeque&lt;Event&gt;</code> + <code>Condvar</code> in <code>src/monitor.rs</code>. Each event: <code>{seq, time, kind, status, ip, method, path, user?, user_agent?}</code>. Overwrites during a live connection are counted and later reported as <mark>{"kind":"dropped"}</mark>; events leave only after they are written to the client.',
+    how: '<code>VecDeque&lt;Event&gt;</code> + <code>Condvar</code> in <code>src/monitor.rs</code>. Each event: <code>{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}</code> — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets <code>truncated</code>. The queue is bounded by count <mark>and ~4 MiB of retained bytes</mark>; overwrites of unsent events during a live connection are counted and later reported as <mark>{"kind":"dropped"}</mark>; events leave only after they are written to the client, at most 100 per write.',
     steps: [
       ['Push', 'Stamp seq + UTC time; if full, evict the oldest (count it if a monitor is attached).'],
       ['Pending', 'Wait on the condvar; hand the batch out but keep it queued.'],
@@ -218,7 +228,7 @@ export const NODES = [
   { id: 'MO', code: 'M', name: 'Monitor port', short: 'MONITOR', group: 'ops', gx: 13, gy: 10, w: 2, d: 2, h: 26, kind: 'screen',
     one: 'One loopback TCP client at a time gets the live JSON-lines feed.',
     what: 'A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.',
-    how: 'Plain <code>TcpListener</code> on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>) on its own OS thread; each client is served on a further thread. Second clients get <code>{"error":"another monitor is already connected"}</code>. Idle clients receive a <code>heartbeat</code> line every 10s so gone-aways are detected.',
+    how: 'Plain <code>TcpListener</code> on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get <code>{"error":"another monitor is already connected"}</code>. Once a client half-closes, a <code>heartbeat</code> line every 10s probes for gone-aways — a reset frees the slot.',
     steps: [
       ['Accept', 'One slot: try_connect or send the busy error and close.'],
       ['Stream', 'Wait for pending events; write JSON lines + dropped notices.'],
@@ -244,13 +254,13 @@ export const NODES = [
 // Flows for the final "whole system" chapter. Hop = [from, to, label, payload, bend('xy'|'yx')]
 export const FLOWS = [
   { id: 'login', name: 'A login', hops: [
-    ['BR', 'CF', 'POST /__wsb/login', { form: { user: 'chris', phrase: 'correct horse battery staple 42!' } }, 'xy'],
+    ['BR', 'CF', 'POST /__wsb/login', { form: { user: 'chris', phrase: 'correct horse battery staple 42!', next: '/' } }, 'xy'],
     ['CF', 'G', 'name + phrase + client IP', { headers: { 'cf-connecting-ip': '203.0.113.9' } }, 'xy'],
     ['G', 'R', 'reserve attempt', { key: '203.0.113.9', in_window: 0 }, 'xy'],
     ['G', 'U', 'SELECT by user_name + Argon2id verify', { user_name: 'chris' }, 'yx'],
     ['U', 'G', 'user row', { user_name: 'chris', is_admin: false }, 'xy'],
-    ['G', 'S', 'insert session (map + users.db)', { token: '9f3a…(32B hex)', stored: 'sha256(9f3a…)', user: 'chris', ttl_secs: 15552000 }, 'xy'],
-    ['G', 'CF', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure' }, 'yx'],
+    ['G', 'S', 'insert session (users.db first, then map)', { token: '9f3a…(32B hex)', stored: 'sha256(9f3a…)', user: 'chris', created: '<unix µs>', ttl_secs: 15552000 }, 'xy'],
+    ['G', 'CF', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…; HttpOnly; SameSite=Lax; Path=/; Max-Age=15552000; Secure' }, 'yx'],
     ['CF', 'BR', 'redirect', { status: 303, location: '/' }, 'yx'],
   ] },
   { id: 'proxy', name: 'A proxied request', hops: [
@@ -261,7 +271,7 @@ export const FLOWS = [
     ['G', 'F', 'forward', { note: 'wsb_session + hop-by-hop stripped' }, 'xy'],
     ['F', 'UP', 'GET /app', { headers: { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' } }, 'xy'],
     ['UP', 'F', 'response', { status: 200 }, 'yx'],
-    ['F', 'G', 'response', { status: 200 }, 'yx'],
+    ['F', 'G', 'response', { status: 200, note: 'Cache-Control → private; wsb_session Set-Cookie dropped' }, 'yx'],
     ['G', 'BR', 'response via tunnel', { kind: 'proxied', status: 200 }, 'yx'],
   ] },
   { id: 'fail', name: 'A failed login', hops: [
@@ -274,9 +284,9 @@ export const FLOWS = [
   ] },
   { id: 'logout', name: 'Logging out', hops: [
     ['BR', 'G', 'POST /__wsb/logout', { headers: { 'sec-fetch-site': 'same-origin' } }, 'xy'],
-    ['G', 'S', 'remove token', { token: '9f3a…' }, 'xy'],
-    ['S', 'G', 'gone', { user: 'chris' }, 'yx'],
-    ['G', 'BR', '303 + cookie cleared', { set_cookie: 'wsb_session=; Max-Age=0' }, 'yx'],
+    ['G', 'S', 'remove every offered token', { token: '9f3a…' }, 'xy'],
+    ['S', 'G', 'gone (users.db, then map)', { user: 'chris' }, 'yx'],
+    ['G', 'BR', '303 + cookie cleared', { set_cookie: 'wsb_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure' }, 'yx'],
   ] },
   { id: 'tail', name: 'Tailing the monitor', hops: [
     ['OP', 'MO', 'nc 127.0.0.1 8081', { connect: 'only monitor slot' }, 'xy'],
@@ -309,10 +319,10 @@ export const CH = [
     ] },
   { id: 'session', title: 'The session table', reveal: ['S'],
     lede: `A correct phrase mints a token; the cookie is your ticket from then on.`,
-    story: `<p>The gate keeps a <mark>small table — hashed token → user + expiry</mark> — capped at 3 sessions per user and 10,000 total. Every login writes through to the <code>sessions</code> table in users.db (SHA-256 of the token only), and serve reloads it at startup and every minute — restart no longer logs anyone out.</p>`,
+    story: `<p>The gate keeps a <mark>small table — hashed token → user + expiry + created stamp</mark> — capped at 3 sessions per user and 10,000 total, earliest-created evicted. Every login writes through to the <code>sessions</code> table in users.db (SHA-256 of the token only) <mark>before</mark> the in-memory map changes, and serve reloads the table at startup and every minute — restart no longer logs anyone out.</p>`,
     flow: [
       ['BR', 'G', 'POST name + phrase', { form: { user: 'chris', phrase: '…' } }],
-      ['G', 'S', 'insert hash', { cookie_string: 'sha256(9f3a…)', user: 'chris', ttl_secs: 15552000 }],
+      ['G', 'S', 'insert hash', { cookie_string: 'sha256(9f3a…)', user: 'chris', created: '<unix µs>', ttl_secs: 15552000 }],
       ['G', 'BR', '303 + Set-Cookie', { set_cookie: 'wsb_session=9f3a…' }],
       ['BR', 'G', 'next request + cookie', { cookie: 'wsb_session=9f3a…' }],
       ['G', 'S', 'lookup', { token: '9f3a…' }],
@@ -320,7 +330,7 @@ export const CH = [
     ] },
   { id: 'through', title: 'Through to the app', reveal: ['F', 'UP'],
     lede: `Once you're known, the gate rewrites and forwards — the app never sees the login dance.`,
-    story: `<p>The forwarder <mark>rebuilds the request</mark>: the session cookie and hop-by-hop headers come out, client-sent forwarding headers are discarded, honest ones are stamped. The app sits on loopback and trusts what arrives.</p>`,
+    story: `<p>The forwarder <mark>rebuilds the request</mark>: the session cookie and hop-by-hop headers come out, client-sent forwarding headers are discarded, honest ones are stamped. The answer's Cache-Control is <mark>rewritten to private</mark> so a shared cache can't serve it to someone else. The app sits on loopback and trusts what arrives.</p>`,
     flow: [
       ['BR', 'G', 'GET /app + cookie', { cookie: 'wsb_session=9f3a…' }],
       ['G', 'S', 'check', { token: '9f3a…' }],
@@ -344,7 +354,7 @@ export const CH = [
     ] },
   { id: 'watch', title: 'Watching the door', reveal: ['EQ', 'MO'],
     lede: `Every request leaves a one-line trace on a loopback port.`,
-    story: `<p>Handlers <mark>push events without blocking</mark> into a bounded queue; a separate thread serves them as JSON lines to one connected monitor, marking them consumed only after the bytes are written.</p>`,
+    story: `<p>Handlers <mark>push events without blocking</mark> into a queue bounded by count and ~4 MiB; a separate thread serves them as JSON lines to one connected monitor, marking them consumed only after the bytes are written.</p>`,
     flow: [
       ['BR', 'G', 'any request', { method: 'POST', path: '/__wsb/login' }],
       ['G', 'EQ', 'push event', { kind: 'login_succeeded', ip: '203.0.113.9' }],
@@ -353,7 +363,7 @@ export const CH = [
     ] },
   { id: 'operate', title: 'Running it', reveal: ['OP', 'C'],
     lede: `Five commands: write-config, add-user, remove-user, list-users, serve.`,
-    story: `<p>The operator <mark>manages users by piping lines</mark> — "name pass phrase words…" — into add-user; remove-user deletes by name and list-users shows who is in. serve refuses to start with no users at all.</p>`,
+    story: `<p>The operator <mark>manages users by piping lines</mark> — "name pass phrase words…" — into add-user; remove-user deletes the user and their sessions, and list-users shows who is in. serve refuses to start with no users at all.</p>`,
     flow: [
       ['OP', 'C', 'add-user <<EOF', { line: 'chris correct horse … 42!' }],
       ['C', 'U', 'INSERT hash', { user_name: 'chris', salt: '<16B hex>', pass_phrase: '<argon2id hex>', is_admin: false }],
@@ -396,9 +406,10 @@ export const HOW_HTML = `<div class="eyebrow">web-safe-block · v0.1</div><h1 cl
   Notes/atlas/    this atlas</pre>
 <h3 class="sec">Runtime shape</h3><pre>one process
   tokio runtime ─ public listener (axum + hyper)
-                └ purger task (session reload + failures, 60s)
+                ├ purger task (session reload + failures, 60s)
+                └ hash_slot: one Argon2 (~12 MiB) at a time, on the blocking pool
   OS thread     ─ monitor listener + per-client threads
-  hyper client  ─ upstream, 10s connect / 60s headers</pre>
+  hyper client  ─ upstream, 10s connect / 60s headers / 60s body-idle · ≤256 live</pre>
 <h3 class="sec">Ports</h3><pre>listen_addr   127.0.0.1:8080  public (via tunnel)
 monitor_addr  127.0.0.1:8081  loopback only
 upstream      127.0.0.1:3000  the protected app</pre>`;

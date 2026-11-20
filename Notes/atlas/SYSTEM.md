@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **9 open · 8 resolved**._
+_Question status: **15 open · 8 resolved**._
 
 ## One paragraph
 
@@ -15,12 +15,14 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Runtime | Rust + axum/hyper on one tokio runtime; a plain OS thread runs the monitor | — |
 | Credential | User name + pass phrase; names are 1–64 printable ASCII, matched case-insensitively | [0001](./adr/0001-phrase-is-the-credential.md) |
 | Phrase storage | Per-user salted Argon2id (12 MiB, t=3, p=1, 32-byte out) of the normalized phrase, looked up by user name — unknown names still cost one hash against a dummy salt; ≥20 chars + digit + punctuation enforced at add time | [0001](./adr/0001-phrase-is-the-credential.md) |
-| Sessions | Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total; reload on the 60s purge tick picks up remove-user | [0006](./adr/0006-sessions-persisted.md) |
-| Client IP | CF-Connecting-IP is trusted when present — listen_addr must only ever face the tunnel | [0003](./adr/0003-trusted-edge-header.md) |
-| Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file | [0004](./adr/0004-strict-config.md) |
-| Monitor | One loopback JSON-lines client at a time; bounded queue overwrites the oldest events | [0005](./adr/0005-one-monitor.md) |
+| Sessions | Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total with earliest-created evicted; the db write lands before the map mutates; reload at startup and on the 60s purge tick picks up remove-user | [0006](./adr/0006-sessions-persisted.md) |
+| Hash work | Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time | — |
+| Client IP | CF-Connecting-IP is trusted when it parses as an IP, else the TCP peer — listen_addr must only ever face the tunnel | [0003](./adr/0003-trusted-edge-header.md) |
+| Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y | [0004](./adr/0004-strict-config.md) |
+| Monitor | One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
 | Upstream | http:// only, no path — the protected app stays on loopback | — |
 | Reserved paths | /__wsb/* is never forwarded; cross-site POSTs to it are rejected | — |
+| Shared caches | Upstream Cache-Control is rewritten to private (public/s-maxage/proxy-revalidate and CDN override headers dropped) — a shared cache must never serve a gated page | — |
 | Protocol upgrades | An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost) | — |
 
 ## Cost model
@@ -29,11 +31,13 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 | Resource | Bound | Where |
 |---|---|---|
-| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
-| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window | `src/rate_limit.rs` `reserve_attempt` |
-| Event queue | `monitor_queue_len` (default 100), oldest overwritten | `src/monitor.rs` `EventQueue` |
-| Upstream waits | 10s to connect, 60s for response headers | `src/proxy.rs` `forward` |
-| users.db | one row per user; phrase kept only as a per-user salted Argon2id hash | `src/users.rs` |
+| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); earliest-created evicted; persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |
+| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window; fullest ledger evicts the fewest-stamp key | `src/rate_limit.rs` `reserve_attempt` |
+| Argon2 memory | one ~12 MiB hash at a time, on the blocking pool | `src/state.rs` `hash_slot` + `src/auth.rs` |
+| Login POST body | 4,096 B | `src/app.rs` `DefaultBodyLimit` |
+| Event queue | `monitor_queue_len` (default 100) events *and* ~4 MiB retained, oldest overwritten | `src/monitor.rs` `EventQueue` |
+| Upstream waits | 10s to connect, 60s for response headers, 60s body-idle; 256 requests upstream at once | `src/proxy.rs` `forward` |
+| users.db | one row per user; phrase kept only as a per-user salted Argon2id hash; 5s busy timeout | `src/users.rs` |
 ## Reading order (the atlas chapters)
 
 1. **The front door** — Every request arrives at one public port; everything else hides behind it. _(adds BR, CF, G)_
@@ -70,7 +74,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** TLS is not web-safe-block's job. A tunnel or reverse proxy holds the certificate and forwards plain http to the public port, stamping the real client IP in a header.
 
-**How it's built.** Forwards to `listen_addr` (default `127.0.0.1:8080`) and sets `CF-Connecting-IP`, which the gate reads **and trusts** for client IP, rate limiting, and event logs.
+**How it's built.** Forwards to `listen_addr` (default `127.0.0.1:8080`) and sets `CF-Connecting-IP`, which the gate reads **and trusts when it parses as an IP** (else the TCP peer) for client IP, rate limiting, and event logs.
 
 **Steps in execution.**
 
@@ -90,12 +94,12 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.
 
-**How it's built.** `axum` router in `src/app.rs`: `POST /__wsb/login` and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. Cross-site POSTs are refused via `Sec-Fetch-Site`, then `Origin`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware.
+**How it's built.** `axum` router in `src/app.rs`: `GET|POST /__wsb/login` (GET just 303s to /; POST bodies capped at 4 KiB) and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. The login form carries a sanitized `next` so a successful login returns you to what you asked for. Cross-site POSTs are refused via `Sec-Fetch-Site` (`same-origin`/`none` pass), then an `Origin` that must match Host — https when cookies are Secure. Phrase checks run on the blocking pool, **one Argon2 hash at a time** (`hash_slot`). Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware; gate pages are `no-store` and frame-denied.
 
 **Steps in execution.**
 
 1. **Route** — /__wsb/ endpoints handled here; unknown ones are 404 reserved.
-2. **Authenticate** — Parse cookies → wsb_session → sessions table → user.
+2. **Authenticate** — Check every wsb_session cookie offered — first valid wins; expired ones drop lazily.
 3. **Decide** — Login page (401), the login/logout handlers, 501 for upgrade attempts, or hand to the forwarder.
 4. **Report** — Attach an Outcome; middleware pushes one event per request.
 
@@ -103,6 +107,8 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 - ~~**Q-G1** Should GET /__wsb/logout end the session?~~ ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
 - **Q-G2** Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
+- **Q-G3** A client that disconnects mid-login drops the hash_slot guard while its Argon2 run continues — rapid resets can stack many 12 MiB hashes in parallel and OOM the box (review-4 finding 1). Move an owned guard inside the blocking task?
+- **Q-G4** A non-UTF-8 byte in any sibling cookie makes parse_cookies skip the whole Cookie header — a valid wsb_session is ignored (lockout loop) and logout then revokes nothing server-side (review-4 finding 3). Parse cookies on raw bytes like strip_session_cookie does?
 
 #### S · Session table
 
@@ -110,18 +116,19 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** A small table that answers "who is this cookie?" Login puts a random token in; every later request trades the cookie for a user name. A restart reloads the live sessions — nobody is logged out.
 
-**How it's built.** `HashMap<String, Session>` behind a `Mutex`, written through to the `sessions` table in `users.db` on every login. Tokens are **32 random bytes, hex**; only their **SHA-256 hash** is stored — the raw token exists solely in the Set-Cookie header. Caps: 3 sessions per user and 10,000 total — the earliest-expiring entry is evicted from map and table together. The 60s purge tick re-reads the table, dropping expired rows and picking up sessions deleted by `remove-user`.
+**How it's built.** `HashMap<String, Session>` behind a `Mutex`, write-through to the `sessions` table in `users.db`. Tokens are **32 random bytes, hex**; only their **SHA-256 hash** is stored — the raw token exists solely in the Set-Cookie header. Each session also gets a unique, increasing `created` stamp (unix µs, persisted) — when a cap is hit, expired entries drop first, then **the earliest-created is evicted**, so expiry changes can't reshuffle the order. On login the db write (insert + evictions, one transaction) lands **before** the map mutates; a failed save evicts nothing. Caps: 3 per user and 10,000 total. Every `wsb_session` cookie offered is checked — the first valid wins; expired ones drop lazily. The table is reloaded at startup and every 60s, dropping expired rows and picking up sessions deleted by `remove-user`.
 
 **Steps in execution.**
 
-1. **Insert** — new_token() → hash → Session{user, expires}; evict oldest to stay inside caps; write hash + expiry to users.db.
-2. **Check** — Cookie → SHA-256 → lookup; valid + unexpired → user name.
-3. **Reload** — Every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.
+1. **Insert** — new_token() → hash → Session{user, expires, created}; plan evictions (earliest-created first); write rows to users.db, then mutate the map.
+2. **Check** — Each offered cookie → SHA-256 → lookup; valid + unexpired → user name.
+3. **Reload** — At startup and every 60s: delete expired rows, clear the map, refill from the table — also sees remove-user deletions.
 
 **Questions.**
 
 - ~~**Q-S1** Sessions die on restart — acceptable while this guards one box, or should they persist?~~ ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
 - **Q-S2** A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
+- **Q-S3** A client that disconnects while a session write is in flight drops the session_writes guard but not the blocking db call — the table can commit a session the map never learns, or keep rows the write evicted, until the next reload (review-4 finding 1). Move the owned guard and the map mutation inside the blocking task?
 
 #### R · Failure ledger
 
@@ -129,7 +136,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The brute-force brake. Every failed login is written down against the client's IP; after ten in fifteen minutes the answer is "too many attempts" until the window slides past.
 
-**How it's built.** `HashMap<ip, Vec<Instant>>`. **One attempt is reserved under a single lock** before the database lookup, refunded on a db error and on success — a success only undoes its own reservation, so failures against other names keep counting. Ledger bounded to 10,000 keys; a wrong answer also waits 1s before responding.
+**How it's built.** `HashMap<ip, Vec<Instant>>`. **One attempt is reserved under a single lock** before the database lookup, refunded on a db error and on success — a success only undoes its own reservation, so failures against other names keep counting. Over the limit the answer is **429** with the login page. Ledger bounded to 10,000 keys — when full, the key with the fewest in-window stamps (then oldest last failure) is evicted, so a throttled key keeps its budget. A wrong answer also waits 1s before responding.
 
 **Steps in execution.**
 
@@ -141,6 +148,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 - **Q-R1** Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
 - ~~**Q-R2** Should failures count the attempt before the lookup (atomically)?~~ ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
+- **Q-R3** Keyed on the full IP — an IPv6 client rotating host bits inside its /64 gets a fresh 10-attempt budget every request (review-4 finding 4). Key IPv6 on the /64 prefix, or add a per-user-name throttle?
 
 #### U · Phrase book
 
@@ -148,20 +156,21 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The list of people allowed in. It stores each user name, a random salt, the Argon2id hash of their normalized phrase, and an admin flag — not the phrase itself. The gate asks it "does this name + phrase verify?" on every login.
 
-**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. It runs in **WAL mode** — users.db-wal/-shm are part of the database — for Litestream backups. Phrases are **normalized — whitespace stripped, lower-cased** — then hashed with **Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt**. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 chars, a digit, and punctuation.
+**How it's built.** `users.db`: `UserStore` opens it read-write for `serve` (it also writes the `sessions` table there — which carries a `created` stamp and cascades on user delete) and `list-users`; `add-user` creates and writes it, `remove-user NAME` deletes the user and their sessions in one transaction. It runs in **WAL mode** — users.db-wal/-shm are part of the database — for Litestream backups, with a 5s busy timeout. A db that predates the schema (users without `salt`, sessions without `created`) is **refused, not migrated**; new files are created mode 0600 and an over-exposed one earns a warning. Phrases are **normalized — whitespace stripped, lower-cased** — then hashed with **Argon2id (12 MiB, t=3, p=1, 32-byte out) under a per-user salt**, serialized so at most one hash runs at a time. Names are 1–64 printable ASCII, UNIQUE, and matched case-insensitively; a lookup for an unknown name still hashes against a dummy salt so timing does not reveal it. Names containing "admin" set the flag; new phrases need ≥20 non-whitespace chars, a digit, and punctuation.
 
 **Steps in execution.**
 
 1. **Normalize** — Drop all whitespace, lower-case ("Open Sesame" == "opensesame").
 2. **Hash** — Argon2id of the normalized phrase under a per-user salt — that hex is what is stored.
 3. **Lookup** — SELECT row WHERE user_name = ?1, then verify the Argon2id hash in constant time.
-4. **Manage** — add-user inserts; remove-user deletes by name; list-users prints names + flags.
+4. **Manage** — add-user inserts; remove-user deletes the row and its sessions; list-users prints names + flags.
 
 **Questions.**
 
 - ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
+- **Q-U4** add-user holds the WAL write lock across stdin reads and every Argon2 hash — a large batch stalls serve logins past the 5s busy timeout, and the deferred read-then-write can fail SQLITE_BUSY outright (review-4 finding 2). Hash first, then insert in one immediate transaction?
 
 ### Through to the app
 
@@ -171,7 +180,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app's answer.
 
-**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers, and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto, -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (`IdleTimeoutBody`) that cuts off stalled streams. At most **256 requests** run upstream at once — extras get 503. Upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
+**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers (a client `Connection` header can't remove Host or Content-Length), and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (`IdleTimeoutBody`) that cuts off stalled streams. At most **256 requests** run upstream at once — extras get 503 — and the permit is held until the response body finishes. Upstream Cache-Control is **rewritten to private** (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
 
 **Steps in execution.**
 
@@ -185,6 +194,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 - ~~**Q-F1** Trust client-sent X-Forwarded-* / X-Real-IP headers?~~ ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
 - ~~**Q-F2** Only connect (10s) and response-header (60s) deadlines exist — a response that stalls mid-body streams forever. Is that a real exposure?~~ ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
+- **Q-F3** The body-idle timer only runs while downstream polls frames — a slow-reading client can hold an upstream permit indefinitely (review-4 finding 5). Idle the connection, not just the upstream read?
 
 #### A · Protected app
 
@@ -217,7 +227,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 1. **Configure** — write-config emits a commented config.toml; refuses to overwrite.
 2. **Populate** — add-user reads "name pass phrase…" lines from stdin.
-3. **Maintain** — list-users shows names + admin flags; remove-user NAME deletes a row.
+3. **Maintain** — list-users shows names + admin flags; remove-user NAME deletes the user and their sessions.
 4. **Run** — serve binds the public port and the monitor port.
 5. **Watch** — nc to the monitor port for a live event stream.
 
@@ -227,15 +237,15 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.
 
-**How it's built.** `src/main.rs` + `src/settings.rs`. Seven settings, **all required, unknown keys denied**: users_db, listen_addr, upstream, session_ttl_secs, cookie_secure, monitor_addr (loopback only), monitor_queue_len. Relative users_db resolves against the config file's directory.
+**How it's built.** `src/main.rs` + `src/settings.rs`. Seven settings, **all required, unknown keys denied**: users_db, listen_addr (a literal IP:port), upstream, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file's directory.
 
 **Steps in execution.**
 
 1. **write-config** — Emit defaults with comments; refuse to overwrite an existing file.
-2. **add-user** — Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped.
-3. **remove-user NAME** — Deletes the row; errors if the name is not found.
+2. **add-user** — Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped; any skip fails the exit code.
+3. **remove-user NAME** — Deletes the row and its sessions in one transaction; errors if the name is not found.
 4. **list-users** — Print user_name + is_admin, sorted by name.
-5. **serve** — Load config + users.db (must exist and be non-empty), bind both ports.
+5. **serve** — Load config + users.db (must exist, be current schema, and be non-empty), bind both ports.
 
 **Questions.**
 
@@ -247,7 +257,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Every request — page shown, login won or lost, request proxied — becomes one small record. The queue holds the most recent ones until a monitor comes to read them; when it fills, the oldest are overwritten.
 
-**How it's built.** `VecDeque<Event>` + `Condvar` in `src/monitor.rs`. Each event: `{seq, time, kind, status, ip, method, path, user?, user_agent?}`. Overwrites during a live connection are counted and later reported as **{"kind":"dropped"}**; events leave only after they are written to the client.
+**How it's built.** `VecDeque<Event>` + `Condvar` in `src/monitor.rs`. Each event: `{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}` — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets `truncated`. The queue is bounded by count **and ~4 MiB of retained bytes**; overwrites of unsent events during a live connection are counted and later reported as **{"kind":"dropped"}**; events leave only after they are written to the client, at most 100 per write.
 
 **Steps in execution.**
 
@@ -265,7 +275,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.
 
-**How it's built.** Plain `TcpListener` on `monitor_addr` (**loopback enforced in config**) on its own OS thread; each client is served on a further thread. Second clients get `{"error":"another monitor is already connected"}`. Idle clients receive a `heartbeat` line every 10s so gone-aways are detected.
+**How it's built.** Plain `TcpListener` on `monitor_addr` (**loopback enforced in config**) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get `{"error":"another monitor is already connected"}`. Once a client half-closes, a `heartbeat` line every 10s probes for gone-aways — a reset frees the slot.
 
 **Steps in execution.**
 
@@ -304,13 +314,13 @@ Payload shapes are what the design implies, not measured traffic.
 
 | # | From → To | Packet | Representative payload |
 |---|---|---|---|
-| 1 | BR → CF | POST /__wsb/login | `{"form":{"user":"chris","phrase":"correct horse battery staple 42!"}}` |
+| 1 | BR → CF | POST /__wsb/login | `{"form":{"user":"chris","phrase":"correct horse battery staple 42!","next":"/"}}` |
 | 2 | CF → G | name + phrase + client IP | `{"headers":{"cf-connecting-ip":"203.0.113.9"}}` |
 | 3 | G → R | reserve attempt | `{"key":"203.0.113.9","in_window":0}` |
 | 4 | G → U | SELECT by user_name + Argon2id verify | `{"user_name":"chris"}` |
 | 5 | U → G | user row | `{"user_name":"chris","is_admin":false}` |
-| 6 | G → S | insert session (map + users.db) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","ttl_secs":15552000}` |
-| 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Secure"}` |
+| 6 | G → S | insert session (users.db first, then map) | `{"token":"9f3a…(32B hex)","stored":"sha256(9f3a…)","user":"chris","created":"<unix µs>","ttl_secs":15552000}` |
+| 7 | G → CF | 303 + Set-Cookie | `{"set_cookie":"wsb_session=9f3a…; HttpOnly; SameSite=Lax; Path=/; Max-Age=15552000; Secure"}` |
 | 8 | CF → BR | redirect | `{"status":303,"location":"/"}` |
 
 ### A proxied request
@@ -324,7 +334,7 @@ Payload shapes are what the design implies, not measured traffic.
 | 5 | G → F | forward | `{"note":"wsb_session + hop-by-hop stripped"}` |
 | 6 | F → UP | GET /app | `{"headers":{"x-forwarded-for":"203.0.113.9","x-forwarded-proto":"https"}}` |
 | 7 | UP → F | response | `{"status":200}` |
-| 8 | F → G | response | `{"status":200}` |
+| 8 | F → G | response | `{"status":200,"note":"Cache-Control → private; wsb_session Set-Cookie dropped"}` |
 | 9 | G → BR | response via tunnel | `{"kind":"proxied","status":200}` |
 
 ### A failed login
@@ -343,9 +353,9 @@ Payload shapes are what the design implies, not measured traffic.
 | # | From → To | Packet | Representative payload |
 |---|---|---|---|
 | 1 | BR → G | POST /__wsb/logout | `{"headers":{"sec-fetch-site":"same-origin"}}` |
-| 2 | G → S | remove token | `{"token":"9f3a…"}` |
-| 3 | S → G | gone | `{"user":"chris"}` |
-| 4 | G → BR | 303 + cookie cleared | `{"set_cookie":"wsb_session=; Max-Age=0"}` |
+| 2 | G → S | remove every offered token | `{"token":"9f3a…"}` |
+| 3 | S → G | gone (users.db, then map) | `{"user":"chris"}` |
+| 4 | G → BR | 303 + cookie cleared | `{"set_cookie":"wsb_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure"}` |
 
 ### Tailing the monitor
 
@@ -364,15 +374,21 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - **Q-T1** (T) If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel's peer address?
 - ~~**Q-G1**~~ (G) ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
 - **Q-G2** (G) Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
+- **Q-G3** (G) A client that disconnects mid-login drops the hash_slot guard while its Argon2 run continues — rapid resets can stack many 12 MiB hashes in parallel and OOM the box (review-4 finding 1). Move an owned guard inside the blocking task?
+- **Q-G4** (G) A non-UTF-8 byte in any sibling cookie makes parse_cookies skip the whole Cookie header — a valid wsb_session is ignored (lockout loop) and logout then revokes nothing server-side (review-4 finding 3). Parse cookies on raw bytes like strip_session_cookie does?
 - ~~**Q-S1**~~ (S) ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
 - **Q-S2** (S) A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
+- **Q-S3** (S) A client that disconnects while a session write is in flight drops the session_writes guard but not the blocking db call — the table can commit a session the map never learns, or keep rows the write evicted, until the next reload (review-4 finding 1). Move the owned guard and the map mutation inside the blocking task?
 - **Q-R1** (R) Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
 - ~~**Q-R2**~~ (R) ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
+- **Q-R3** (R) Keyed on the full IP — an IPv6 client rotating host bits inside its /64 gets a fresh 10-attempt budget every request (review-4 finding 4). Key IPv6 on the /64 prefix, or add a per-user-name throttle?
 - ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
 - **Q-U2** (U) The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
 - ~~**Q-U3**~~ (U) ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
+- **Q-U4** (U) add-user holds the WAL write lock across stdin reads and every Argon2 hash — a large batch stalls serve logins past the 5s busy timeout, and the deferred read-then-write can fail SQLITE_BUSY outright (review-4 finding 2). Hash first, then insert in one immediate transaction?
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
 - ~~**Q-F2**~~ (F) ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
+- **Q-F3** (F) The body-idle timer only runs while downstream polls frames — a slow-reading client can hold an upstream permit indefinitely (review-4 finding 5). Idle the connection, not just the upstream read?
 - **Q-A1** (A) Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
 - **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
@@ -381,7 +397,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 
 ## What the platform gives vs what we own
 
-**Platform gives:** axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand.
+**Platform gives:** axum 0.8 (router, form extractor, middleware), hyper + hyper-util (HTTP/1 server and client with timeouts), rusqlite with bundled sqlite, tokio, rand, argon2, sha2, serde + serde_json, toml.
 
 **We own:** the gate: user-name + pass-phrase login, persisted sessions (write-through to users.db behind an in-memory map), the per-IP throttle, header scrub + forwarding-header rebuild, the bounded event queue and monitor thread, strict config loading, and the users.db schema plus pass-phrase strength policy.
 
