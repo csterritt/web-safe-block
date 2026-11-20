@@ -15,8 +15,8 @@ use crate::sessions::{Session, evictions, hash_token, new_token, unix_micros, va
 use crate::state::AppState;
 use crate::users::StoredSession;
 use crate::util::{
-    LOGOUT_PATH, PAGE_STYLE, SESSION_COOKIE, clear_cookie_header, client_key, cross_site,
-    html_response, login_page, parse_cookies, plain_response, sanitize_next, session_cookie_header,
+    LOGOUT_PATH, PAGE_STYLE, clear_cookie_header, cross_site, html_response, login_page,
+    plain_response, rate_limit_key, sanitize_next, session_cookie_header, session_tokens,
 };
 
 pub(crate) fn forbidden() -> Response {
@@ -56,7 +56,7 @@ pub(crate) async fn login(
     if cross_site(&headers, state.config.cookie_secure) {
         return forbidden();
     }
-    let key = client_key(&headers, Some(peer));
+    let key = rate_limit_key(&headers, Some(peer));
     if !reserve_attempt(
         &mut state.failures.lock().unwrap(),
         state.config.limits.max_failure_keys,
@@ -71,13 +71,33 @@ pub(crate) async fn login(
             None,
         );
     }
+    // Bound how many logins queue for the Argon2 slot; extras get a 503.
+    let waiter = match state.login_waiters.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            refund_attempt(&mut state.failures.lock().unwrap(), &key);
+            return with_outcome(
+                html_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    login_page(Some("Server busy, try again shortly."), &next),
+                ),
+                EventKind::LoginBusy,
+                None,
+            );
+        }
+    };
     // Serialize Argon2 hashing (one ~12 MiB run at a time) but run it on the
-    // blocking pool so Tokio workers stay free.
+    // blocking pool so Tokio workers stay free. The owned guards move into
+    // the closure: dropping this future must not release them early.
     let looked_up = {
-        let _hash = state.hash_slot.lock().await;
+        let hash = state.hash_slot.clone().lock_owned().await;
         let users = state.config.users.clone();
         let (user_name, phrase) = (form.user.clone(), form.phrase.clone());
-        tokio::task::spawn_blocking(move || users.lookup(&user_name, &phrase)).await
+        tokio::task::spawn_blocking(move || {
+            let _held = (hash, waiter);
+            users.lookup(&user_name, &phrase)
+        })
+        .await
     };
     match looked_up {
         Err(e) => {
@@ -106,29 +126,42 @@ pub(crate) async fn login(
             let expires = SystemTime::now() + state.config.session_ttl;
             // Serialize the session write: memory and the database must never
             // disagree about which sessions exist, and `created` stamps must
-            // be unique and increasing.
-            let mut last_created = state.session_writes.lock().await;
-            let created = unix_micros().max(*last_created + 1);
-            *last_created = created;
-            let stored = StoredSession {
-                cookie_string: hash_token(&token),
-                user_name: user.name.clone(),
-                expires,
-                created,
-            };
-            // Plan the evictions first; the map is mutated only once the
-            // rows are durably written, so a failed save evicts nothing.
-            let removed = evictions(
-                &state.sessions.lock().unwrap(),
-                &state.config.limits,
-                &user.name,
-            );
-            let cookie_string = stored.cookie_string.clone();
-            let users = state.config.users.clone();
-            let saved = {
-                let removed = removed.clone();
-                tokio::task::spawn_blocking(move || users.save_session(&stored, &removed)).await
-            };
+            // be unique and increasing. The owned guard moves into the
+            // closure so a cancelled request cannot release it mid-write.
+            let writes = state.session_writes.clone().lock_owned().await;
+            let st = state.clone();
+            let user_name = user.name.clone();
+            let cookie_string = hash_token(&token);
+            let saved = tokio::task::spawn_blocking(move || {
+                let mut last_created = writes;
+                let created = unix_micros().max(*last_created + 1);
+                *last_created = created;
+                let stored = StoredSession {
+                    cookie_string: cookie_string.clone(),
+                    user_name: user_name.clone(),
+                    expires,
+                    created,
+                };
+                // Plan the evictions first; the map is mutated only once the
+                // rows are durably written, so a failed save evicts nothing.
+                let removed =
+                    evictions(&st.sessions.lock().unwrap(), &st.config.limits, &user_name);
+                st.config.users.save_session(&stored, &removed).map(|()| {
+                    let mut sessions = st.sessions.lock().unwrap();
+                    for k in &removed {
+                        sessions.remove(k);
+                    }
+                    sessions.insert(
+                        cookie_string,
+                        Session {
+                            expires,
+                            user: user_name,
+                            created,
+                        },
+                    );
+                })
+            })
+            .await;
             if !matches!(saved, Ok(Ok(()))) {
                 match &saved {
                     Ok(Err(e)) => eprintln!("web-safe-block: session save failed: {e}"),
@@ -138,28 +171,16 @@ pub(crate) async fn login(
                 refund_attempt(&mut state.failures.lock().unwrap(), &key);
                 return login_error(&next);
             }
-            {
-                let mut sessions = state.sessions.lock().unwrap();
-                for k in &removed {
-                    sessions.remove(k);
-                }
-                sessions.insert(
-                    cookie_string,
-                    Session {
-                        expires,
-                        user: user.name.clone(),
-                        created,
-                    },
-                );
-            }
-            drop(last_created);
             println!("web-safe-block: user '{}' logged in", user.name);
             // A success undoes only its own reserved attempt; earlier
             // failures against other names keep counting.
             refund_attempt(&mut state.failures.lock().unwrap(), &key);
             let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
             let h = resp.headers_mut();
-            h.insert(header::LOCATION, HeaderValue::from_str(&next).unwrap());
+            h.insert(
+                header::LOCATION,
+                HeaderValue::from_str(&next).unwrap_or(HeaderValue::from_static("/")),
+            );
             h.insert(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&session_cookie_header(
@@ -191,7 +212,7 @@ fn logout_form_html(message: Option<&str>) -> String {
         .map(|m| format!("<p>{}</p>\n", crate::util::html_escape(m)))
         .unwrap_or_default();
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Log out</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Log out</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
     )
 }
 
@@ -213,10 +234,9 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
     }
     // Every wsb_session cookie offered is revoked — a path-scoped sibling
     // cookie may shadow the real one.
-    let hashes: Vec<String> = parse_cookies(&headers)
+    let hashes: Vec<String> = session_tokens(&headers)
         .into_iter()
-        .filter(|(n, _)| n == SESSION_COOKIE)
-        .map(|(_, t)| hash_token(&t))
+        .map(|t| hash_token(&t))
         .collect();
     let done = |user: Option<String>| {
         let mut resp = (StatusCode::SEE_OTHER, ()).into_response();
@@ -228,44 +248,50 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
         );
         with_outcome(resp, EventKind::Logout, user)
     };
-    let _writes = state.session_writes.lock().await;
-    // Only hashes the map actually holds can be live sessions; unknown
-    // values need no database write at all.
-    let (present, user) = {
-        let sessions = state.sessions.lock().unwrap();
-        let present: Vec<String> = hashes
-            .iter()
-            .filter(|h| sessions.contains_key(*h))
-            .cloned()
-            .collect();
-        let user = present
-            .first()
-            .and_then(|h| sessions.get(h))
-            .map(|s| s.user.clone());
-        (present, user)
-    };
-    if present.is_empty() {
-        return done(None);
-    }
-    let users = state.config.users.clone();
-    let gone = {
-        let present = present.clone();
-        tokio::task::spawn_blocking(move || users.delete_sessions(&present)).await
-    };
-    match gone {
-        Ok(Ok(())) => {
-            let mut sessions = state.sessions.lock().unwrap();
+    // The owned guard moves into the closure so a cancelled request cannot
+    // release it while the delete is still running.
+    let writes = state.session_writes.clone().lock_owned().await;
+    let st = state.clone();
+    let gone = tokio::task::spawn_blocking(move || {
+        let _writes = writes;
+        // Only hashes the map actually holds can be live sessions; unknown
+        // values need no database write at all.
+        let (present, user) = {
+            let sessions = st.sessions.lock().unwrap();
+            let present: Vec<String> = hashes
+                .iter()
+                .filter(|h| sessions.contains_key(*h))
+                .cloned()
+                .collect();
+            let user = present
+                .first()
+                .and_then(|h| sessions.get(h))
+                .map(|s| s.user.clone());
+            (present, user)
+        };
+        if present.is_empty() {
+            return (false, user, Ok(()));
+        }
+        let result = st.config.users.delete_sessions(&present);
+        if result.is_ok() {
+            let mut sessions = st.sessions.lock().unwrap();
             for h in &present {
                 sessions.remove(h);
             }
-            done(user)
         }
+        (true, user, result)
+    })
+    .await;
+    match gone {
+        Ok((false, _, _)) => done(None),
+        Ok((true, user, Ok(()))) => done(user),
         result => {
             match &result {
-                Ok(Err(e)) => eprintln!("web-safe-block: session delete failed: {e}"),
+                Ok((_, _, Err(e))) => eprintln!("web-safe-block: session delete failed: {e}"),
                 Err(e) => eprintln!("web-safe-block: session delete failed: {e}"),
                 _ => {}
             }
+            let user = result.ok().and_then(|(_, u, _)| u);
             with_outcome(
                 html_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -275,5 +301,94 @@ pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) ->
                 user,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::monitor::EventQueue;
+    use crate::state::{Config, Limits};
+    use crate::users::{self, UserStore};
+
+    fn state_with_alice() -> AppState {
+        let dir = std::env::temp_dir().join(format!("wsb-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(users::DB_FILE);
+        let conn = users::open_for_add(&path).unwrap();
+        users::add_users(
+            &conn,
+            "alice Correct-Horse-Battery-42\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
+        let config = Config {
+            users: Arc::new(UserStore::open(&path).unwrap()),
+            upstream: "http://127.0.0.1:1".parse().unwrap(),
+            session_ttl: Duration::from_secs(600),
+            cookie_secure: false,
+            fail_delay: Duration::ZERO,
+            limits: Limits::default(),
+        };
+        AppState::new(config, Arc::new(EventQueue::new(10)))
+    }
+
+    /// Cancelling a login mid-hash must not release the hash slot early:
+    /// the owned guard lives in the blocking closure.
+    ///
+    /// Current-thread runtime: when `try_lock` first fails, the login future
+    /// is suspended at `spawn_blocking(..).await` — the guard is already
+    /// inside the detached blocking closure, so aborting cannot drop it.
+    #[tokio::test]
+    async fn hash_slot_survives_request_cancellation() {
+        let state = state_with_alice();
+        let peer: SocketAddr = "127.0.0.1:4321".parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for _ in 0..10 {
+            let st = state.clone();
+            let task = tokio::spawn(login(
+                State(st),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Form(LoginForm {
+                    user: "alice".into(),
+                    phrase: "Correct-Horse-Battery-42".into(),
+                    next: String::new(),
+                }),
+            ));
+            // Poll tightly until the Argon2 hash is actually in progress.
+            while state.hash_slot.try_lock().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "login never held the hash slot"
+                );
+                tokio::task::yield_now().await;
+            }
+            task.abort();
+            let Err(e) = task.await else {
+                continue; // login finished before the abort landed; retry
+            };
+            assert!(e.is_cancelled());
+            if state.hash_slot.try_lock().is_ok() {
+                // Either the slot was released early (the bug this tests
+                // for) or the hash finished in the abort window; retry.
+                continue;
+            }
+            // Held after the abort: the guard outlives the cancelled
+            // future. It must be released once the blocking hash exits.
+            for _ in 0..1000 {
+                if state.hash_slot.try_lock().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("hash slot never released");
+        }
+        panic!("hash slot was released early on every attempt");
     }
 }

@@ -4,7 +4,7 @@ Status: accepted (2026-11)
 
 ## Decision
 
-Sessions are written through to a `sessions` table in `users.db` — `(user_name REFERENCES users ON DELETE CASCADE, cookie_string UNIQUE, timestamp)` — while the in-memory `HashMap` remains the fast lookup path. `cookie_string` is the hex SHA-256 of the cookie token; the raw token only ever travels in `Set-Cookie`. Caps are 3 sessions per user and 10,000 total; a new login evicts the earliest-expiring session from both the map and the table in one step. `serve` loads unexpired rows at startup and re-reads the whole table on its 60-second purge tick, which is also how a `remove-user` from another process kills that user's live sessions.
+Sessions are written through to a `sessions` table in `users.db` — `(user_name REFERENCES users ON DELETE CASCADE, cookie_string UNIQUE, timestamp, created)` — while the in-memory `HashMap` remains the fast lookup path. `cookie_string` is the hex SHA-256 of the cookie token; the raw token only ever travels in `Set-Cookie`. Caps are 3 sessions per user and 10,000 total; a new login evicts the earliest-created session (by the persisted `created` stamp, so expiry changes can't reshuffle the order) from both the map and the table in one step. `serve` loads unexpired rows at startup and re-reads the whole table on its 60-second purge tick, which is also how a `remove-user` from another process kills that user's live sessions.
 
 ## Why
 

@@ -35,6 +35,8 @@ pub enum EventKind {
     LoginSucceeded,
     /// User lookup failed; the attempt did not count against the rate limit.
     LoginError,
+    /// Too many logins were already queued for the Argon2 slot; 503.
+    LoginBusy,
     RateLimited,
     /// The log-out form was shown.
     LogoutPage,
@@ -122,8 +124,8 @@ impl EventQueue {
     /// Add an event, overwriting the oldest unconsumed ones if the queue is
     /// over its count capacity or its total byte budget.
     pub fn push(&self, mut ev: Event) {
-        ev.time = rfc3339(SystemTime::now());
         let mut inner = self.inner.lock().unwrap();
+        ev.time = rfc3339(SystemTime::now());
         inner.next_seq += 1;
         ev.seq = inner.next_seq;
         inner.events.push_back(ev);
@@ -207,6 +209,9 @@ pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::
                     continue;
                 };
                 if !events.try_connect() {
+                    // Nonblocking: a stalled client must not hold the
+                    // accept loop (and its slot decision) hostage.
+                    let _ = stream.set_nonblocking(true);
                     let _ = stream.write_all(BUSY_MESSAGE);
                     continue;
                 }
@@ -214,8 +219,15 @@ pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::
                 let spawned = thread::Builder::new()
                     .name("wsb-monitor-conn".into())
                     .spawn(move || {
+                        // A panic must still free the monitor slot.
+                        struct Guard<'a>(&'a EventQueue);
+                        impl Drop for Guard<'_> {
+                            fn drop(&mut self) {
+                                self.0.disconnect();
+                            }
+                        }
+                        let _guard = Guard(&conn_events);
                         let _ = serve_monitor(stream, &conn_events);
-                        conn_events.disconnect();
                     });
                 if spawned.is_err() {
                     events.disconnect();
@@ -279,10 +291,19 @@ fn probe(stream: &mut TcpStream) -> io::Result<()> {
 fn read_eof(stream: &TcpStream) -> io::Result<bool> {
     stream.set_nonblocking(true)?;
     let mut buf = [0u8; 256];
+    // Drain at most this many pending reads, so a chatty client cannot keep
+    // the monitor thread from answering events.
+    let mut reads = 0;
     let result = loop {
         match (&*stream).read(&mut buf) {
             Ok(0) => break Ok(true),
-            Ok(_) => continue,
+            Ok(_) => {
+                reads += 1;
+                if reads >= 64 {
+                    break Ok(false);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::WouldBlock => break Ok(false),
             Err(e) => break Err(e),
         }

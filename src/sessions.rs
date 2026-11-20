@@ -1,7 +1,7 @@
 //! Login sessions: token minting, lookup, bounded insertion, and the
 //! write-through to the `sessions` table in users.db.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
@@ -9,7 +9,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use crate::state::{AppState, Limits};
-use crate::util::{SESSION_COOKIE, parse_cookies};
+use crate::util::session_tokens;
 
 pub(crate) struct Session {
     pub expires: SystemTime,
@@ -40,11 +40,7 @@ pub(crate) fn hash_token(token: &str) -> String {
 /// (a path-scoped cookie may shadow the real one). Expired ones seen on
 /// the way are dropped lazily.
 pub(crate) fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let tokens: Vec<String> = parse_cookies(headers)
-        .into_iter()
-        .filter(|(n, _)| n == SESSION_COOKIE)
-        .map(|(_, t)| t)
-        .collect();
+    let tokens = session_tokens(headers);
     let mut sessions = state.sessions.lock().unwrap();
     let now = SystemTime::now();
     for token in tokens {
@@ -71,43 +67,46 @@ pub(crate) fn evictions(
 ) -> Vec<String> {
     let now = SystemTime::now();
     let mut removed: Vec<String> = Vec::new();
+    let mut gone: HashSet<&str> = HashSet::new();
     let mut len = sessions.len();
     let mut user_count = sessions.values().filter(|s| s.user == user).count();
     if len >= limits.max_sessions || user_count >= limits.max_sessions_per_user {
         for (k, s) in sessions {
             if s.expires <= now {
+                if s.user == user {
+                    user_count -= 1;
+                }
                 removed.push(k.clone());
+                gone.insert(k);
             }
         }
         len -= removed.len();
-        user_count -= sessions
-            .iter()
-            .filter(|(k, s)| s.user == user && removed.contains(*k))
-            .count();
     }
     while user_count >= limits.max_sessions_per_user {
         let Some(oldest) = sessions
             .iter()
-            .filter(|(k, s)| s.user == user && !removed.contains(*k))
+            .filter(|(k, s)| s.user == user && !gone.contains(k.as_str()))
             .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.as_str())
         else {
             break;
         };
-        removed.push(oldest);
+        gone.insert(oldest);
+        removed.push(oldest.to_string());
         user_count -= 1;
         len -= 1;
     }
     while len >= limits.max_sessions {
         let Some(oldest) = sessions
             .iter()
-            .filter(|(k, _)| !removed.contains(*k))
+            .filter(|(k, _)| !gone.contains(k.as_str()))
             .min_by(|(k1, s1), (k2, s2)| (s1.created, *k1).cmp(&(s2.created, *k2)))
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.as_str())
         else {
             break;
         };
-        removed.push(oldest);
+        gone.insert(oldest);
+        removed.push(oldest.to_string());
         len -= 1;
     }
     removed

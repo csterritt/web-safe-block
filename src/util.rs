@@ -10,16 +10,23 @@ pub const SESSION_COOKIE: &str = "wsb_session";
 pub const LOGIN_PATH: &str = "/__wsb/login";
 pub const LOGOUT_PATH: &str = "/__wsb/logout";
 
-/// Parse all Cookie headers and return (name, value) pairs in order.
-pub(crate) fn parse_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
+/// Every `SESSION_COOKIE` token in the Cookie header(s), in order. Works on
+/// raw bytes like `strip_session_cookie` so a non-UTF-8 sibling cookie can
+/// never hide the session cookie; only values that are themselves valid
+/// UTF-8 are returned.
+pub(crate) fn session_tokens(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     for hv in headers.get_all(header::COOKIE).iter() {
-        if let Ok(s) = hv.to_str() {
-            for part in s.split(';') {
-                let part = part.trim();
-                if let Some((name, value)) = part.split_once('=') {
-                    out.push((name.trim().to_string(), value.trim().to_string()));
-                }
+        for part in hv.as_bytes().split(|b| *b == b';') {
+            let part = part.trim_ascii();
+            let Some(eq) = part.iter().position(|b| *b == b'=') else {
+                continue;
+            };
+            if part[..eq].trim_ascii() != SESSION_COOKIE.as_bytes() {
+                continue;
+            }
+            if let Ok(v) = std::str::from_utf8(part[eq + 1..].trim_ascii()) {
+                out.push(v.to_string());
             }
         }
     }
@@ -46,7 +53,7 @@ pub(crate) fn strip_session_cookie(headers: &mut HeaderMap) {
             }
         }
     }
-    while headers.remove(header::COOKIE).is_some() {}
+    headers.remove(header::COOKIE);
     if !remaining.is_empty()
         && let Ok(v) = HeaderValue::from_bytes(&remaining.join(b"; ".as_slice()))
     {
@@ -61,7 +68,7 @@ pub(crate) fn sanitize_next(next: &str) -> String {
         && !next.starts_with("//")
         && !next.starts_with("/\\")
         && !next.starts_with("/__wsb/")
-        && !next.chars().any(|c| c.is_control());
+        && next.bytes().all(|b| b.is_ascii_graphic());
     if ok {
         next.to_string()
     } else {
@@ -70,16 +77,39 @@ pub(crate) fn sanitize_next(next: &str) -> String {
 }
 
 pub(crate) fn html_escape(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '&' => "&amp;".chars().collect::<Vec<_>>(),
-            '<' => "&lt;".chars().collect(),
-            '>' => "&gt;".chars().collect(),
-            '"' => "&quot;".chars().collect(),
-            '\'' => "&#39;".chars().collect(),
-            _ => vec![c],
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Split an HTTP list header value on commas that are outside double-quoted
+/// strings (a `\"` escape does not close the quote).
+fn split_http_list(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, b) in s.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            quoted = !quoted;
+        } else if b == b',' && !quoted {
+            out.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 /// Rewrite the caching headers of a gated upstream response so a shared
@@ -92,12 +122,12 @@ pub(crate) fn rewrite_cache_control(headers: &mut HeaderMap) {
         "cloudflare-cdn-cache-control",
         "surrogate-control",
     ] {
-        while headers.remove(name).is_some() {}
+        headers.remove(name);
     }
     let mut directives = Vec::new();
     for value in headers.get_all(header::CACHE_CONTROL).iter() {
         if let Ok(s) = value.to_str() {
-            for d in s.split(',') {
+            for d in split_http_list(s) {
                 let d = d.trim();
                 if d.is_empty() {
                     continue;
@@ -113,7 +143,7 @@ pub(crate) fn rewrite_cache_control(headers: &mut HeaderMap) {
             }
         }
     }
-    while headers.remove(header::CACHE_CONTROL).is_some() {}
+    headers.remove(header::CACHE_CONTROL);
     let mut out = String::from("private");
     for d in directives {
         if !d
@@ -148,7 +178,7 @@ pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
         .map(|m| format!("<p>{}</p>\n", html_escape(m)))
         .unwrap_or_default();
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
         html_escape(next)
     )
 }
@@ -197,25 +227,60 @@ pub(crate) fn clear_cookie_header(secure: bool) -> String {
     s
 }
 
-pub(crate) fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+/// The client IP: `CF-Connecting-IP` when it parses, else the TCP peer.
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<std::net::IpAddr> {
     headers
         .get("CF-Connecting-IP")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .or_else(|| peer.map(|a| a.ip()))
+}
+
+pub(crate) fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    client_ip(headers, peer)
         .map(|ip| ip.to_string())
-        .or_else(|| peer.map(|a| a.ip().to_string()))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The rate-limit key for a request: the same IP source as `client_key`
+/// (canonicalized, so an IPv4-mapped IPv6 address is a plain IPv4 key),
+/// except IPv6 addresses share one key per /64 network.
+pub(crate) fn rate_limit_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    match client_ip(headers, peer).map(|i| i.to_canonical()) {
+        Some(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            let mut segs = v6.segments();
+            for s in &mut segs[4..] {
+                *s = 0;
+            }
+            format!("{}/64", std::net::Ipv6Addr::from(segs))
+        }
+        None => "unknown".to_string(),
+    }
 }
 
 /// True if a POST came from another site, per Sec-Fetch-Site or Origin.
 /// When `secure` (cookie_secure), the Origin scheme must be https; plain
 /// http deployments also accept http.
 pub(crate) fn cross_site(headers: &HeaderMap, secure: bool) -> bool {
-    if let Some(v) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+    let mut sites = headers.get_all("sec-fetch-site").iter();
+    if let Some(v) = sites.next() {
+        // Multiple or non-UTF-8 values cannot be trusted: fail closed.
+        if sites.next().is_some() {
+            return true;
+        }
+        let Ok(v) = v.to_str() else { return true };
         return !(v.trim().eq_ignore_ascii_case("same-origin")
             || v.trim().eq_ignore_ascii_case("none"));
     }
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    if let Some(origin) = origins.next() {
+        if origins.next().is_some() {
+            return true;
+        }
+        let Ok(origin) = origin.to_str() else {
+            return true;
+        };
         let host = headers
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
@@ -271,7 +336,7 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     ]);
     for name in names {
         if let Ok(hn) = name.parse::<header::HeaderName>() {
-            while headers.remove(&hn).is_some() {}
+            headers.remove(&hn);
         }
     }
 }
@@ -349,6 +414,28 @@ mod tests {
     }
 
     #[test]
+    fn session_token_extraction() {
+        // obs-text in a sibling cookie does not hide the session token.
+        let mut h = HeaderMap::new();
+        h.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"app=\xff; wsb_session=tok").unwrap(),
+        );
+        assert_eq!(session_tokens(&h), ["tok"]);
+        // Several wsb_session cookies all come back, in order.
+        let h = headers_with_cookies(&["a=1; wsb_session=x", "wsb_session=y; b=2"]);
+        assert_eq!(session_tokens(&h), ["x", "y"]);
+        // A non-UTF-8 value is skipped; name matching is on raw bytes.
+        let mut h = HeaderMap::new();
+        h.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"wsb_session=\xff; wsb_session2=z; wsb_session=ok").unwrap(),
+        );
+        assert_eq!(session_tokens(&h), ["ok"]);
+        assert!(session_tokens(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
     fn sanitize_next_cases() {
         assert_eq!(sanitize_next("/a?b=1"), "/a?b=1");
         assert_eq!(sanitize_next("//evil.com"), "/");
@@ -357,6 +444,9 @@ mod tests {
         assert_eq!(sanitize_next(""), "/");
         assert_eq!(sanitize_next("/__wsb/login"), "/");
         assert_eq!(sanitize_next("/a\nb"), "/");
+        assert_eq!(sanitize_next("/%C3%A9"), "/%C3%A9", "encoded form stays");
+        assert_eq!(sanitize_next("/é"), "/");
+        assert_eq!(sanitize_next("/foo bar"), "/");
         let long = format!("/{}", "x".repeat(2048));
         assert_eq!(sanitize_next(&long), "/");
         let just = format!("/{}", "x".repeat(2047));
@@ -397,6 +487,19 @@ mod tests {
         assert_eq!(case(Some("no-store")), "private, no-store");
         assert_eq!(case(Some("PUBLIC, proxy-revalidate")), "private");
         assert_eq!(case(Some("private, max-age=1")), "private, max-age=1");
+        // Commas inside quoted strings do not split directives.
+        assert_eq!(
+            case(Some("private=\"a, b\", max-age=60")),
+            "private, max-age=60"
+        );
+        assert_eq!(
+            case(Some("public, no-cache=\"x, y\"")),
+            "private, no-cache=\"x, y\""
+        );
+        assert_eq!(
+            case(Some("no-cache=\"a\\\",b\", max-age=5")),
+            "private, no-cache=\"a\\\",b\", max-age=5"
+        );
     }
 
     #[test]
@@ -458,6 +561,28 @@ mod tests {
             &h(&[("origin", "http://example.com"), ("host", "example.com")]),
             true
         ));
+
+        // Repeated headers fail closed even if the first looks fine.
+        let mut m = HeaderMap::new();
+        m.append("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        m.append("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(cross_site(&m, false));
+        let mut m = HeaderMap::new();
+        m.append("origin", HeaderValue::from_static("http://example.com"));
+        m.append("origin", HeaderValue::from_static("http://evil.example"));
+        m.append("host", HeaderValue::from_static("example.com"));
+        assert!(cross_site(&m, false));
+        // A non-UTF-8 value fails closed too.
+        let mut m = HeaderMap::new();
+        m.append("sec-fetch-site", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(cross_site(&m, false));
+        let mut m = HeaderMap::new();
+        m.append(
+            "origin",
+            HeaderValue::from_bytes(b"http://example.com\xff").unwrap(),
+        );
+        m.append("host", HeaderValue::from_static("example.com"));
+        assert!(cross_site(&m, false));
     }
 
     #[test]
@@ -471,5 +596,35 @@ mod tests {
             HeaderValue::from_static(" 203.0.113.5 "),
         );
         assert_eq!(client_key(&h, Some(peer)), "203.0.113.5");
+    }
+
+    #[test]
+    fn rate_limit_key_cases() {
+        let h = HeaderMap::new();
+        // IPv4 stays exact; IPv6 collapses to its /64 network.
+        let v4: SocketAddr = "203.0.113.5:1234".parse().unwrap();
+        assert_eq!(rate_limit_key(&h, Some(v4)), "203.0.113.5");
+        let v6a: SocketAddr = "[2001:db8:1:2::aaaa]:1".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8:1:2::bbbb]:2".parse().unwrap();
+        assert_eq!(rate_limit_key(&h, Some(v6a)), "2001:db8:1:2::/64");
+        assert_eq!(rate_limit_key(&h, Some(v6b)), "2001:db8:1:2::/64");
+        let v6c: SocketAddr = "[2001:db8:1:3::1]:1".parse().unwrap();
+        assert_eq!(rate_limit_key(&h, Some(v6c)), "2001:db8:1:3::/64");
+        // IPv4-mapped IPv6 is a plain IPv4 key.
+        let mapped: SocketAddr = "[::ffff:203.0.113.5]:80".parse().unwrap();
+        assert_eq!(rate_limit_key(&h, Some(mapped)), "203.0.113.5");
+        // CF-Connecting-IP is used when present, canonicalized too.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static("::ffff:203.0.113.5"),
+        );
+        assert_eq!(rate_limit_key(&h, Some(v4)), "203.0.113.5");
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static("2001:0DB8:0001:0002::99"),
+        );
+        assert_eq!(rate_limit_key(&h, Some(v4)), "2001:db8:1:2::/64");
+        assert_eq!(rate_limit_key(&HeaderMap::new(), None), "unknown");
     }
 }

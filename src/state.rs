@@ -28,6 +28,12 @@ pub struct Limits {
     pub max_upstream_requests: usize,
     /// How often sessions are reloaded from users.db and stale state purged.
     pub purge_interval: Duration,
+    /// At most this many logins wait for the Argon2 hash slot; the rest get 503.
+    pub max_login_waiters: usize,
+    /// A client connection's header read must complete within this long.
+    pub header_read_timeout: Duration,
+    /// A write to the client may stall for at most this long.
+    pub client_write_stall_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -41,6 +47,9 @@ impl Default for Limits {
             upstream_body_idle_timeout: Duration::from_secs(60),
             max_upstream_requests: 256,
             purge_interval: Duration::from_secs(60),
+            max_login_waiters: 32,
+            header_read_timeout: Duration::from_secs(30),
+            client_write_stall_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -87,6 +96,8 @@ pub(crate) struct AppState {
     pub session_writes: Arc<tokio::sync::Mutex<i64>>,
     /// Bounds concurrent upstream requests; held until the body finishes.
     pub upstream_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds how many logins may queue for `hash_slot` at once.
+    pub login_waiters: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -95,6 +106,7 @@ impl AppState {
         connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let max_upstream_requests = config.limits.max_upstream_requests;
+        let max_login_waiters = config.limits.max_login_waiters;
         AppState {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -104,6 +116,7 @@ impl AppState {
             hash_slot: Arc::new(tokio::sync::Mutex::new(())),
             session_writes: Arc::new(tokio::sync::Mutex::new(0)),
             upstream_permits: Arc::new(tokio::sync::Semaphore::new(max_upstream_requests)),
+            login_waiters: Arc::new(tokio::sync::Semaphore::new(max_login_waiters)),
         }
     }
 }

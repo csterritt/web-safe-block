@@ -164,10 +164,12 @@ async fn spawn_proxy_on_db(
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = web_safe_block::build_router(config, events)
-        .unwrap()
-        .into_make_service_with_connect_info::<SocketAddr>();
-    tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+    let router = web_safe_block::build_router(config, events).unwrap();
+    tokio::spawn(async move {
+        web_safe_block::serve(listener, router, limits, std::future::pending())
+            .await
+            .unwrap()
+    });
     (addr, monitor_addr)
 }
 
@@ -1753,6 +1755,11 @@ async fn login_get_redirects_and_body_limit() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 413);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "axum's own rejection still marked no-store"
+    );
 
     let resp = client
         .post(format!("{base}/__wsb/login"))
@@ -1762,4 +1769,113 @@ async fn login_get_redirects_and_body_limit() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 303);
+}
+
+/// An obs-text byte in a sibling cookie must not hide `wsb_session`, and
+/// logout with such a header really deletes the session row.
+#[tokio::test]
+async fn obs_text_sibling_cookie_does_not_hide_session() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, _, db) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let cookie =
+        HeaderValue::from_bytes(&[b"app=\xff; wsb_session=".as_slice(), token.as_bytes()].concat())
+            .unwrap();
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, cookie.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("{base}/__wsb/logout"))
+        .header(header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(token_status(&client, &base, &token).await, 401);
+    let conn = users::open_for_remove(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "session row deleted");
+}
+
+/// A client that stops reading must not pin an upstream permit forever:
+/// the write-stall timeout closes its connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_client_does_not_hold_upstream_permit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Upstream serves a 32 MiB body.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let n = 32 * 1024 * 1024usize;
+                let _ = s
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n").as_bytes())
+                    .await;
+                let chunk = vec![b'x'; 64 * 1024];
+                for _ in 0..n / chunk.len() {
+                    if s.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let limits = Limits {
+        max_upstream_requests: 1,
+        client_write_stall_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    // Open a raw connection that requests the big body and reads nothing.
+    let mut stalled = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    stalled
+        .write_all(
+            format!(
+                "GET /big HTTP/1.1\r\nHost: {proxy}\r\nCookie: wsb_session={token}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    // Poll until the stall timeout frees the connection and the permit.
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let resp = client
+            .get(format!("{base}/foo"))
+            .header(header::COOKIE, format!("wsb_session={token}"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 200 {
+            break;
+        }
+        assert_eq!(resp.status(), 503);
+        assert!(std::time::Instant::now() < deadline, "permit never freed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(stalled);
 }

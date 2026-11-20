@@ -96,6 +96,15 @@ pub fn load(path: &Path) -> Result<Settings, String> {
             raw.upstream
         )));
     }
+    if upstream
+        .authority()
+        .is_some_and(|a| a.as_str().contains('@'))
+    {
+        return Err(bad(format!(
+            "upstream must not contain userinfo (user:pass@): {:?}",
+            raw.upstream
+        )));
+    }
     if upstream.path_and_query().is_some_and(|pq| pq != "/") {
         return Err(bad(format!(
             "upstream must not have a path or query: {:?}",
@@ -107,6 +116,9 @@ pub fn load(path: &Path) -> Result<Settings, String> {
             "monitor_addr must be a loopback address, got {}",
             raw.monitor_addr
         )));
+    }
+    if raw.users_db.as_os_str().is_empty() {
+        return Err(bad("users_db must not be empty".into()));
     }
     if raw.monitor_queue_len == 0 {
         return Err(bad("monitor_queue_len must be at least 1".into()));
@@ -239,6 +251,12 @@ mod tests {
                 "upstream = \"http://x/app\"",
                 "must not have a path or query",
             ),
+            (
+                "upstream",
+                "upstream = \"http://user:pass@127.0.0.1:3000\"",
+                "userinfo",
+            ),
+            ("users_db", "users_db = \"\"", "users_db"),
             (
                 "upstream",
                 "upstream = \"http://x?a=1\"",

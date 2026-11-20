@@ -19,17 +19,19 @@ fi
 
 last_dir=$(basename "$(pwd)")
 
-ssh chris@utmbox "cd $(printf %q "$last_dir") && scripts/tar-new.sh /tmp/new-files.tar"
+remote_dir=$(ssh chris@utmbox mktemp -d)
+local_dir=$(mktemp -d)
+trap 'rm -rf "$local_dir"' EXIT
 
-scp chris@utmbox:/tmp/new-files.tar /tmp/new-files.tar
-scp chris@utmbox:/tmp/deleted-files.txt /tmp/deleted-files.txt
+ssh chris@utmbox "cd $(printf %q "$last_dir") && scripts/tar-new.sh $(printf %q "$remote_dir")/new-files.tar"
 
-tar xvf /tmp/new-files.tar
+scp -q "chris@utmbox:$remote_dir/new-files.tar" "$local_dir/new-files.tar"
+scp -q "chris@utmbox:$remote_dir/new-files.tar.deleted" "$local_dir/new-files.tar.deleted"
 
-while IFS= read -r file; do
+tar xf "$local_dir/new-files.tar"
+
+while IFS= read -r -d '' file; do
   [ -n "$file" ] && rm -f "$file"
-done < /tmp/deleted-files.txt
+done < "$local_dir/new-files.tar.deleted"
 
-rm -f /tmp/new-files.tar /tmp/deleted-files.txt
-
-ssh chris@utmbox 'rm -f /tmp/new-files.tar /tmp/deleted-files.txt'
+ssh chris@utmbox "rm -rf $(printf %q "$remote_dir")"

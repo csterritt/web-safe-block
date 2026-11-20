@@ -88,7 +88,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
         "x-forwarded-port",
         "x-real-ip",
     ] {
-        while headers.remove(name).is_some() {}
+        headers.remove(name);
     }
     if let Ok(v) = HeaderValue::from_str(&key) {
         headers.insert("x-forwarded-for", v);
@@ -120,7 +120,8 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     );
     let upstream_resp = match pending.await {
         Ok(Ok(r)) => r,
-        Ok(Err(_)) => {
+        Ok(Err(e)) => {
+            eprintln!("web-safe-block: upstream request failed: {e}");
             return plain_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
         }
         Err(_) => {
@@ -138,7 +139,7 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
         .filter(|v| !sets_session_cookie(v.as_bytes()))
         .cloned()
         .collect();
-    while parts.headers.remove(header::SET_COOKIE).is_some() {}
+    parts.headers.remove(header::SET_COOKIE);
     for v in set_cookies {
         parts.headers.append(header::SET_COOKIE, v);
     }
@@ -159,6 +160,9 @@ struct IdleTimeoutBody<B> {
     _permit: OwnedSemaphorePermit,
     idle: Duration,
     sleep: Pin<Box<tokio::time::Sleep>>,
+    /// Set once the stream ended (frame None) or timed out: after that the
+    /// body reports end-of-stream forever.
+    done: bool,
 }
 
 impl<B> IdleTimeoutBody<B> {
@@ -168,6 +172,7 @@ impl<B> IdleTimeoutBody<B> {
             _permit: permit,
             idle,
             sleep: Box::pin(tokio::time::sleep(idle)),
+            done: false,
         }
     }
 }
@@ -184,24 +189,35 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
         match Pin::new(&mut self.inner).poll_frame(cx) {
+            // A completed stream ends for good; the timer is left alone.
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
             Poll::Ready(frame) => {
                 let deadline = tokio::time::Instant::now() + self.idle;
                 self.sleep.as_mut().reset(deadline);
                 Poll::Ready(frame.map(|r| r.map_err(io::Error::other)))
             }
             Poll::Pending => match self.sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "upstream body idle timeout",
-                )))),
+                Poll::Ready(()) => {
+                    self.done = true;
+                    Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream body idle timeout",
+                    ))))
+                }
                 Poll::Pending => Poll::Pending,
             },
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.done || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {

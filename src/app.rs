@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
-use axum::http::header;
+use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -21,7 +21,8 @@ use crate::util::{LOGIN_PATH, LOGOUT_PATH, client_key};
 
 /// Build the public-facing router. Every request is reported to `events`.
 /// Loads the persisted sessions before serving; errors if users.db cannot
-/// be read.
+/// be read. Must be called inside a Tokio runtime: it spawns a background
+/// purge task that lives for the life of that runtime.
 pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, String> {
     let state = AppState::new(config, events);
     {
@@ -63,7 +64,14 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
             (Some(t), cut)
         });
     let truncated = m1 || m2 || m3;
+    let wsb_path = path.starts_with("/__wsb/");
     let mut resp = next.run(req).await;
+    // Axum's own rejections (400/405/413/415/422) carry no Cache-Control;
+    // gate answers must never be stored.
+    if wsb_path && !resp.headers().contains_key(header::CACHE_CONTROL) {
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     let outcome = resp
         .extensions_mut()
         .remove::<Outcome>()
@@ -98,12 +106,19 @@ fn spawn_purger(state: AppState) {
             tokio::time::sleep(state.config.limits.purge_interval).await;
             // Reloading drops expired rows and picks up changes made by other
             // processes (a remove-user deletes the user's sessions). Held
-            // under session_writes so reloads and session writes stay ordered.
+            // under session_writes so reloads and session writes stay ordered;
+            // the owned guard lives in the closure so it cannot be released
+            // while the reload still runs.
             {
-                let mut last = state.session_writes.lock().await;
+                let last = state.session_writes.clone().lock_owned().await;
                 let st = state.clone();
-                match tokio::task::spawn_blocking(move || reload_sessions(&st)).await {
-                    Ok(Ok(max)) => *last = (*last).max(max),
+                match tokio::task::spawn_blocking(move || {
+                    let mut last = last;
+                    reload_sessions(&st).map(|max| *last = (*last).max(max))
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => eprintln!("web-safe-block: session reload failed: {e}"),
                     Err(e) => eprintln!("web-safe-block: session reload failed: {e}"),
                 }

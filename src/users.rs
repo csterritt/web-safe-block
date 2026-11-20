@@ -1,11 +1,14 @@
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::Rng;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use subtle::ConstantTimeEq;
 
 pub const DB_FILE: &str = "users.db";
 
@@ -109,7 +112,7 @@ const DUMMY_SALT: &str = "00000000000000000000000000000000";
 
 /// Argon2id (version 0x13) of the normalized phrase with the per-user salt,
 /// as lowercase hex; this is what is stored in the database.
-pub fn hash_phrase(salt: &str, phrase: &str) -> String {
+pub fn hash_phrase(salt: &str, phrase: &str) -> Result<String, argon2::Error> {
     let params = Params::new(
         ARGON2_M_COST_KIB,
         ARGON2_T_COST,
@@ -119,14 +122,12 @@ pub fn hash_phrase(salt: &str, phrase: &str) -> String {
     .expect("fixed argon2 parameters are valid");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; ARGON2_OUT_LEN];
-    argon2
-        .hash_password_into(
-            normalize_phrase(phrase).as_bytes(),
-            salt.as_bytes(),
-            &mut out,
-        )
-        .expect("fixed-size salt and output are valid");
-    out.iter().map(|b| format!("{b:02x}")).collect()
+    argon2.hash_password_into(
+        normalize_phrase(phrase).as_bytes(),
+        salt.as_bytes(),
+        &mut out,
+    )?;
+    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Column names of `table`, or an empty Vec if it does not exist.
@@ -179,72 +180,148 @@ fn create_private_db(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Warn (never chmod) if an existing db is accessible to group/other users.
+/// `path` with a SQLite sidecar suffix appended (`-wal`, `-shm`).
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+/// The db file and its existing WAL sidecars that are accessible to
+/// group/other users.
+#[cfg(unix)]
+fn exposed_files(path: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    [
+        path.to_path_buf(),
+        sidecar(path, "-wal"),
+        sidecar(path, "-shm"),
+    ]
+    .into_iter()
+    .filter(|p| {
+        p.metadata()
+            .map(|md| md.permissions().mode() & 0o077 != 0)
+            .unwrap_or(false)
+    })
+    .collect()
+}
+
+/// Warn (never chmod) if an existing db or its WAL sidecars are accessible
+/// to group/other users.
 #[cfg(unix)]
 fn warn_if_exposed(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(md) = path.metadata() else { return };
-    let mode = md.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        eprintln!(
-            "web-safe-block: warning: {} is accessible to other users \
-             (mode {mode:04o}); run: chmod 600 {}",
-            path.display(),
-            path.display()
-        );
+    let exposed = exposed_files(path);
+    if exposed.is_empty() {
+        return;
     }
+    let files: Vec<String> = exposed
+        .iter()
+        .map(|p| {
+            let mode = p
+                .metadata()
+                .map(|md| md.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            format!("{} (mode {mode:04o})", p.display())
+        })
+        .collect();
+    let paths: Vec<String> = exposed.iter().map(|p| p.display().to_string()).collect();
+    eprintln!(
+        "web-safe-block: warning: {} accessible to other users; run: chmod 600 {}",
+        files.join(", "),
+        paths.join(" ")
+    );
 }
 
 #[cfg(not(unix))]
 fn warn_if_exposed(_path: &Path) {}
 
-/// Open (creating if needed) the database for `add-user`.
-pub fn open_for_add(path: &Path) -> Result<Connection, String> {
+enum OpenKind {
+    /// `add-user`: create the file if missing; no users table required.
+    Add,
+    /// `remove-user`: read-write, requires the users table.
+    ReadWrite,
+    /// `list-users`: read-only; no WAL conversion, no schema creation.
+    ReadOnly,
+    /// `serve`: read-write, requires the users table and at least one user.
+    Serve,
+}
+
+/// Every database open: busy timeout first, then validation (so a rejected
+/// database is never converted to WAL and gets no -wal/-shm files), then
+/// WAL and schema creation for the read-write paths.
+fn open(path: &Path, kind: OpenKind) -> Result<Connection, String> {
     let cannot_open = |e: rusqlite::Error| format!("cannot open {}: {e}", path.display());
+    let hint = "add users with: web-safe-block add-user < users.txt";
+    let missing = || format!("no users database at {}; {hint}", path.display());
     if !path.exists() {
-        create_private_db(path)?;
+        match kind {
+            OpenKind::Add => create_private_db(path)?,
+            _ => return Err(missing()),
+        }
     }
     warn_if_exposed(path);
-    let conn = Connection::open(path).map_err(cannot_open)?;
-    configure(&conn).map_err(cannot_open)?;
+    let conn = match kind {
+        OpenKind::Add => Connection::open(path).map_err(cannot_open)?,
+        OpenKind::ReadOnly => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(cannot_open)?,
+        _ => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(cannot_open)?,
+    };
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(cannot_open)?;
+    let users: Option<i64> = match kind {
+        OpenKind::Add => None,
+        _ => Some(
+            conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+                .map_err(|e| {
+                    if is_no_table(&e) {
+                        match kind {
+                            OpenKind::Serve => missing(),
+                            _ => format!("{} does not contain a users table", path.display()),
+                        }
+                    } else {
+                        cannot_open(e)
+                    }
+                })?,
+        ),
+    };
     if stale_schema(&conn).map_err(cannot_open)? {
         return Err(stale_schema_err(path));
     }
+    if matches!(kind, OpenKind::Serve) && users == Some(0) {
+        return Err(format!(
+            "users database {} has no users; {hint}",
+            path.display()
+        ));
+    }
+    if matches!(kind, OpenKind::ReadOnly) {
+        return Ok(conn);
+    }
+    configure(&conn).map_err(cannot_open)?;
     init(&conn).map_err(cannot_open)?;
     Ok(conn)
 }
 
+/// Open (creating if needed) the database for `add-user`.
+pub fn open_for_add(path: &Path) -> Result<Connection, String> {
+    open(path, OpenKind::Add)
+}
+
 /// Open an existing database read-write for `remove-user`.
 pub fn open_for_remove(path: &Path) -> Result<Connection, String> {
-    if !path.exists() {
-        return Err(format!(
-            "no users database at {}; add users with: web-safe-block add-user < users.txt",
-            path.display()
-        ));
-    }
-    warn_if_exposed(path);
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    configure(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    conn.query_row("SELECT COUNT(*) FROM users", [], |_| Ok(()))
-        .map_err(|e| {
-            if is_no_table(&e) {
-                format!("{} does not contain a users table", path.display())
-            } else {
-                format!("cannot open {}: {e}", path.display())
-            }
-        })?;
-    if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
-        return Err(stale_schema_err(path));
-    }
-    init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    Ok(conn)
+    open(path, OpenKind::ReadWrite)
+}
+
+/// Open an existing database read-only for `list-users`.
+pub fn open_read_only(path: &Path) -> Result<Connection, String> {
+    open(path, OpenKind::ReadOnly)
 }
 
 /// Remove the user `name` and their sessions; returns whether a row was deleted.
 pub fn remove_user(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let name = name.trim();
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Sessions.user_name has BINARY collation; match the stored spelling so
     // a differently-cased argument still deletes the user's sessions.
     tx.execute(
@@ -271,13 +348,25 @@ pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<User>> {
 
 /// Read `user-name pass phrase words...` lines and insert them. Bad lines are
 /// reported to `err` and skipped. Returns (added, skipped).
+///
+/// All lines are read and every Argon2 hash computed before any transaction
+/// opens, so a long stdin (or a slow typist) never holds a write lock on a
+/// database a live `serve` is using.
 pub fn add_users(
     conn: &Connection,
     input: impl BufRead,
     err: &mut impl Write,
 ) -> rusqlite::Result<(usize, usize)> {
-    let tx = conn.unchecked_transaction()?;
-    let (mut added, mut skipped) = (0, 0);
+    struct Pending {
+        line_no: usize,
+        name: String,
+        salt: String,
+        hash: String,
+        is_admin: bool,
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skipped = 0;
     for (i, line) in input.lines().enumerate() {
         let line_no = i + 1;
         let line = match line {
@@ -299,7 +388,7 @@ pub fn add_users(
             Some(format!("user '{name}' has no pass phrase"))
         } else if let Some(p) = phrase_problem(&phrase) {
             Some(format!("pass phrase for '{name}' {p}"))
-        } else if exists(&tx, "user_name", name)? {
+        } else if seen.contains(&name.to_ascii_lowercase()) || user_exists(conn, name)? {
             Some(format!("user '{name}' already exists"))
         } else {
             None
@@ -311,23 +400,55 @@ pub fn add_users(
         }
         let is_admin = name.to_lowercase().contains("admin");
         let salt = new_salt();
-        tx.execute(
+        match hash_phrase(&salt, &phrase) {
+            Ok(hash) => {
+                seen.insert(name.to_ascii_lowercase());
+                pending.push(Pending {
+                    line_no,
+                    name: name.to_string(),
+                    salt,
+                    hash,
+                    is_admin,
+                });
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "line {line_no}: skipped: could not hash pass phrase for '{name}': {e}"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    // One IMMEDIATE transaction inserts the batch in microseconds; a
+    // concurrent writer can never leave a stale read snapshot behind.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let mut added = 0;
+    for p in &pending {
+        let changed = tx.execute(
             "INSERT INTO users (user_name, salt, pass_phrase, is_admin) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![name, salt, hash_phrase(&salt, &phrase), is_admin],
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(user_name) DO NOTHING",
+            params![p.name, p.salt, p.hash, p.is_admin],
         )?;
-        added += 1;
+        if changed == 0 {
+            let _ = writeln!(
+                err,
+                "line {}: skipped: user '{}' already exists",
+                p.line_no, p.name
+            );
+            skipped += 1;
+        } else {
+            added += 1;
+        }
     }
     tx.commit()?;
     Ok((added, skipped))
 }
 
-fn exists(conn: &Connection, column: &str, value: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        &format!("SELECT 1 FROM users WHERE {column} = ?1"),
-        [value],
-        |_| Ok(()),
-    )
+fn user_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT 1 FROM users WHERE user_name = ?1", [name], |_| {
+        Ok(())
+    })
     .optional()
     .map(|r| r.is_some())
 }
@@ -358,35 +479,7 @@ pub struct UserStore {
 impl UserStore {
     /// Open an existing database; errors if it is missing or has no users.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let hint = "add users with: web-safe-block add-user < users.txt";
-        let missing = || format!("no users database at {}; {hint}", path.display());
-        if !path.exists() {
-            return Err(missing());
-        }
-        warn_if_exposed(path);
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        configure(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-            .map_err(|e| {
-                if is_no_table(&e) {
-                    missing()
-                } else {
-                    format!("cannot open {}: {e}", path.display())
-                }
-            })?;
-        if stale_schema(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))? {
-            return Err(stale_schema_err(path));
-        }
-        if count == 0 {
-            return Err(format!(
-                "users database {} has no users; {hint}",
-                path.display()
-            ));
-        }
-        init(&conn).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        Ok(UserStore {
+        open(path, OpenKind::Serve).map(|conn| UserStore {
             conn: Mutex::new(conn),
         })
     }
@@ -406,10 +499,27 @@ impl UserStore {
                  WHERE timestamp > ?1",
             )?
             .query_map([unix_secs(now)], |r| {
+                let ts: i64 = r.get(2)?;
+                let secs = u64::try_from(ts).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(e),
+                    )
+                })?;
+                let expires = UNIX_EPOCH
+                    .checked_add(Duration::from_secs(secs))
+                    .ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            "timestamp out of range".into(),
+                        )
+                    })?;
                 Ok(StoredSession {
                     cookie_string: r.get(0)?,
                     user_name: r.get(1)?,
-                    expires: UNIX_EPOCH + Duration::from_secs(r.get::<_, i64>(2)? as u64),
+                    expires,
                     created: r.get(3)?,
                 })
             })?
@@ -419,7 +529,7 @@ impl UserStore {
     /// Insert `new` and delete each `removed` cookie string, in one transaction.
     pub fn save_session(&self, new: &StoredSession, removed: &[String]) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         for cookie in removed {
             tx.execute("DELETE FROM sessions WHERE cookie_string = ?1", [cookie])?;
         }
@@ -436,19 +546,29 @@ impl UserStore {
         tx.commit()
     }
 
-    /// Delete the sessions with these cookie strings, if they exist.
+    /// Delete the sessions with these cookie strings, in one transaction.
     pub fn delete_sessions(&self, cookie_strings: &[String]) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("DELETE FROM sessions WHERE cookie_string = ?1")?;
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         for cookie in cookie_strings {
-            stmt.execute([cookie])?;
+            tx.execute("DELETE FROM sessions WHERE cookie_string = ?1", [cookie])?;
         }
-        Ok(())
+        tx.commit()
     }
 
     /// Delete sessions at or past their expiry; returns how many were removed.
+    /// Checks first so an all-live database takes no write lock at all.
     pub fn delete_expired_sessions(&self, now: SystemTime) -> rusqlite::Result<usize> {
-        self.conn.lock().unwrap().execute(
+        let conn = self.conn.lock().unwrap();
+        let any: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE timestamp <= ?1)",
+            [unix_secs(now)],
+            |r| r.get(0),
+        )?;
+        if !any {
+            return Ok(0);
+        }
+        conn.execute(
             "DELETE FROM sessions WHERE timestamp <= ?1",
             [unix_secs(now)],
         )
@@ -480,7 +600,15 @@ impl UserStore {
         // 12 MiB Argon2 run happens at a time.
         match row {
             Some((name, salt, hash, is_admin)) => {
-                Ok(hex_eq(&hash_phrase(&salt, phrase), &hash).then_some(User { name, is_admin }))
+                // A stored row whose salt cannot be hashed is a data error.
+                let computed = hash_phrase(&salt, phrase).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(hex_eq(&computed, &hash).then_some(User { name, is_admin }))
             }
             None => {
                 let _ = hash_phrase(DUMMY_SALT, phrase);
@@ -492,11 +620,7 @@ impl UserStore {
 
 /// Constant-time comparison of two same-format hash strings (hex).
 fn hex_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -529,18 +653,18 @@ mod tests {
     fn hash_is_argon2id_of_normalized() {
         // Deterministic, and the phrase is normalized before hashing.
         assert_eq!(
-            hash_phrase("aaaaaaaa", "abc"),
-            hash_phrase("aaaaaaaa", "abc")
+            hash_phrase("aaaaaaaa", "abc").unwrap(),
+            hash_phrase("aaaaaaaa", "abc").unwrap()
         );
         assert_eq!(
-            hash_phrase("aaaaaaaa", " A b C "),
-            hash_phrase("aaaaaaaa", "abc")
+            hash_phrase("aaaaaaaa", " A b C ").unwrap(),
+            hash_phrase("aaaaaaaa", "abc").unwrap()
         );
-        assert_eq!(hash_phrase("aaaaaaaa", "abc").len(), 64);
+        assert_eq!(hash_phrase("aaaaaaaa", "abc").unwrap().len(), 64);
         // Same phrase, different salts -> different hashes.
         assert_ne!(
-            hash_phrase("aaaaaaaa", "abc"),
-            hash_phrase("bbbbbbbb", "abc")
+            hash_phrase("aaaaaaaa", "abc").unwrap(),
+            hash_phrase("bbbbbbbb", "abc").unwrap()
         );
         // Known answer: computed independently via the argon2 crate.
         let params = Params::new(12 * 1024, 3, 1, Some(32)).unwrap();
@@ -553,7 +677,7 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        assert_eq!(hash_phrase("somesalt", "abc"), expected);
+        assert_eq!(hash_phrase("somesalt", "abc").unwrap(), expected);
     }
 
     #[test]
@@ -616,14 +740,14 @@ mod tests {
         assert_eq!(rows[0].1.len(), 32, "salt is 16 hex bytes");
         assert_eq!(
             rows[0].2,
-            hash_phrase(&rows[0].1, "correcthorsebatterystaple42!")
+            hash_phrase(&rows[0].1, "correcthorsebatterystaple42!").unwrap()
         );
         assert!(!rows[0].3);
         // bob may share alice's phrase, but his salt and hash differ.
         assert_eq!(rows[1].0, "bob");
         assert_eq!(
             rows[1].2,
-            hash_phrase(&rows[1].1, "correct horse battery staple 42!")
+            hash_phrase(&rows[1].1, "correct horse battery staple 42!").unwrap()
         );
         assert_ne!(rows[0].1, rows[1].1);
         assert_ne!(rows[0].2, rows[1].2);
@@ -759,6 +883,93 @@ mod tests {
     }
 
     #[test]
+    fn add_users_batch_duplicate() {
+        let conn = mem_db();
+        let mut err = Vec::new();
+        let (added, skipped) = add_users(
+            &conn,
+            "alice Correct Horse Battery 42!\nALICE Another Good Phrase 77!\n".as_bytes(),
+            &mut err,
+        )
+        .unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!((added, skipped), (1, 1), "{err}");
+        assert!(
+            err.contains("line 2: skipped: user 'ALICE' already exists"),
+            "{err}"
+        );
+    }
+
+    /// A custom BufRead that, while add_users is still reading stdin,
+    /// proves no write lock is held: a second connection with a zero busy
+    /// timeout can write to the same file database.
+    #[test]
+    fn add_users_holds_no_lock_while_reading() {
+        use std::io::Read;
+        struct WriteOnRead {
+            inner: std::io::Cursor<Vec<u8>>,
+            path: PathBuf,
+            fired: bool,
+        }
+        impl WriteOnRead {
+            fn poke(&mut self) {
+                if self.fired {
+                    return;
+                }
+                self.fired = true;
+                let conn = Connection::open(&self.path).unwrap();
+                conn.busy_timeout(Duration::ZERO).unwrap();
+                conn.execute(
+                    "INSERT INTO users (user_name, salt, pass_phrase, is_admin) \
+                     VALUES ('concurrent', 's', 'h', 0)",
+                    [],
+                )
+                .expect("concurrent write while stdin is still open");
+            }
+        }
+        impl Read for WriteOnRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.poke();
+                self.inner.read(buf)
+            }
+        }
+        impl BufRead for WriteOnRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.poke();
+                self.inner.fill_buf()
+            }
+            fn consume(&mut self, n: usize) {
+                self.inner.consume(n);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("wsb-nolock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+        let conn = open_for_add(&path).unwrap();
+        let mut err = Vec::new();
+        let (added, skipped) = add_users(
+            &conn,
+            WriteOnRead {
+                inner: std::io::Cursor::new(b"alice Correct Horse Battery 42!\n".to_vec()),
+                path: path.clone(),
+                fired: false,
+            },
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(
+            (added, skipped),
+            (1, 0),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn old_database_without_salts_rejected() {
         const OLD_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
             user_name   TEXT    NOT NULL UNIQUE,
@@ -789,8 +1000,14 @@ mod tests {
             assert!(err.contains("add-user < users.txt"), "{err}");
         }
 
-        // The database is left untouched.
+        // The database is left untouched: not even a WAL conversion.
         let conn = Connection::open(&path).unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "delete");
+        assert!(!Path::new(&format!("{}-wal", path.display())).exists());
+        assert!(!Path::new(&format!("{}-shm", path.display())).exists());
         assert!(!has_table(&conn, "sessions"));
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
@@ -961,6 +1178,26 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exposed_files_includes_wal_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wsb-exposed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(DB_FILE);
+        let conn = open_for_add(&path).unwrap();
+        assert!(exposed_files(&path).is_empty(), "fresh db is 0600");
+        // A loose -wal sidecar is reported even when the db itself is tight.
+        conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1);").unwrap();
+        let wal = sidecar(&path, "-wal");
+        assert!(wal.exists(), "wal file exists");
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(exposed_files(&path), vec![wal]);
+        drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

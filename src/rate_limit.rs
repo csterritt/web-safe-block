@@ -41,9 +41,6 @@ pub(crate) fn reserve_attempt(
         }
     }
     let v = failures.entry(key.to_string()).or_default();
-    if v.len() >= RATE_LIMIT_MAX_FAILURES {
-        v.drain(..v.len() + 1 - RATE_LIMIT_MAX_FAILURES);
-    }
     v.push(now);
     true
 }
