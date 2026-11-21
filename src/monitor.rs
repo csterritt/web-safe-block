@@ -287,8 +287,14 @@ fn probe(stream: &mut TcpStream) -> io::Result<()> {
 }
 
 /// Non-blocking read: Ok(true) at EOF, Ok(false) if nothing is pending, Err if
-/// the connection is gone. Any input from the client is discarded.
+/// the connection is gone (a read error or a pending socket error such as a
+/// reset). Any input from the client is discarded.
 fn read_eof(stream: &TcpStream) -> io::Result<bool> {
+    // Linux keeps returning EOF from read after a FIN even once the peer's
+    // RST has arrived; the reset is only visible as the pending socket error.
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
     stream.set_nonblocking(true)?;
     let mut buf = [0u8; 256];
     // Drain at most this many pending reads, so a chatty client cannot keep
