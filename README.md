@@ -40,7 +40,7 @@ EOF
 ./target/release/web-safe-block serve
 ```
 
-Then point Cloudflare Tunnel (or another TLS terminator) at `http://127.0.0.1:8080`.
+Then point Cloudflare Tunnel (or another TLS terminator) at `http://127.0.0.1:8080` — see [Running behind Cloudflare Tunnel](#running-behind-cloudflare-tunnel).
 
 Every command accepts `-c path-to-config` (before or after the command name) to use a config file other than `./config.toml`:
 
@@ -113,7 +113,7 @@ $ nc 127.0.0.1 8081
   - `upgrade`: authenticated request with an `Upgrade` header; answered 501.
   - `reserved`: an unknown `/__wsb/` path.
   - `other`: e.g. wrong method or a malformed form.
-- `ip` is `CF-Connecting-IP` if present, otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page`, `logout` and `logout_error`. `truncated` is true when `path` (1024 bytes), `user_agent` (512 bytes) or `method` (32 bytes) was cut to its cap.
+- `ip` is `CF-Connecting-IP` if present and the connection comes from a loopback address (the tunnel), otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page`, `logout` and `logout_error`. `truncated` is true when `path` (1024 bytes), `user_agent` (512 bytes) or `method` (32 bytes) was cut to its cap.
 - The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor — at most 100 events per write — and marks them consumed only after they have been written. The queue also has a ~4 MiB total byte budget.
 - When the queue is full, the oldest events are overwritten.
   - With no monitor connected this happens silently. A monitor that connects later first receives whatever is still queued.
@@ -125,7 +125,7 @@ $ nc 127.0.0.1 8081
 
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
 - The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped. Gated responses are always marked `Cache-Control: private` (`public`, `s-maxage`, `proxy-revalidate` and CDN override headers are removed) so shared caches cannot serve them to another client. Do NOT configure edge rules that override origin cache-control for this hostname (e.g. Cloudflare Cache Rules with "Ignore cache-control header" or an Edge TTL override); use a cache bypass rule if in doubt.
-- Login attempts are limited to 10 failures per 15 minutes per client (keyed on `CF-Connecting-IP`, falling back to the peer IP; IPv6 clients are keyed on their /64 network), with a 1s delay on each failure. At most 32 logins may be waiting for the Argon2 hash slot at once — extras get a 503 "Server busy" page instead of queueing. Because `CF-Connecting-IP` is trusted, don't expose `listen_addr` anywhere except to the tunnel.
+- Login attempts are limited to 10 failures per 15 minutes per client (keyed on the client IP — see [Client IP](#client-ip); IPv6 clients are keyed on their /64 network), with a 1s delay on each failure. At most 32 logins may be waiting for the Argon2 hash slot at once — extras get a 503 "Server busy" page instead of queueing.
 - Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest, by a persisted creation stamp, is dropped) and 10,000 in total are kept. Every users.db created before the current schema is rejected, so no sessions outlive the change to 180-day TTLs — users are re-added anyway.
 - Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
 - Client connections have 30 seconds to send their request headers, and a write to the client may stall for at most 60 seconds — a client that stops reading loses its connection (and its upstream slot). Upstream requests time out after 10s to connect and 60s waiting for response headers (504); a response body that stalls for 60s is cut off with an error. At most 256 requests are in flight upstream at once; further requests are answered 503.
@@ -134,6 +134,48 @@ $ nc 127.0.0.1 8081
 - WebSockets and other protocol upgrades are not supported in v1; authenticated requests with an `Upgrade` header are answered 501 and never forwarded.
 - Paths under `/__wsb/` are reserved and never forwarded.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.
+
+#### Client IP
+
+The client IP is used for the login rate limit, the monitor's `ip` field and the `X-Forwarded-For` header sent upstream. Behind Cloudflare Tunnel every connection comes from `cloudflared` on `127.0.0.1`, so the real visitor address has to come from the `CF-Connecting-IP` header that Cloudflare sets.
+
+That header is only believed when the TCP connection comes from a **loopback address** (`127.0.0.0/8`, `::1`, or `::ffff:127.x.x.x`) — i.e. from `cloudflared` (or another proxy) on the same machine. A connection from any other address is identified by its own address and its `CF-Connecting-IP` is ignored, so a client that reaches `listen_addr` directly cannot pick a fresh fake IP per request to dodge the rate limit or forge log entries.
+
+Consequences:
+
+- Run `cloudflared` on the same machine as web-safe-block. A tunnel on another host or in a Docker container (peer e.g. `172.17.0.1`) is not loopback: every visitor would share that one address — one rate-limit budget, one IP in the logs.
+- Any local process can still set `CF-Connecting-IP`; on a shared machine, treat local users as trusted.
+- `serve` prints a warning at startup if `listen_addr` is not a loopback address. It still runs, but keep the default `127.0.0.1:8080` unless you have a reason not to.
+
+#### Running behind Cloudflare Tunnel
+
+The tunnel connects *outward* from your server to Cloudflare, so no inbound port needs to be open — only SSH, if you use it. With [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) installed on the same machine:
+
+```sh
+cloudflared tunnel login                         # pick your domain in the browser
+cloudflared tunnel create wsb                    # prints a tunnel UUID, writes ~/.cloudflared/<UUID>.json
+cloudflared tunnel route dns wsb magazine.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <UUID>
+credentials-file: /home/<you>/.cloudflared/<UUID>.json
+ingress:
+  - hostname: magazine.example.com
+    service: http://127.0.0.1:8080      # web-safe-block's listen_addr
+  - service: http_status:404
+```
+
+Try it with `cloudflared tunnel run wsb`, then install it as a service with `sudo cloudflared service install` (which copies the config to `/etc/cloudflared/`). A dashboard-managed tunnel works the same way: set the public hostname's service to `http://127.0.0.1:8080`.
+
+Checklist:
+
+- `listen_addr = "127.0.0.1:8080"` and the protected app bound to `127.0.0.1:3000`.
+- No firewall rule letting 8080 or 3000 in from outside.
+- `cookie_secure = true` — visitors reach the site over https at Cloudflare.
+- No Cloudflare cache rule that overrides origin cache-control for this hostname (see above).
 
 #### Threat model and rotation
 

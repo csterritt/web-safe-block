@@ -9,7 +9,7 @@ The nouns, one line each. Edited by hand; everything else in this folder is gene
 - **the gate** — the public listener and its handlers: phrase form, login, logout, session check, forward-or-refuse
 - **upstream** — the protected web server, always `http://` on loopback; only reachable through the gate
 - **the tunnel** — the TLS terminator in front of the public port (e.g. Cloudflare Tunnel); stamps `CF-Connecting-IP`
-- **client IP** — `CF-Connecting-IP` when present and parseable, else the TCP peer address; used for rate limiting and event logs
+- **client IP** — `CF-Connecting-IP` when the TCP peer is loopback (the tunnel) and the header parses, else the TCP peer address; used for rate limiting, event logs and `X-Forwarded-For`
 - **reserved namespace** — `/__wsb/*`: login, logout, and nothing else; never forwarded upstream
 - **failure ledger** — the per-client-IP list of recent failed logins; 10 within 15 minutes → "too many attempts"
 - **event** — one record per request: `{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}`; pushed to the bounded queue (count + ~4 MiB)

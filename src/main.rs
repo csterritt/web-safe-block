@@ -148,6 +148,12 @@ fn serve(settings: Settings) -> ExitCode {
         settings.monitor_addr,
         settings.monitor_queue_len,
     );
+    if !settings.listen_addr.ip().is_loopback() {
+        eprintln!(
+            "web-safe-block: warning: listen_addr {} is not a loopback address; CF-Connecting-IP is only trusted from loopback peers, so clients reaching it directly are rate-limited by their own address",
+            settings.listen_addr
+        );
+    }
     // Everything that can fail runs before the monitor thread starts.
     let config = match UserStore::open(&settings.users_db) {
         Ok(users) => web_safe_block::Config::new(&settings, users),

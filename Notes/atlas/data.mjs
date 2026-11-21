@@ -9,7 +9,7 @@ export const META = {
   outDir: '.',                            // generated files land in Notes/atlas/, next to this source
   stats: [
     { k: 'System', v: 'rust · axum 0.8 + hyper 1' },
-    { k: 'Source', v: '~3,600 LOC · ~1,800 tests' },
+    { k: 'Source', v: '~2,900 LOC · ~3,300 tests' },
     { k: 'Seats', v: '1 public port · 1 monitor' },
   ],
   intro: `_**This file is the living source of truth for the design.** The interactive atlas (\`atlas.html\`) is built from the same data; edit this file and rebuild, never the outputs._`,
@@ -57,7 +57,7 @@ export const DECISIONS = [
   { axis: 'Phrase storage', decision: 'Per-user salted Argon2id (12 MiB, t=3, p=1, 32-byte out) of the normalized phrase, looked up by user name — unknown names still cost one hash against a dummy salt; ≥20 chars + digit + punctuation enforced at add time', adr: '[0001](./adr/0001-phrase-is-the-credential.md)' },
   { axis: 'Sessions', decision: 'Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total with earliest-created evicted; the db write lands before the map mutates; reload at startup and on the 60s purge tick picks up remove-user', adr: '[0006](./adr/0006-sessions-persisted.md)' },
   { axis: 'Hash work', decision: 'Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time', adr: '—' },
-  { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted when it parses as an IP, else the TCP peer — listen_addr must only ever face the tunnel', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
+  { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
   { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y', adr: '[0004](./adr/0004-strict-config.md)' },
   { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten', adr: '[0005](./adr/0005-one-monitor.md)' },
   { axis: 'Upstream', decision: 'http:// only, no path — the protected app stays on loopback', adr: '—' },
@@ -90,14 +90,14 @@ export const NODES = [
   { id: 'CF', code: 'T', name: 'TLS terminator', short: 'TUNNEL', group: 'edge', gx: 3.5, gy: 4.5, w: 2, d: 2, h: 40, kind: 'box',
     one: 'Cloudflare Tunnel (or any TLS front) — the only road in.',
     what: 'TLS is not web-safe-block\'s job. A tunnel or reverse proxy holds the certificate and forwards plain http to the public port, stamping the real client IP in a header.',
-    how: 'Forwards to <code>listen_addr</code> (default <code>127.0.0.1:8080</code>) and sets <code>CF-Connecting-IP</code>, which the gate reads <mark>and trusts when it parses as an IP</mark> (else the TCP peer) for client IP, rate limiting, and event logs.',
+    how: 'Forwards to <code>listen_addr</code> (default <code>127.0.0.1:8080</code>) and sets <code>CF-Connecting-IP</code>, which the gate trusts <mark>only when the TCP peer is loopback</mark> — i.e. cloudflared on the same machine — and the value parses as an IP; from any other peer the header is ignored and the peer address is used for client IP, rate limiting, and event logs.',
     steps: [
       ['Terminate', 'TLS ends here; onward hop is plain http.'],
       ['Stamp', 'Adds CF-Connecting-IP with the real client address.'],
       ['Forward', 'Sends the request to listen_addr.'],
     ],
     cond: [
-      'If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel\'s peer address?',
+      { q: 'If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel\'s peer address?', r: 'Yes, option A: the header is honored only from a loopback peer (127.0.0.0/8, ::1, IPv4-mapped loopback), with no new config setting; other peers are keyed on their own address, and serve warns at startup when listen_addr is not loopback. cloudflared must run on the same machine (2026-11-21).' },
     ] },
   // ---- The gate ----
   { id: 'G', code: 'G', name: 'The gate', short: 'GATE', group: 'gate', gx: 7, gy: 3, w: 3, d: 2.5, h: 56, kind: 'gate',
@@ -345,7 +345,7 @@ export const CH = [
     ] },
   { id: 'throttle', title: 'Slowing down guessing', reveal: ['R'],
     lede: `Wrong phrase? Ten tries per quarter-hour per client — and each miss costs a second.`,
-    story: `<p>Failures are counted per <mark>client IP</mark> (the tunnel's header first, the peer address as fallback) in a bounded ledger. The attempt is reserved before the lookup, so concurrency can't slip extra tries through.</p>`,
+    story: `<p>Failures are counted per <mark>client IP</mark> (the tunnel's header when the connection comes from the tunnel on loopback, otherwise the peer address) in a bounded ledger. The attempt is reserved before the lookup, so concurrency can't slip extra tries through.</p>`,
     flow: [
       ['BR', 'G', 'POST wrong phrase', { form: { user: 'chris', phrase: 'let me in' } }],
       ['G', 'R', 'reserve attempt', { key: '203.0.113.9' }],

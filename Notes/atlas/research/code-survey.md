@@ -75,3 +75,5 @@ Resolves Q-S1; the ghost P "saved sessions" node is built and removed from the m
 - `sessions.rs` — `Session.expires` is `SystemTime`; `hash_token` = hex SHA-256 (the map key and `cookie_string`; raw tokens never stored); `insert_session` returns evicted keys; `reload_sessions` rebuilds the map from live DB rows.
 - `auth.rs` — login inserts under the sessions lock and saves to the DB before replying (save failure → refund + 500 `login_error`); logout deletes the hash from map and DB.
 - `state.rs`/`app.rs` — `max_sessions_per_user` default 3; `Limits.purge_interval` (default 60s) drives the purger, which reloads sessions from the DB each tick (picking up `remove-user` deletions) instead of just sweeping memory. `build_router` returns `Result<Router, String>` and loads sessions at startup.
+
+- 2026-11-21: Q-T1 resolved — `client_ip` now honors `CF-Connecting-IP` only from loopback peers (ADR 0003 amended).

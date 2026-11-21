@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **9 open · 14 resolved**._
+_Question status: **8 open · 15 resolved**._
 
 ## One paragraph
 
@@ -17,7 +17,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Phrase storage | Per-user salted Argon2id (12 MiB, t=3, p=1, 32-byte out) of the normalized phrase, looked up by user name — unknown names still cost one hash against a dummy salt; ≥20 chars + digit + punctuation enforced at add time | [0001](./adr/0001-phrase-is-the-credential.md) |
 | Sessions | Write-through to a sessions table in users.db (SHA-256 of the token only), in-memory map as cache, 3/user and 10k total with earliest-created evicted; the db write lands before the map mutates; reload at startup and on the 60s purge tick picks up remove-user | [0006](./adr/0006-sessions-persisted.md) |
 | Hash work | Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time | — |
-| Client IP | CF-Connecting-IP is trusted when it parses as an IP, else the TCP peer — listen_addr must only ever face the tunnel | [0003](./adr/0003-trusted-edge-header.md) |
+| Client IP | CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback | [0003](./adr/0003-trusted-edge-header.md) |
 | Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y | [0004](./adr/0004-strict-config.md) |
 | Monitor | One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
 | Upstream | http:// only, no path — the protected app stays on loopback | — |
@@ -75,7 +75,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** TLS is not web-safe-block's job. A tunnel or reverse proxy holds the certificate and forwards plain http to the public port, stamping the real client IP in a header.
 
-**How it's built.** Forwards to `listen_addr` (default `127.0.0.1:8080`) and sets `CF-Connecting-IP`, which the gate reads **and trusts when it parses as an IP** (else the TCP peer) for client IP, rate limiting, and event logs.
+**How it's built.** Forwards to `listen_addr` (default `127.0.0.1:8080`) and sets `CF-Connecting-IP`, which the gate trusts **only when the TCP peer is loopback** — i.e. cloudflared on the same machine — and the value parses as an IP; from any other peer the header is ignored and the peer address is used for client IP, rate limiting, and event logs.
 
 **Steps in execution.**
 
@@ -85,7 +85,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- **Q-T1** If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel's peer address?
+- ~~**Q-T1** If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel's peer address?~~ ✓ Yes, option A: the header is honored only from a loopback peer (127.0.0.0/8, ::1, IPv4-mapped loopback), with no new config setting; other peers are keyed on their own address, and serve warns at startup when listen_addr is not loopback. cloudflared must run on the same machine (2026-11-21).
 
 ### The gate
 
@@ -372,7 +372,7 @@ Payload shapes are what the design implies, not measured traffic.
 
 Reference by ID. ✓ resolved (with date) · otherwise open.
 
-- **Q-T1** (T) If listen_addr is ever exposed directly, CF-Connecting-IP becomes attacker-controlled — should the gate only honor it from the tunnel's peer address?
+- ~~**Q-T1**~~ (T) ✓ Yes, option A: the header is honored only from a loopback peer (127.0.0.0/8, ::1, IPv4-mapped loopback), with no new config setting; other peers are keyed on their own address, and serve warns at startup when listen_addr is not loopback. cloudflared must run on the same machine (2026-11-21).
 - ~~**Q-G1**~~ (G) ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
 - **Q-G2** (G) Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
 - ~~**Q-G3**~~ (G) ✓ Fixed — owned hash_slot (and session_writes) guards now move inside the blocking closures, so a cancelled request cannot release them early; at most 32 logins may queue for the slot, extras get 503 login_busy (review-4 finding 1, fixed).

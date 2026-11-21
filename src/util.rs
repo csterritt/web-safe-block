@@ -227,13 +227,20 @@ pub(crate) fn clear_cookie_header(secure: bool) -> String {
     s
 }
 
-/// The client IP: `CF-Connecting-IP` when it parses, else the TCP peer.
+/// The client IP: `CF-Connecting-IP` when the TCP peer is loopback (the
+/// header is only trustworthy from a local reverse proxy such as
+/// cloudflared) and it parses, else the TCP peer.
 fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<std::net::IpAddr> {
-    headers
-        .get("CF-Connecting-IP")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-        .or_else(|| peer.map(|a| a.ip()))
+    let peer_ip = peer.map(|a| a.ip().to_canonical());
+    if peer_ip.is_some_and(|ip| ip.is_loopback())
+        && let Some(ip) = headers
+            .get("CF-Connecting-IP")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return Some(ip);
+    }
+    peer_ip
 }
 
 pub(crate) fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
@@ -243,8 +250,9 @@ pub(crate) fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> Strin
 }
 
 /// The rate-limit key for a request: the same IP source as `client_key`
-/// (canonicalized, so an IPv4-mapped IPv6 address is a plain IPv4 key),
-/// except IPv6 addresses share one key per /64 network.
+/// (`CF-Connecting-IP` only from loopback peers; canonicalized, so an
+/// IPv4-mapped IPv6 address is a plain IPv4 key), except IPv6 addresses
+/// share one key per /64 network.
 pub(crate) fn rate_limit_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     match client_ip(headers, peer).map(|i| i.to_canonical()) {
         Some(std::net::IpAddr::V4(v4)) => v4.to_string(),
@@ -587,10 +595,12 @@ mod tests {
 
     #[test]
     fn client_key_requires_ip_header() {
-        let peer = "9.9.9.9:1234".parse().unwrap();
+        // Loopback peer: the header is trusted, so garbage falls back
+        // to the peer and a valid value wins.
+        let peer = "127.0.0.1:1234".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert("cf-connecting-ip", HeaderValue::from_static("not an ip"));
-        assert_eq!(client_key(&h, Some(peer)), "9.9.9.9");
+        assert_eq!(client_key(&h, Some(peer)), "127.0.0.1");
         h.insert(
             "cf-connecting-ip",
             HeaderValue::from_static(" 203.0.113.5 "),
@@ -613,18 +623,43 @@ mod tests {
         // IPv4-mapped IPv6 is a plain IPv4 key.
         let mapped: SocketAddr = "[::ffff:203.0.113.5]:80".parse().unwrap();
         assert_eq!(rate_limit_key(&h, Some(mapped)), "203.0.113.5");
-        // CF-Connecting-IP is used when present, canonicalized too.
+        // CF-Connecting-IP is used when present, canonicalized too —
+        // but only from a loopback peer.
+        let loopback: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert(
             "cf-connecting-ip",
             HeaderValue::from_static("::ffff:203.0.113.5"),
         );
-        assert_eq!(rate_limit_key(&h, Some(v4)), "203.0.113.5");
+        assert_eq!(rate_limit_key(&h, Some(loopback)), "203.0.113.5");
         h.insert(
             "cf-connecting-ip",
             HeaderValue::from_static("2001:0DB8:0001:0002::99"),
         );
-        assert_eq!(rate_limit_key(&h, Some(v4)), "2001:db8:1:2::/64");
+        assert_eq!(rate_limit_key(&h, Some(loopback)), "2001:db8:1:2::/64");
         assert_eq!(rate_limit_key(&HeaderMap::new(), None), "unknown");
+    }
+
+    #[test]
+    fn cf_connecting_ip_only_from_loopback() {
+        let mut h = HeaderMap::new();
+        h.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.7"));
+        // A non-loopback peer cannot set the header: its own IP is used.
+        let public: SocketAddr = "9.9.9.9:1234".parse().unwrap();
+        assert_eq!(client_key(&h, Some(public)), "9.9.9.9");
+        assert_eq!(rate_limit_key(&h, Some(public)), "9.9.9.9");
+        // Loopback peers (v4, v6, v4-mapped-v6) trust the header.
+        let v4loop: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(client_key(&h, Some(v4loop)), "203.0.113.7");
+        let v6loop: SocketAddr = "[::1]:1234".parse().unwrap();
+        assert_eq!(client_key(&h, Some(v6loop)), "203.0.113.7");
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:1234".parse().unwrap();
+        assert_eq!(client_key(&h, Some(mapped)), "203.0.113.7");
+        // A public IPv6 peer is rate-limited by its own /64, not the header.
+        let v6: SocketAddr = "[2001:db8::5]:1234".parse().unwrap();
+        assert_eq!(rate_limit_key(&h, Some(v6)), "2001:db8::/64");
+        // No peer at all: no header trust, so the key is "unknown".
+        assert_eq!(client_key(&h, None), "unknown");
+        assert_eq!(rate_limit_key(&h, None), "unknown");
     }
 }
