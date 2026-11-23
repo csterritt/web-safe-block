@@ -2174,3 +2174,61 @@ async fn robots_txt() {
     let kinds: Vec<serde_json::Value> = (0..3).map(|_| m.event()["kind"].clone()).collect();
     assert_eq!(kinds, ["robots", "login_succeeded", "robots"], "{kinds:?}");
 }
+
+/// serve under `umask 000` still creates the monitor unix socket with mode
+/// 0600, and a client can connect and read it.
+#[cfg(unix)]
+#[test]
+fn cli_unix_monitor_socket() {
+    use std::io::BufReader;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = config_dir();
+    let config = dir.join("config.toml");
+    let sock = dir.join("m.sock");
+    edit_config(
+        &config,
+        "monitor_addr",
+        &format!("monitor_addr = \"unix:{}\"", sock.display()),
+    );
+    edit_config(
+        &config,
+        "listen_addr",
+        &format!("listen_addr = \"127.0.0.1:{}\"", free_port()),
+    );
+    assert!(
+        run_add_user(&dir, "alice Correct-Horse-Battery-42\n")
+            .status
+            .success()
+    );
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("umask 000; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_web-safe-block"))
+        .arg("serve")
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sock.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "monitor socket never appeared"
+        );
+        assert!(child.try_wait().unwrap().is_none(), "serve exited early");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(sock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+    let s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("\"daily_counts\""), "{line}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

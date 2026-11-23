@@ -77,22 +77,31 @@ impl fmt::Display for Upstream {
 
 #[cfg(unix)]
 fn unix_upstream(rest: &str) -> Result<PathBuf, String> {
+    unix_socket_path("upstream", rest)
+}
+
+/// Validate the part after `unix:`: an absolute path with no NUL bytes.
+/// `setting` names the config key in error messages.
+#[cfg(unix)]
+pub(crate) fn unix_socket_path(setting: &str, rest: &str) -> Result<PathBuf, String> {
     if rest.is_empty() {
-        return Err("upstream unix: requires a path: unix:/absolute/path".into());
+        return Err(format!(
+            "{setting} unix: requires a path: unix:/absolute/path"
+        ));
     }
     if rest.starts_with('/') && !rest[1..].starts_with('/') {
         if rest.contains('\0') {
-            return Err("upstream unix path must not contain NUL bytes".into());
+            return Err(format!("{setting} unix path must not contain NUL bytes"));
         }
         return Ok(PathBuf::from(rest));
     }
     if rest.starts_with("//") {
         return Err(format!(
-            "upstream unix socket uses unix:/absolute/path, not unix://{rest}"
+            "{setting} unix socket uses unix:/absolute/path, not unix://{rest}"
         ));
     }
     Err(format!(
-        "upstream unix path must be absolute (unix:/absolute/path), got unix:{rest:?}"
+        "{setting} unix path must be absolute (unix:/absolute/path), got unix:{rest:?}"
     ))
 }
 

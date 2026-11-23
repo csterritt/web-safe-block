@@ -60,7 +60,7 @@ Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `s
 | `front_page_message` | `"Site Description Here"` | Plain text in a paragraph above the sign-in form (HTML is escaped; empty shows nothing). |
 | `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime; at most 10 years (315360000). |
 | `cookie_secure`     | `true`                    | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
-| `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor port. Must be a loopback address. |
+| `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor: a loopback address, or `unix:/absolute/path.sock` (created 0600 — only the user running web-safe-block can connect). The directory must exist; a stale socket file left by a previous run is replaced. |
 | `monitor_queue_len` | `100`                     | How many unreported events are kept. |
 
 #### `write-config`
@@ -124,6 +124,7 @@ $ nc 127.0.0.1 8081
 - On connect, before any queued events, the monitor gets one `daily_counts` line per retained UTC day (oldest first, at most 7 days) — security counters kept in memory only, so a restart resets them (`since` is the process start time for the day it started, midnight for later days). While a monitor stays connected, each day that ends at 00:00 UTC is sent again with `"final":true`. Fields, in order: `login_succeeded`, `login_failed`, `unauth_non_root` (unauthenticated requests for a path other than `/` outside `/__wsb/` — probes looking for the app), `rate_limited`, `login_busy`, `forbidden`, `reserved`, `other`, `login_error`, `logout_error`, `dropped_unseen`.
 - Only one monitor can be connected at a time. Another connection gets `{"error":"another monitor is already connected"}` and is closed.
 - If the monitor client stops sending (e.g. `nc 127.0.0.1 8081 < /dev/null`), it gets a `{"kind":"heartbeat",...}` line every 10s while idle; this is how the server finds out when it has gone away.
+- `monitor_addr` can instead be a unix socket, `unix:/absolute/path.sock`, read with `nc -U /run/web-safe-block/monitor.sock` or `socat - UNIX-CONNECT:…`. The socket is created mode `0600` inside an existing directory (a stale socket file from a previous run is replaced; a live one or a non-socket is an error), so only the OS user running web-safe-block can connect. Prefer it on a shared machine: with a TCP port any local process — including the protected app — can watch who logs in or hold the single slot, leaving you with "already connected". Put it somewhere private such as `/run/web-safe-block/` (e.g. systemd `RuntimeDirectory=web-safe-block`).
 
 ### Security notes
 
@@ -145,6 +146,14 @@ $ nc 127.0.0.1 8081
 `upstream` also accepts a unix domain socket: `unix:/absolute/path.sock`. The path must be absolute (`unix:run/app.sock` and `unix://run/app.sock` are rejected). The socket is not checked at startup — the app may start after the gate; if the socket is missing when a request comes in, the visitor gets a 502 and the error is logged to stderr. The user web-safe-block runs as needs read+write permission on the socket file.
 
 Why use it: a loopback TCP port can be reached by **any** local process, bypassing the gate entirely. A socket with mode `0660` owned by a group shared only by the app and web-safe-block cannot be opened by other local users. Requests are sent with the visitor's `Host` header and the same `X-Forwarded-*` headers as over http.
+
+#### Run the protected app as a separate user
+
+The app is the thing you don't trust — if it runs as the same OS user as web-safe-block, every local protection above is already lost. It can read `config.toml` and `users.db` (including the `-wal`/`-shm` sidecars), connect to the monitor socket or port and watch who logs in, talk to anything else the gate's user can reach (including a unix upstream's peer), and attach a debugger to the gate. Run it under its own user:
+
+- Create two system users, e.g. `useradd --system --no-create-home wsb` and `useradd --system --no-create-home app`.
+- Run web-safe-block as `wsb`, with `config.toml` and `users.db` owned by `wsb` mode `0600` (and the monitor on a unix socket — see above).
+- Run the app as `app`. For a unix upstream, have the app create its socket mode `0660` in a group shared only with `wsb` (or add `wsb` to the app's socket group); a loopback TCP upstream on a shared machine is reachable by every local user regardless.
 
 #### Client IP
 

@@ -59,7 +59,7 @@ export const DECISIONS = [
   { axis: 'Hash work', decision: 'Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time', adr: '—' },
   { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
   { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y', adr: '[0004](./adr/0004-strict-config.md)' },
-  { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten', adr: '[0005](./adr/0005-one-monitor.md)' },
+  { axis: 'Monitor', decision: 'One loopback or unix-socket (0600) JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten', adr: '[0005](./adr/0005-one-monitor.md)' },
   { axis: 'Upstream', decision: 'http:// (no path) or unix:/absolute/path socket — the protected app stays on the same machine', adr: '—' },
   { axis: 'Reserved paths', decision: '/__wsb/* is never forwarded; cross-site POSTs to it are rejected', adr: '—' },
   { axis: 'Crawlers', decision: '/robots.txt is answered by the gate with Disallow: / for every agent and never forwarded', adr: '—' },
@@ -205,7 +205,7 @@ export const NODES = [
   { id: 'C', code: 'C', name: 'CLI & config', short: 'CLI+CONFIG', group: 'ops', gx: 2, gy: 0.5, w: 2.5, d: 2, h: 30, kind: 'cards',
     one: 'Five commands and one strict config file.',
     what: 'The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.',
-    how: '<code>src/main.rs</code> + <code>src/settings.rs</code>. Eight settings, <mark>all required, unknown keys denied</mark>: users_db, listen_addr (a literal IP:port), upstream, front_page_message, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file\'s directory.',
+    how: '<code>src/main.rs</code> + <code>src/settings.rs</code>. Eight settings, <mark>all required, unknown keys denied</mark>: users_db, listen_addr (a literal IP:port), upstream, front_page_message, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback, or unix:/path created 0600), monitor_queue_len (≥1). Relative users_db resolves against the config file\'s directory.',
     steps: [
       ['write-config', 'Emit defaults with comments; refuse to overwrite an existing file.'],
       ['add-user', 'Per stdin line: first word = name, rest = phrase; weak or duplicate lines skipped; any skip fails the exit code.'],
@@ -231,15 +231,15 @@ export const NODES = [
   { id: 'MO', code: 'M', name: 'Monitor port', short: 'MONITOR', group: 'ops', gx: 13, gy: 10, w: 2, d: 2, h: 26, kind: 'screen',
     one: 'One loopback TCP client at a time gets the live JSON-lines feed.',
     what: 'A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.',
-    how: 'Plain <code>TcpListener</code> on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get <code>{"error":"another monitor is already connected"}</code> — <mark>never the counters</mark>. On connect the client first receives one <code>daily_counts</code> line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with <code>"final":true</code>. Once a client half-closes, a <code>heartbeat</code> line every 10s probes for gone-aways — a reset frees the slot.',
+    how: 'Plain listener on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>, or <code>unix:/absolute/path.sock</code> — bound inside a private temp dir, chmod 0600, renamed into place, so only the gate\'s own user can ever connect; a stale socket is replaced, a live one is refused) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get <code>{"error":"another monitor is already connected"}</code> — <mark>never the counters</mark>. On connect the client first receives one <code>daily_counts</code> line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with <code>"final":true</code>. Once a client half-closes, a <code>heartbeat</code> line every 10s probes for gone-aways — a reset frees the slot.',
     steps: [
-      ['Accept', 'One slot: try_connect or send the busy error and close.'],
+      ['Accept', 'TCP or unix socket (created 0600 in a private dir, renamed in); one slot: try_connect or send the busy error and close.'],
       ['Report', 'Write the retained days\' daily_counts lines first.'],
       ['Stream', 'Wait for pending events; write JSON lines + dropped notices; a finished day\'s final counts go out at 00:00 UTC.'],
       ['Probe', 'After EOF on reads, heartbeat every 10s; a reset ends the connection.'],
     ],
     cond: [
-      'The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?',
+      { q: 'The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?', r: 'Yes, by file permissions rather than a token — monitor_addr = "unix:/absolute/path.sock" is created 0600, so only the gate\'s own user can watch or hold the slot; TCP loopback stays allowed. Run the protected app as a separate OS user (README) (2026-11-23).' },
     ] },
   // ---- Not switched on ----
   { id: 'WS', code: 'W', name: 'WebSocket relay', short: 'WEBSOCKETS', group: 'off', ghost: true, gx: 17, gy: 5.5, w: 2, d: 2, h: 34, kind: 'box',
@@ -415,5 +415,5 @@ export const HOW_HTML = `<div class="eyebrow">web-safe-block · v0.1</div><h1 cl
   OS thread     ─ monitor listener + per-client threads
   hyper client  ─ upstream, 10s connect / 60s headers / 60s body-idle · ≤256 live</pre>
 <h3 class="sec">Ports</h3><pre>listen_addr   127.0.0.1:8080  public (via tunnel)
-monitor_addr  127.0.0.1:8081  loopback only
+monitor_addr  127.0.0.1:8081  loopback or unix socket (0600)
 upstream      127.0.0.1:3000  the protected app</pre>`;

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::monitor::MonitorAddr;
 use crate::upstream::Upstream;
 
 pub const CONFIG_FILE: &str = "config.toml";
@@ -33,7 +34,8 @@ session_ttl_secs = 15552000
 # testing on a non-localhost hostname.
 cookie_secure = true
 
-# Local monitor port; must be a loopback address.
+# Local monitor: a loopback address, or unix:/absolute/path.sock (created
+# with mode 0600, only this user can connect).
 monitor_addr = "127.0.0.1:8081"
 
 # How many unreported events the monitor queue keeps.
@@ -49,7 +51,7 @@ struct RawSettings {
     front_page_message: String,
     session_ttl_secs: u64,
     cookie_secure: bool,
-    monitor_addr: SocketAddr,
+    monitor_addr: String,
     monitor_queue_len: usize,
 }
 
@@ -62,7 +64,7 @@ pub struct Settings {
     pub front_page_message: String,
     pub session_ttl_secs: u64,
     pub cookie_secure: bool,
-    pub monitor_addr: SocketAddr,
+    pub monitor_addr: MonitorAddr,
     pub monitor_queue_len: usize,
 }
 
@@ -93,12 +95,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     let bad = |msg: String| format!("invalid config file {}: {msg}", path.display());
 
     let upstream: Upstream = raw.upstream.parse().map_err(&bad)?;
-    if !raw.monitor_addr.ip().is_loopback() {
-        return Err(bad(format!(
-            "monitor_addr must be a loopback address, got {}",
-            raw.monitor_addr
-        )));
-    }
+    let monitor_addr: MonitorAddr = raw.monitor_addr.parse().map_err(&bad)?;
     if raw.users_db.as_os_str().is_empty() {
         return Err(bad("users_db must not be empty".into()));
     }
@@ -124,7 +121,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         front_page_message: raw.front_page_message,
         session_ttl_secs: raw.session_ttl_secs,
         cookie_secure: raw.cookie_secure,
-        monitor_addr: raw.monitor_addr,
+        monitor_addr,
         monitor_queue_len: raw.monitor_queue_len,
     })
 }
@@ -290,6 +287,30 @@ mod tests {
             ("upstream = \"unix://run/app.sock\"", "unix:/absolute/path"),
         ] {
             let err = load_str(&replace("upstream", line)).unwrap_err();
+            assert!(err.contains(needle), "{line}: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitor_addr_unix_socket() {
+        let s = load_str(&replace(
+            "monitor_addr",
+            "monitor_addr = \"unix:/run/wsb/monitor.sock\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            s.monitor_addr,
+            crate::monitor::MonitorAddr::Unix(Path::new("/run/wsb/monitor.sock").into())
+        );
+
+        for (line, needle) in [
+            ("monitor_addr = \"unix:\"", "unix:/absolute/path"),
+            ("monitor_addr = \"unix:rel/x.sock\"", "absolute"),
+            ("monitor_addr = \"unix://x\"", "unix:/absolute/path"),
+            ("monitor_addr = \"not an addr\"", "monitor_addr"),
+        ] {
+            let err = load_str(&replace("monitor_addr", line)).unwrap_err();
             assert!(err.contains(needle), "{line}: {err}");
         }
     }

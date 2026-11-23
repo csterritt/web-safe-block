@@ -13,5 +13,5 @@ The monitor is a debugging peephole, not a metrics pipeline. One client keeps or
 ## Trade-off accepted
 
 - Only one watcher at a time (no fan-out).
-- Events dropped while nobody is watching vanish silently; open question Q-Q1 asks whether that count should be surfaced to the next monitor.
-- Loopback is the only access control; open question Q-M1 asks whether any local process should be able to watch.
+- Events dropped while nobody is watching vanish silently; open question Q-Q1 asks whether that count should be surfaced to the next monitor. (Resolved 2026-11-23: they are counted in the per-day `dropped_unseen` counter sent as `daily_counts` on connect.)
+- Loopback is the only access control; open question Q-M1 asks whether any local process should be able to watch. (Resolved 2026-11-23: `monitor_addr` may be `unix:/absolute/path.sock`, created mode 0600, so only the gate's own OS user can watch or hold the slot.)

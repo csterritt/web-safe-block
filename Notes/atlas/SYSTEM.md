@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **5 open · 18 resolved**._
+_Question status: **4 open · 19 resolved**._
 
 ## One paragraph
 
@@ -19,7 +19,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Hash work | Argon2 runs are serialized through hash_slot on the blocking pool — at most one ~12 MiB hash at a time | — |
 | Client IP | CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback | [0003](./adr/0003-trusted-edge-header.md) |
 | Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y | [0004](./adr/0004-strict-config.md) |
-| Monitor | One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
+| Monitor | One loopback or unix-socket (0600) JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
 | Upstream | http:// (no path) or unix:/absolute/path socket — the protected app stays on the same machine | — |
 | Reserved paths | /__wsb/* is never forwarded; cross-site POSTs to it are rejected | — |
 | Crawlers | /robots.txt is answered by the gate with Disallow: / for every agent and never forwarded | — |
@@ -239,7 +239,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.
 
-**How it's built.** `src/main.rs` + `src/settings.rs`. Eight settings, **all required, unknown keys denied**: users_db, listen_addr (a literal IP:port), upstream, front_page_message, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file's directory.
+**How it's built.** `src/main.rs` + `src/settings.rs`. Eight settings, **all required, unknown keys denied**: users_db, listen_addr (a literal IP:port), upstream, front_page_message, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback, or unix:/path created 0600), monitor_queue_len (≥1). Relative users_db resolves against the config file's directory.
 
 **Steps in execution.**
 
@@ -277,18 +277,18 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.
 
-**How it's built.** Plain `TcpListener` on `monitor_addr` (**loopback enforced in config**) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get `{"error":"another monitor is already connected"}` — **never the counters**. On connect the client first receives one `daily_counts` line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with `"final":true`. Once a client half-closes, a `heartbeat` line every 10s probes for gone-aways — a reset frees the slot.
+**How it's built.** Plain listener on `monitor_addr` (**loopback enforced in config**, or `unix:/absolute/path.sock` — bound inside a private temp dir, chmod 0600, renamed into place, so only the gate's own user can ever connect; a stale socket is replaced, a live one is refused) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get `{"error":"another monitor is already connected"}` — **never the counters**. On connect the client first receives one `daily_counts` line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with `"final":true`. Once a client half-closes, a `heartbeat` line every 10s probes for gone-aways — a reset frees the slot.
 
 **Steps in execution.**
 
-1. **Accept** — One slot: try_connect or send the busy error and close.
+1. **Accept** — TCP or unix socket (created 0600 in a private dir, renamed in); one slot: try_connect or send the busy error and close.
 2. **Report** — Write the retained days' daily_counts lines first.
 3. **Stream** — Wait for pending events; write JSON lines + dropped notices; a finished day's final counts go out at 00:00 UTC.
 4. **Probe** — After EOF on reads, heartbeat every 10s; a reset ends the connection.
 
 **Questions.**
 
-- **Q-M1** The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?
+- ~~**Q-M1** The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?~~ ✓ Yes, by file permissions rather than a token — monitor_addr = "unix:/absolute/path.sock" is created 0600, so only the gate's own user can watch or hold the slot; TCP loopback stays allowed. Run the protected app as a separate OS user (README) (2026-11-23).
 
 ### Not switched on (designed for, not built)
 
@@ -395,7 +395,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - ~~**Q-A1**~~ (A) ✓ Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
 - ~~**Q-Q1**~~ (Q) ✓ Yes — every eviction with no monitor attached is counted as dropped_unseen in in-memory per-UTC-day security counters (logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors); a new monitor first receives the last 7 days as daily_counts lines, and a connected monitor gets each day's final line at 00:00 UTC (2026-11-23).
-- **Q-M1** (M) The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?
+- ~~**Q-M1**~~ (M) ✓ Yes, by file permissions rather than a token — monitor_addr = "unix:/absolute/path.sock" is created 0600, so only the gate's own user can watch or hold the slot; TCP loopback stays allowed. Run the protected app as a separate OS user (README) (2026-11-23).
 - ~~**Q-W1**~~ (W) ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
 
 ## What the platform gives vs what we own

@@ -145,7 +145,7 @@ fn serve(settings: Settings) -> ExitCode {
     };
     let (listen, monitor_addr, queue_len) = (
         settings.listen_addr,
-        settings.monitor_addr,
+        settings.monitor_addr.clone(),
         settings.monitor_queue_len,
     );
     if !settings.listen_addr.ip().is_loopback() {
@@ -159,7 +159,7 @@ fn serve(settings: Settings) -> ExitCode {
         Ok(users) => web_safe_block::Config::new(&settings, users),
         Err(e) => return fail(e),
     };
-    let monitor_listener = match std::net::TcpListener::bind(monitor_addr) {
+    let monitor_listener = match monitor::bind_monitor(&monitor_addr) {
         Ok(l) => l,
         Err(e) => return fail(format!("failed to bind monitor {monitor_addr}: {e}")),
     };

@@ -7,13 +7,23 @@
 //! overwritten.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
+
+#[cfg(unix)]
+use crate::upstream::unix_socket_path;
 
 const IDLE_CHECK: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -55,6 +65,167 @@ pub enum EventKind {
     Reserved,
     /// Anything else, e.g. wrong method or malformed login form.
     Other,
+}
+
+/// Where the monitor listens: a loopback TCP address or a unix socket.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MonitorAddr {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl FromStr for MonitorAddr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(rest) = s.strip_prefix("unix:") {
+            #[cfg(unix)]
+            return unix_socket_path("monitor_addr", rest).map(MonitorAddr::Unix);
+            #[cfg(not(unix))]
+            return Err("unix socket monitor_addr is only supported on Unix".into());
+        }
+        let addr: SocketAddr = s
+            .parse()
+            .map_err(|_| format!("monitor_addr is not a valid address or unix:/path: {s:?}"))?;
+        if !addr.ip().is_loopback() {
+            return Err(format!(
+                "monitor_addr must be a loopback address, got {addr}"
+            ));
+        }
+        Ok(MonitorAddr::Tcp(addr))
+    }
+}
+
+impl fmt::Display for MonitorAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MonitorAddr::Tcp(a) => a.fmt(f),
+            #[cfg(unix)]
+            MonitorAddr::Unix(p) => write!(f, "unix:{}", p.display()),
+        }
+    }
+}
+
+/// A bound monitor listener, TCP or unix socket.
+#[derive(Debug)]
+pub enum MonitorListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl From<TcpListener> for MonitorListener {
+    fn from(l: TcpListener) -> Self {
+        MonitorListener::Tcp(l)
+    }
+}
+
+impl MonitorListener {
+    fn accept(&self) -> io::Result<Box<dyn MonitorStream>> {
+        match self {
+            MonitorListener::Tcp(l) => l.accept().map(|(s, _)| Box::new(s) as _),
+            #[cfg(unix)]
+            MonitorListener::Unix(l) => l.accept().map(|(s, _)| Box::new(s) as _),
+        }
+    }
+}
+
+/// The stream operations the monitor loop needs; both TcpStream and
+/// UnixStream provide them natively.
+trait MonitorStream: Read + Write + Send + 'static {
+    fn take_error(&self) -> io::Result<Option<io::Error>>;
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+}
+
+impl MonitorStream for TcpStream {
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        TcpStream::take_error(self)
+    }
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        TcpStream::set_nonblocking(self, nonblocking)
+    }
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, dur)
+    }
+}
+
+#[cfg(unix)]
+impl MonitorStream for UnixStream {
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        UnixStream::take_error(self)
+    }
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        UnixStream::set_nonblocking(self, nonblocking)
+    }
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_write_timeout(self, dur)
+    }
+}
+
+/// Bind the monitor address. A unix socket is created mode 0600 (via a
+/// private temp dir + rename, so it is never reachable with looser
+/// permissions) inside an existing directory; a stale socket file at the
+/// path is replaced, a live one or a non-socket is an error.
+pub fn bind_monitor(addr: &MonitorAddr) -> io::Result<MonitorListener> {
+    match addr {
+        MonitorAddr::Tcp(a) => TcpListener::bind(a).map(MonitorListener::Tcp),
+        #[cfg(unix)]
+        MonitorAddr::Unix(path) => bind_unix_monitor(path).map(MonitorListener::Unix),
+    }
+}
+
+#[cfg(unix)]
+fn bind_unix_monitor(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if !md.file_type().is_socket() {
+            return Err(io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!(
+                        "monitor socket {} is in use by another process",
+                        path.display()
+                    ),
+                ));
+            }
+            // Stale socket left by a previous run: remove it.
+            // Only a refused connect proves nobody is listening; anything
+            // else (e.g. permission denied) might be a live socket.
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)?,
+            Err(e) => return Err(e),
+        }
+    }
+    // Keep the temporary name short: the bound path must fit in sun_path
+    // (104 bytes on macOS), so it should not be much longer than `path`.
+    let mut attempt = 0;
+    let tmp = loop {
+        let tmp = parent.join(format!(".w{:x}-{attempt}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
+            Ok(()) => break tmp,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempt < 15 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        let sock = tmp.join("s");
+        let listener = UnixListener::bind(&sock)
+            .map_err(|e| io::Error::new(e.kind(), format!("binding {}: {e}", sock.display())))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&sock, path)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
 }
 
 /// What a handler reports about a request; attached as a response extension.
@@ -382,11 +553,16 @@ fn event_bytes(e: &Event) -> usize {
 
 /// Run the monitor on its own OS thread. Each accepted client is served on a
 /// further thread so a second client can be turned away immediately.
-pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::JoinHandle<()> {
+pub fn spawn_monitor(
+    listener: impl Into<MonitorListener>,
+    events: Arc<EventQueue>,
+) -> thread::JoinHandle<()> {
+    let listener = listener.into();
     thread::Builder::new()
         .name("wsb-monitor".into())
         .spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = listener.accept();
                 let Ok(mut stream) = stream else {
                     // accept() can fail fast (e.g. fd exhaustion); don't spin.
                     thread::sleep(Duration::from_millis(100));
@@ -421,7 +597,7 @@ pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::
         .expect("failed to spawn monitor thread")
 }
 
-fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
+fn serve_monitor(mut stream: Box<dyn MonitorStream>, events: &EventQueue) -> io::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     // The daily counters go first, before any queued events.
     let mut out = String::new();
@@ -451,10 +627,10 @@ fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
         }
         if out.is_empty() && batch.is_empty() && dropped == 0 {
             if !half_closed {
-                half_closed = read_eof(&stream)?;
+                half_closed = read_eof(&mut *stream)?;
             }
             if half_closed && next_probe.is_none_or(|t| Instant::now() >= t) {
-                probe(&mut stream)?;
+                probe(&mut *stream)?;
                 next_probe = Some(Instant::now() + HEARTBEAT_INTERVAL);
             }
             continue;
@@ -471,7 +647,7 @@ fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
         // The write may have gone to a client that has since closed; wait for
         // a possible reset so those events stay queued for the next monitor.
         thread::sleep(PROBE_WAIT);
-        half_closed |= read_eof(&stream)?;
+        half_closed |= read_eof(&mut *stream)?;
         if let Some(last) = batch.last() {
             events.mark_consumed(last.seq);
         }
@@ -480,7 +656,7 @@ fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
 
 /// Send a heartbeat line. A client that has fully closed answers with a reset,
 /// which shows up as a read error shortly after.
-fn probe(stream: &mut TcpStream) -> io::Result<()> {
+fn probe(stream: &mut dyn MonitorStream) -> io::Result<()> {
     let line = serde_json::json!({"kind": "heartbeat", "time": rfc3339(SystemTime::now())});
     stream.write_all(format!("{line}\n").as_bytes())?;
     thread::sleep(PROBE_WAIT);
@@ -490,7 +666,7 @@ fn probe(stream: &mut TcpStream) -> io::Result<()> {
 /// Non-blocking read: Ok(true) at EOF, Ok(false) if nothing is pending, Err if
 /// the connection is gone (a read error or a pending socket error such as a
 /// reset). Any input from the client is discarded.
-fn read_eof(stream: &TcpStream) -> io::Result<bool> {
+fn read_eof(stream: &mut dyn MonitorStream) -> io::Result<bool> {
     // Linux keeps returning EOF from read after a FIN even once the peer's
     // RST has arrived; the reset is only visible as the pending socket error.
     if let Some(e) = stream.take_error()? {
@@ -502,7 +678,7 @@ fn read_eof(stream: &TcpStream) -> io::Result<bool> {
     // the monitor thread from answering events.
     let mut reads = 0;
     let result = loop {
-        match (&*stream).read(&mut buf) {
+        match stream.read(&mut buf) {
             Ok(0) => break Ok(true),
             Ok(_) => {
                 reads += 1;
@@ -909,5 +1085,137 @@ mod tests {
         assert_eq!(v["final"], true);
         assert_eq!(v["counts"]["login_succeeded"], 1);
         q.disconnect();
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Short paths: sun_path is limited (~104 bytes on macOS).
+        fn sock(name: &str) -> PathBuf {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "wsb-mon-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.join(name)
+        }
+
+        fn unix_addr(path: &Path) -> MonitorAddr {
+            format!("unix:{}", path.display()).parse().unwrap()
+        }
+
+        #[test]
+        fn bind_monitor_creates_private_socket() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            assert!(matches!(listener, MonitorListener::Unix(_)));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "umask must not widen the socket");
+            // No private temp dir left behind.
+            let names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [std::ffi::OsString::from("m.sock")], "{names:?}");
+            // The renamed listener still accepts.
+            UnixStream::connect(&path).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The temporary bind path must not push a path that fits in
+        /// sun_path (104 bytes on macOS) over the limit.
+        #[test]
+        fn bind_monitor_long_directory() {
+            let base = sock("x").parent().unwrap().to_path_buf();
+            let pad = 85usize.saturating_sub(base.as_os_str().len() + 1).max(1);
+            let dir = base.join("d".repeat(pad));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("monitor.sock");
+            assert!(path.as_os_str().len() < 104, "{}", path.display());
+            let _listener = bind_monitor(&unix_addr(&path)).unwrap();
+            UnixStream::connect(&path).unwrap();
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn bind_monitor_replaces_stale_socket() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            {
+                let _dead = UnixListener::bind(&path).unwrap();
+            }
+            assert!(path.exists(), "dropped listener leaves the file");
+            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            assert!(matches!(listener, MonitorListener::Unix(_)));
+            UnixStream::connect(&path).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn bind_monitor_live_socket_in_use() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            let _live = UnixListener::bind(&path).unwrap();
+            let err = bind_monitor(&unix_addr(&path)).unwrap_err();
+            assert!(err.to_string().contains("in use"), "{err}");
+            assert!(path.exists(), "live socket left alone");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn bind_monitor_refuses_regular_file() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            std::fs::write(&path, b"keep me").unwrap();
+            bind_monitor(&unix_addr(&path)).unwrap_err();
+            assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn unix_monitor_streams_events() {
+            use std::io::BufReader;
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            let q = Arc::new(EventQueue::new(10));
+            spawn_monitor(listener, q.clone());
+            let mut e = ev("/x");
+            e.kind = EventKind::LoginSucceeded;
+            q.push(e);
+
+            let s = UnixStream::connect(&path).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                "daily_counts"
+            );
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                "login_succeeded"
+            );
+
+            // A second connection is refused with the busy error.
+            let s2 = UnixStream::connect(&path).unwrap();
+            s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut r2 = BufReader::new(s2);
+            line.clear();
+            r2.read_line(&mut line).unwrap();
+            assert!(line.contains("already connected"), "{line}");
+            q.disconnect();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
