@@ -128,7 +128,7 @@ export const NODES = [
     ],
     cond: [
       { q: 'Sessions die on restart — acceptable while this guards one box, or should they persist?', r: 'Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).' },
-      'A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?',
+      { q: 'A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?', r: 'Yes — up to 60s is accepted; restart serve after remove-user to drop the sessions immediately (2026-11-23).' },
       { q: 'A client that disconnects while a session write is in flight drops the session_writes guard but not the blocking db call — the table can commit a session the map never learns, or keep rows the write evicted, until the next reload. Move the owned guard and the map mutation inside the blocking task?', r: 'Fixed — login, logout and the purger move the owned session_writes guard into the blocking closure, which also performs the map mutation on success (review-4 finding 1, fixed).' },
     ] },
   { id: 'R', code: 'R', name: 'Failure ledger', short: 'THROTTLE', group: 'gate', gx: 8.5, gy: 7, w: 2, d: 2, h: 22, kind: 'store',
@@ -141,7 +141,7 @@ export const NODES = [
       ['Delay', 'Failed logins sleep 1s before the 401.'],
     ],
     cond: [
-      'Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?',
+      { q: 'Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?', r: 'Yes — a shared budget behind one NAT or carrier-grade address is accepted (2026-11-23).' },
       { q: 'Should failures count the attempt before the lookup (atomically)?', r: 'Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).' },
       { q: 'Keyed on the full IP — an IPv6 client rotating host bits inside its /64 gets a fresh 10-attempt budget every request. Key IPv6 on the /64 prefix, or add a per-user-name throttle?', r: 'IPv6 clients now rate-limit per /64 (rate_limit_key; IPv4-mapped IPv6 folds to plain IPv4) — deliberately no per-user-name throttle, which would let anyone lock a user out (review-4 finding 4, fixed).' },
     ] },
@@ -157,7 +157,7 @@ export const NODES = [
     ],
     cond: [
       { q: 'There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?', r: 'remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.' },
-      'The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?',
+      { q: 'The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?', r: 'Nothing for now — the flag is kept and listed but grants no extra rights; serve treats admins like any user (2026-11-23).' },
       { q: 'Why not a per-user salt on the hash?', r: 'Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).' },
       { q: 'add-user holds the WAL write lock across stdin reads and every Argon2 hash — a large batch stalls serve logins past the 5s busy timeout, and the deferred read-then-write can fail SQLITE_BUSY outright. Hash first, then insert in one immediate transaction?', r: 'Fixed — all lines are validated and hashed with no transaction open (concurrent writers proceed), then a single BEGIN IMMEDIATE inserts the batch with ON CONFLICT DO NOTHING (review-4 finding 2, fixed).' },
     ] },
@@ -214,7 +214,7 @@ export const NODES = [
       ['serve', 'Load config + users.db (must exist, be current schema, and be non-empty), bind both ports.'],
     ],
     cond: [
-      'Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?',
+      { q: 'Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?', r: 'Fine — one strict config file, no env overrides or flags, stays the design (ADR 0004, 2026-11-23).' },
     ] },
   { id: 'EQ', code: 'Q', name: 'Event queue', short: 'EVENT QUEUE', group: 'ops', gx: 9.5, gy: 9.5, w: 2, d: 2, h: 18, kind: 'store',
     one: 'A bounded ring of "what just happened" — handlers push without blocking.',

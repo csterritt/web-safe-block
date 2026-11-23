@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **4 open · 19 resolved**._
+_Question status: **0 open · 23 resolved**._
 
 ## One paragraph
 
@@ -129,7 +129,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 **Questions.**
 
 - ~~**Q-S1** Sessions die on restart — acceptable while this guards one box, or should they persist?~~ ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
-- **Q-S2** A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
+- ~~**Q-S2** A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?~~ ✓ Yes — up to 60s is accepted; restart serve after remove-user to drop the sessions immediately (2026-11-23).
 - ~~**Q-S3** A client that disconnects while a session write is in flight drops the session_writes guard but not the blocking db call — the table can commit a session the map never learns, or keep rows the write evicted, until the next reload. Move the owned guard and the map mutation inside the blocking task?~~ ✓ Fixed — login, logout and the purger move the owned session_writes guard into the blocking closure, which also performs the map mutation on success (review-4 finding 1, fixed).
 
 #### R · Failure ledger
@@ -148,7 +148,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- **Q-R1** Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
+- ~~**Q-R1** Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?~~ ✓ Yes — a shared budget behind one NAT or carrier-grade address is accepted (2026-11-23).
 - ~~**Q-R2** Should failures count the attempt before the lookup (atomically)?~~ ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
 - ~~**Q-R3** Keyed on the full IP — an IPv6 client rotating host bits inside its /64 gets a fresh 10-attempt budget every request. Key IPv6 on the /64 prefix, or add a per-user-name throttle?~~ ✓ IPv6 clients now rate-limit per /64 (rate_limit_key; IPv4-mapped IPv6 folds to plain IPv4) — deliberately no per-user-name throttle, which would let anyone lock a user out (review-4 finding 4, fixed).
 
@@ -170,7 +170,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 **Questions.**
 
 - ~~**Q-U1** There is no remove-user or phrase-rotation command — revoking someone means editing users.db by hand. Acceptable?~~ ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
-- **Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
+- ~~**Q-U2** The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?~~ ✓ Nothing for now — the flag is kept and listed but grants no extra rights; serve treats admins like any user (2026-11-23).
 - ~~**Q-U3** Why not a per-user salt on the hash?~~ ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
 - ~~**Q-U4** add-user holds the WAL write lock across stdin reads and every Argon2 hash — a large batch stalls serve logins past the 5s busy timeout, and the deferred read-then-write can fail SQLITE_BUSY outright. Hash first, then insert in one immediate transaction?~~ ✓ Fixed — all lines are validated and hashed with no transaction open (concurrent writers proceed), then a single BEGIN IMMEDIATE inserts the batch with ON CONFLICT DO NOTHING (review-4 finding 2, fixed).
 
@@ -251,7 +251,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- **Q-C1** Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
+- ~~**Q-C1** Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?~~ ✓ Fine — one strict config file, no env overrides or flags, stays the design (ADR 0004, 2026-11-23).
 
 #### Q · Event queue
 
@@ -380,20 +380,20 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - ~~**Q-G3**~~ (G) ✓ Fixed — owned hash_slot (and session_writes) guards now move inside the blocking closures, so a cancelled request cannot release them early; at most 32 logins may queue for the slot, extras get 503 login_busy (review-4 finding 1, fixed).
 - ~~**Q-G4**~~ (G) ✓ Fixed — session_tokens parses Cookie headers on raw bytes, matching wsb_session by name and keeping only UTF-8 values (review-4 finding 3, fixed).
 - ~~**Q-S1**~~ (S) ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).
-- **Q-S2** (S) A running serve notices remove-user deletions only on the 60s reload — is up to a minute of grace acceptable?
+- ~~**Q-S2**~~ (S) ✓ Yes — up to 60s is accepted; restart serve after remove-user to drop the sessions immediately (2026-11-23).
 - ~~**Q-S3**~~ (S) ✓ Fixed — login, logout and the purger move the owned session_writes guard into the blocking closure, which also performs the map mutation on success (review-4 finding 1, fixed).
-- **Q-R1** (R) Limiting keys on client IP — visitors sharing one NAT or carrier-grade address share the 10/15min budget. Acceptable?
+- ~~**Q-R1**~~ (R) ✓ Yes — a shared budget behind one NAT or carrier-grade address is accepted (2026-11-23).
 - ~~**Q-R2**~~ (R) ✓ Yes — reserve_attempt takes the slot under one lock, then refund/clear reconciles (review-1 finding 7, fixed).
 - ~~**Q-R3**~~ (R) ✓ IPv6 clients now rate-limit per /64 (rate_limit_key; IPv4-mapped IPv6 folds to plain IPv4) — deliberately no per-user-name throttle, which would let anyone lock a user out (review-4 finding 4, fixed).
 - ~~**Q-U1**~~ (U) ✓ remove-user NAME deletes the row — and now their sessions too (2026-11). A running serve drops those sessions on its next 60s reload; phrase rotation is still add-then-remove.
-- **Q-U2** (U) The is_admin flag is stored and shown by list-users but serve never reads it for authorization — what should admins be able to do?
+- ~~**Q-U2**~~ (U) ✓ Nothing for now — the flag is kept and listed but grants no extra rights; serve treats admins like any user (2026-11-23).
 - ~~**Q-U3**~~ (U) ✓ Done — the move to user name + phrase (commit c3f8099) gave a name to salt against: Argon2id with a random per-user salt replaced unsalted SHA-512 (ADR 0001 superseded).
 - ~~**Q-U4**~~ (U) ✓ Fixed — all lines are validated and hashed with no transaction open (concurrent writers proceed), then a single BEGIN IMMEDIATE inserts the batch with ON CONFLICT DO NOTHING (review-4 finding 2, fixed).
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
 - ~~**Q-F2**~~ (F) ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
 - ~~**Q-F3**~~ (F) ✓ Fixed — a custom accept loop (src/server.rs) wraps each connection in StallTimeoutIo: a write stalled 60s fails the connection, plus a 30s header-read timeout; a stalled client frees its permit (review-4 finding 5, fixed).
 - ~~**Q-A1**~~ (A) ✓ Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.
-- **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
+- ~~**Q-C1**~~ (C) ✓ Fine — one strict config file, no env overrides or flags, stays the design (ADR 0004, 2026-11-23).
 - ~~**Q-Q1**~~ (Q) ✓ Yes — every eviction with no monitor attached is counted as dropped_unseen in in-memory per-UTC-day security counters (logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors); a new monitor first receives the last 7 days as daily_counts lines, and a connected monitor gets each day's final line at 00:00 UTC (2026-11-23).
 - ~~**Q-M1**~~ (M) ✓ Yes, by file permissions rather than a token — monitor_addr = "unix:/absolute/path.sock" is created 0600, so only the gate's own user can watch or hold the slot; TCP loopback stays allowed. Run the protected app as a separate OS user (README) (2026-11-23).
 - ~~**Q-W1**~~ (W) ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).

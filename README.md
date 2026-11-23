@@ -75,14 +75,14 @@ Reads lines from stdin into the users database, creating it if needed. Each line
 - New pass phrases must have at least 20 non-whitespace characters, at least one number, and at least one punctuation character. Lines with weaker phrases are reported and skipped.
 - The database stores a random per-user salt and an Argon2id hash (12 MiB, 3 passes, 1 lane) of the normalized phrase, not the phrase itself. Each line therefore takes a noticeable fraction of a second to add.
 - User names must be 1–64 printable ASCII characters (`!`–`~`) and unique (case-insensitive), including against users already in the database. Pass phrases do not need to be unique.
-- A user whose name contains `admin` (any case) is an admin.
+- A user whose name contains `admin` (any case) is an admin. The flag is stored and shown by `list-users` but currently grants nothing extra — `serve` treats admins like any other user.
 - Blank lines are ignored. Bad lines (no phrase, weak phrase, or a name that duplicates an existing user or an earlier line — case-insensitively) are reported on stderr and skipped. The other lines are still added, and the command exits with status 1 if anything was skipped. All lines are read and every phrase hashed before anything is written, so a running `serve` is never blocked by a large batch.
 
 Speed: one hash took about 16 ms in a release build on the development machine. That's quicker than password hashes are usually tuned for, so it's worth timing on your actual server. If it's also fast there, you can raise the passes (ARGON2_T_COST in `src/users.rs`) rather than the memory.
 
 #### `remove-user`
 
-`web-safe-block remove-user <user-name>` deletes that user and their sessions from the users database. It exits with an error if the database is missing or there is no such user. The user's pass phrase stops working immediately; a running `serve` drops their live sessions within 60 seconds.
+`web-safe-block remove-user <user-name>` deletes that user and their sessions from the users database. It exits with an error if the database is missing or there is no such user. The user's pass phrase stops working immediately; a running `serve` drops their live sessions within 60 seconds. To end them immediately, restart `serve`.
 
 #### `list-users`
 
@@ -130,7 +130,7 @@ $ nc 127.0.0.1 8081
 
 - Bind the protected server to `127.0.0.1` so it is reachable only through web-safe-block.
 - The session cookie `wsb_session` is `HttpOnly`, `SameSite=Lax`, and stripped from requests before they are forwarded; any `Set-Cookie` for `wsb_session` coming from the backend is dropped. Gated responses are always marked `Cache-Control: private` (`public`, `s-maxage`, `proxy-revalidate` and CDN override headers are removed) so shared caches cannot serve them to another client. Do NOT configure edge rules that override origin cache-control for this hostname (e.g. Cloudflare Cache Rules with "Ignore cache-control header" or an Edge TTL override); use a cache bypass rule if in doubt.
-- Login attempts are limited to 10 failures per 15 minutes per client (keyed on the client IP — see [Client IP](#client-ip); IPv6 clients are keyed on their /64 network), with a 1s delay on each failure. At most 32 logins may be waiting for the Argon2 hash slot at once — extras get a 503 "Server busy" page instead of queueing.
+- Login attempts are limited to 10 failures per 15 minutes per client (keyed on the client IP — see [Client IP](#client-ip); IPv6 clients are keyed on their /64 network), with a 1s delay on each failure. Visitors sharing one NAT or carrier-grade address share that budget; this is accepted. At most 32 logins may be waiting for the Argon2 hash slot at once — extras get a 503 "Server busy" page instead of queueing.
 - Sessions are kept in `users.db` as SHA-256 hashes of the cookie token (the raw token is never stored) and survive a restart; a fast in-memory map fronts the table. At most 3 live sessions per user (the oldest, by a persisted creation stamp, is dropped) and 10,000 in total are kept. Every users.db created before the current schema is rejected, so no sessions outlive the change to 180-day TTLs — users are re-added anyway.
 - Incoming `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers are discarded; the upstream gets `X-Forwarded-For` (the client IP), `X-Forwarded-Proto` (`https` if `cookie_secure`, else `http`) and `X-Forwarded-Host`.
 - Client connections have 30 seconds to send their request headers, and a write to the client may stall for at most 60 seconds — a client that stops reading loses its connection (and its upstream slot). Upstream requests time out after 10s to connect and 60s waiting for response headers (504); a response body that stalls for 60s is cut off with an error. At most 256 requests are in flight upstream at once; further requests are answered 503.
@@ -199,4 +199,4 @@ Checklist:
 
 #### Threat model and rotation
 
-A leaked `users.db` gives an attacker salted Argon2id hashes — offline guessing of weak phrases is possible, hence the strength rules — plus session hashes, which are *not* usable as cookies (the cookie is the raw token; only its SHA-256 is stored). To rotate a user, `remove-user name` then `add-user` with a new phrase: the phrase stops working immediately and a running `serve` drops their live sessions within 60 seconds. If the db leaks, rotate every user.
+A leaked `users.db` gives an attacker salted Argon2id hashes — offline guessing of weak phrases is possible, hence the strength rules — plus session hashes, which are *not* usable as cookies (the cookie is the raw token; only its SHA-256 is stored). To rotate a user, `remove-user name` then `add-user` with a new phrase: the phrase stops working immediately and a running `serve` drops their live sessions within 60 seconds (restart `serve` to drop them at once). If the db leaks, rotate every user.
