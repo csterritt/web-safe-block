@@ -8,7 +8,7 @@ use axum::Router;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 use crate::auth::{login, login_redirect, logout, logout_page};
@@ -38,6 +38,8 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, S
                 .layer(DefaultBodyLimit::max(4096)),
         )
         .route(LOGOUT_PATH, get(logout_page).post(logout))
+        // Answered by the gate for everyone; never forwarded upstream.
+        .route("/robots.txt", get(robots))
         .fallback(proxy_or_login)
         .layer(middleware::from_fn_with_state(state.clone(), record_event))
         .with_state(state))
@@ -92,6 +94,21 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
         truncated,
     });
     resp
+}
+
+/// Static `Disallow: /` for crawlers, served before the session check.
+async fn robots() -> Response {
+    let mut resp = (axum::http::StatusCode::OK, "User-agent: *\nDisallow: /\n").into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    with_outcome(resp, EventKind::Robots, None)
 }
 
 /// Attach what a request did so `record_event` can report it.

@@ -173,18 +173,23 @@ pub(crate) fn sets_session_cookie(value: &[u8]) -> bool {
 pub(crate) const PAGE_STYLE: &str =
     "<style>body,input,button{font-size:18pt}input{border:1px solid #000}</style>\n";
 
-pub(crate) fn login_page(message: Option<&str>, next: &str) -> String {
+pub(crate) fn login_page(front: &str, message: Option<&str>, next: &str) -> String {
+    let front = if front.is_empty() {
+        String::new()
+    } else {
+        format!("<p>{}</p>\n", html_escape(front))
+    };
     let msg = message
         .map(|m| format!("<p>{}</p>\n", html_escape(m)))
         .unwrap_or_default();
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{front}{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
         html_escape(next)
     )
 }
 
-pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
-    let mut resp = (status, body).into_response();
+pub(crate) fn html_response(status: StatusCode, body: impl Into<axum::body::Body>) -> Response {
+    let mut resp = (status, body.into()).into_response();
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -465,6 +470,24 @@ mod tests {
     #[test]
     fn html_escape_cases() {
         assert_eq!(html_escape("a&<b>\"'c"), "a&amp;&lt;b&gt;&quot;&#39;c");
+    }
+
+    #[test]
+    fn login_page_front_message() {
+        let page = login_page("Site Description Here", None, "/");
+        let front = page.find("<p>Site Description Here</p>").unwrap();
+        let form = page.find("<form").unwrap();
+        assert!(front < form, "{page}");
+
+        let page = login_page("<b>A&B</b>", Some("nope"), "/x");
+        assert!(
+            page.contains("<p>&lt;b&gt;A&amp;B&lt;/b&gt;</p>\n<p>nope</p>\n<form"),
+            "{page}"
+        );
+
+        let page = login_page("", None, "/");
+        assert!(!page.contains("<p>"), "{page}");
+        assert!(page.contains("<form"), "{page}");
     }
 
     #[test]

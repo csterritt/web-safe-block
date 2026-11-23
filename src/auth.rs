@@ -65,7 +65,11 @@ pub(crate) async fn login(
         return with_outcome(
             html_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                login_page(Some("Too many attempts, try again later."), &next),
+                login_page(
+                    &state.config.front_page_message,
+                    Some("Too many attempts, try again later."),
+                    &next,
+                ),
             ),
             EventKind::RateLimited,
             None,
@@ -79,7 +83,11 @@ pub(crate) async fn login(
             return with_outcome(
                 html_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    login_page(Some("Server busy, try again shortly."), &next),
+                    login_page(
+                        &state.config.front_page_message,
+                        Some("Server busy, try again shortly."),
+                        &next,
+                    ),
                 ),
                 EventKind::LoginBusy,
                 None,
@@ -103,19 +111,23 @@ pub(crate) async fn login(
         Err(e) => {
             eprintln!("web-safe-block: user lookup failed: {e}");
             refund_attempt(&mut state.failures.lock().unwrap(), &key);
-            login_error(&next)
+            login_error(&state.config.front_page_message, &next)
         }
         Ok(Err(e)) => {
             eprintln!("web-safe-block: user lookup failed: {e}");
             refund_attempt(&mut state.failures.lock().unwrap(), &key);
-            login_error(&next)
+            login_error(&state.config.front_page_message, &next)
         }
         Ok(Ok(None)) => {
             tokio::time::sleep(state.config.fail_delay).await;
             with_outcome(
                 html_response(
                     StatusCode::UNAUTHORIZED,
-                    login_page(Some("Incorrect user name or phrase."), &next),
+                    login_page(
+                        &state.config.front_page_message,
+                        Some("Incorrect user name or phrase."),
+                        &next,
+                    ),
                 ),
                 EventKind::LoginFailed,
                 None,
@@ -169,7 +181,7 @@ pub(crate) async fn login(
                     _ => {}
                 }
                 refund_attempt(&mut state.failures.lock().unwrap(), &key);
-                return login_error(&next);
+                return login_error(&state.config.front_page_message, &next);
             }
             println!("web-safe-block: user '{}' logged in", user.name);
             // A success undoes only its own reserved attempt; earlier
@@ -196,11 +208,11 @@ pub(crate) async fn login(
 }
 
 /// The 500 page for a database error mid-login.
-fn login_error(next: &str) -> Response {
+fn login_error(front: &str, next: &str) -> Response {
     with_outcome(
         html_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            login_page(Some("Server error, try again later."), next),
+            login_page(front, Some("Server error, try again later."), next),
         ),
         EventKind::LoginError,
         None,
@@ -315,7 +327,12 @@ mod tests {
     use crate::users::{self, UserStore};
 
     fn state_with_alice() -> AppState {
-        let dir = std::env::temp_dir().join(format!("wsb-auth-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wsb-auth-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(users::DB_FILE);
@@ -330,12 +347,20 @@ mod tests {
         let config = Config {
             users: Arc::new(UserStore::open(&path).unwrap()),
             upstream: "http://127.0.0.1:1".parse().unwrap(),
+            front_page_message: "Site Description Here".into(),
             session_ttl: Duration::from_secs(600),
             cookie_secure: false,
             fail_delay: Duration::ZERO,
             limits: Limits::default(),
         };
         AppState::new(config, Arc::new(EventQueue::new(10)))
+    }
+
+    #[test]
+    fn root_page_is_prebuilt() {
+        let state = state_with_alice();
+        let expected = login_page("Site Description Here", None, "/");
+        assert_eq!(&state.root_page[..], expected.as_bytes());
     }
 
     /// Cancelling a login mid-hash must not release the hash slot early:

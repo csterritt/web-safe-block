@@ -157,6 +157,7 @@ async fn spawn_proxy_on_db(
     let config = Config {
         users: Arc::new(UserStore::open(db).unwrap()),
         upstream: upstream.parse().unwrap(),
+        front_page_message: "Site Description Here".into(),
         session_ttl: Duration::from_secs(600),
         cookie_secure: false,
         fail_delay: Duration::ZERO,
@@ -2073,4 +2074,103 @@ async fn unix_upstream_missing_socket_is_502() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 502);
+}
+
+/// The configured front_page_message appears above the form on every login
+/// page variant.
+#[tokio::test]
+async fn front_page_message_shown() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    let resp = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let h = resp.headers();
+    assert_eq!(
+        h.get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+    let body = resp.text().await.unwrap();
+    let front = body.find("<p>Site Description Here</p>").unwrap();
+    assert!(front < body.find("<form").unwrap(), "{body}");
+
+    // Non-root paths render per request with their own `next`.
+    let resp = client.get(format!("{base}/wp-admin")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<p>Site Description Here</p>"), "{body}");
+    assert!(body.contains("name=\"next\" value=\"/wp-admin\""), "{body}");
+
+    // A failed login re-render shows it too.
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
+        .body("user=alice&phrase=wrong&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<p>Site Description Here</p>"), "{body}");
+}
+
+/// /robots.txt is answered by the gate for everyone and never forwarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn robots_txt() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits.clone()).await;
+    let (proxy, monitor_addr) = spawn_proxy_with_monitor(&upstream, 10).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    let check = |resp: reqwest::Response| {
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers();
+        assert_eq!(
+            h.get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            h.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=86400"
+        );
+        resp
+    };
+
+    // Unauthenticated.
+    let resp = check(
+        client
+            .get(format!("{base}/robots.txt"))
+            .send()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resp.text().await.unwrap(), "User-agent: *\nDisallow: /\n");
+
+    // Authenticated.
+    let token = login_token(&client, &base).await;
+    let resp = check(
+        client
+            .get(format!("{base}/robots.txt"))
+            .header(header::COOKIE, format!("wsb_session={token}"))
+            .send()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(resp.text().await.unwrap(), "User-agent: *\nDisallow: /\n");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "robots.txt never forwarded");
+
+    // Reported as kind "robots", which inflates no daily counter.
+    let mut m = MonitorClient::connect(monitor_addr);
+    let counts = &m.daily[0]["counts"];
+    assert_eq!(counts["other"], 0);
+    assert_eq!(counts["unauth_non_root"], 0);
+    let kinds: Vec<serde_json::Value> = (0..3).map(|_| m.event()["kind"].clone()).collect();
+    assert_eq!(kinds, ["robots", "login_succeeded", "robots"], "{kinds:?}");
 }

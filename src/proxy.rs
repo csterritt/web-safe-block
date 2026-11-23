@@ -37,9 +37,21 @@ pub(crate) async fn proxy_or_login(
     }
 
     let Some(user) = valid_session(&state, req.headers()) else {
-        let next = sanitize_next(req.uri().path_and_query().map_or("/", |pq| pq.as_str()));
+        let pq = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+        // `/` is the common case: serve the page rendered at startup.
+        if pq == "/" {
+            return with_outcome(
+                html_response(StatusCode::UNAUTHORIZED, state.root_page.clone()),
+                EventKind::LoginPage,
+                None,
+            );
+        }
+        let next = sanitize_next(pq);
         return with_outcome(
-            html_response(StatusCode::UNAUTHORIZED, login_page(None, &next)),
+            html_response(
+                StatusCode::UNAUTHORIZED,
+                login_page(&state.config.front_page_message, None, &next),
+            ),
             EventKind::LoginPage,
             None,
         );

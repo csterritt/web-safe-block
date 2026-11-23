@@ -63,6 +63,8 @@ pub struct Config {
     pub users: Arc<UserStore>,
     /// Upstream base: an `http://host[:port]` URI or a unix socket path.
     pub upstream: Upstream,
+    /// Plain text shown above the sign-in form (HTML is escaped).
+    pub front_page_message: String,
     pub session_ttl: Duration,
     /// Emit `Secure` on session cookies.
     pub cookie_secure: bool,
@@ -77,6 +79,7 @@ impl Config {
         Config {
             users: Arc::new(users),
             upstream: settings.upstream.clone(),
+            front_page_message: settings.front_page_message.clone(),
             session_ttl: Duration::from_secs(settings.session_ttl_secs),
             cookie_secure: settings.cookie_secure,
             fail_delay: Duration::from_secs(1),
@@ -101,6 +104,8 @@ pub(crate) struct AppState {
     pub upstream_permits: Arc<tokio::sync::Semaphore>,
     /// Bounds how many logins may queue for `hash_slot` at once.
     pub login_waiters: Arc<tokio::sync::Semaphore>,
+    /// The `/` login page, rendered once at startup.
+    pub root_page: axum::body::Bytes,
 }
 
 /// The hyper client used to reach upstream — TCP for `http://`, a unix
@@ -139,6 +144,7 @@ impl AppState {
         };
         let max_upstream_requests = config.limits.max_upstream_requests;
         let max_login_waiters = config.limits.max_login_waiters;
+        let root_page = crate::util::login_page(&config.front_page_message, None, "/").into();
         AppState {
             config: Arc::new(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -149,6 +155,7 @@ impl AppState {
             session_writes: Arc::new(tokio::sync::Mutex::new(0)),
             upstream_permits: Arc::new(tokio::sync::Semaphore::new(max_upstream_requests)),
             login_waiters: Arc::new(tokio::sync::Semaphore::new(max_login_waiters)),
+            root_page,
         }
     }
 }

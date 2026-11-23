@@ -50,13 +50,14 @@ web-safe-block -c /etc/web-safe-block/config.toml serve
 
 #### Configuration
 
-Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `serve`) validates the config file first, exiting with an error if it is missing, can't be parsed, is missing any setting, or contains an unknown one.
+Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `serve`) validates the config file first, exiting with an error if it is missing, can't be parsed, is missing any setting, or contains an unknown one. An existing config file from before `front_page_message` was added must gain the line — startup fails on the missing setting, as with any other.
 
 | Setting | Default | Meaning |
 |---------------------|---------------------------|---|
 | `users_db`          | `"users.db"`              | sqlite3 users database. A relative path is relative to the config file's directory. |
 | `listen_addr`       | `"127.0.0.1:8080"`        | Public-facing address web-safe-block listens on. |
 | `upstream`          | `"http://127.0.0.1:3000"` | Protected server: `http://host:port` (no path) or `unix:/absolute/path.sock`. |
+| `front_page_message` | `"Site Description Here"` | Plain text in a paragraph above the sign-in form (HTML is escaped; empty shows nothing). |
 | `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime; at most 10 years (315360000). |
 | `cookie_secure`     | `true`                    | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
 | `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor port. Must be a loopback address. |
@@ -91,7 +92,7 @@ Speed: one hash took about 16 ms in a release build on the development machine. 
 
 Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
 
-Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. So are POSTs that carry neither `Sec-Fetch-Site` nor `Origin`; scripted clients (e.g. curl) must send `-H 'Sec-Fetch-Site: same-origin'` or an `Origin` matching the Host. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. Login form bodies are limited to 4 KiB.
+Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. So are POSTs that carry neither `Sec-Fetch-Site` nor `Origin`; scripted clients (e.g. curl) must send `-H 'Sec-Fetch-Site: same-origin'` or an `Origin` matching the Host. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. The root page — including the `front_page_message` paragraph — is rendered once at startup; other paths render it per request. Login form bodies are limited to 4 KiB.
 
 #### Backups
 
@@ -113,6 +114,7 @@ $ nc 127.0.0.1 8081
   - `proxied`: authenticated request forwarded upstream; `status` is the upstream's, or 502/503/504.
   - `upgrade`: authenticated request with an `Upgrade` header; answered 501.
   - `reserved`: an unknown `/__wsb/` path.
+  - `robots`: a `GET /robots.txt` request; counts in no daily counter.
   - `other`: e.g. wrong method or a malformed form.
 - `ip` is `CF-Connecting-IP` if present and the connection comes from a loopback address (the tunnel), otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page`, `logout` and `logout_error`. `truncated` is true when `path` (1024 bytes), `user_agent` (512 bytes) or `method` (32 bytes) was cut to its cap.
 - The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor — at most 100 events per write — and marks them consumed only after they have been written. The queue also has a ~4 MiB total byte budget.
@@ -135,6 +137,7 @@ $ nc 127.0.0.1 8081
 - A `users.db` created before the current schema (per-user salts, session creation stamps) is rejected by every command; move it aside and re-add the users with `add-user`. New databases are created mode `0600`; an existing db (or its `-wal`/`-shm` sidecars) accessible to group or other users produces a stderr warning (never a chmod). A rejected database is never converted to WAL.
 - WebSockets and other protocol upgrades are not supported in v1; authenticated requests with an `Upgrade` header are answered 501 and never forwarded.
 - Paths under `/__wsb/` are reserved and never forwarded.
+- `/robots.txt` is answered by the gate itself (`Disallow: /` for every agent, cached a day) and never forwarded — the app's own robots.txt is shadowed, which is what you want.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.
 
 #### Unix socket upstream

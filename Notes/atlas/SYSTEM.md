@@ -22,6 +22,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Monitor | One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
 | Upstream | http:// (no path) or unix:/absolute/path socket — the protected app stays on the same machine | — |
 | Reserved paths | /__wsb/* is never forwarded; cross-site POSTs to it are rejected | — |
+| Crawlers | /robots.txt is answered by the gate with Disallow: / for every agent and never forwarded | — |
 | Shared caches | Upstream Cache-Control is rewritten to private (public/s-maxage/proxy-revalidate and CDN override headers dropped) — a shared cache must never serve a gated page | — |
 | Protocol upgrades | An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost) | — |
 
@@ -95,7 +96,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.
 
-**How it's built.** `axum` router in `src/app.rs`: `GET|POST /__wsb/login` (GET just 303s to /; POST bodies capped at 4 KiB) and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. The login form carries a sanitized `next` so a successful login returns you to what you asked for. Cross-site POSTs are refused via `Sec-Fetch-Site` (`same-origin`/`none` pass), then an `Origin` that must match Host — https when cookies are Secure. A POST with neither header is refused too. Phrase checks run on the blocking pool, **one Argon2 hash at a time** (`hash_slot`), and at most **32 logins may queue** for it — extras get 503, kind `login_busy`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware; gate pages are `no-store` and frame-denied.
+**How it's built.** `axum` router in `src/app.rs`: `GET|POST /__wsb/login` (GET just 303s to /; POST bodies capped at 4 KiB), `GET|POST /__wsb/logout` live in `src/auth.rs`, and `GET /robots.txt` — the gate's own **Disallow: /** for every agent, never forwarded, kind `robots` — live in `src/app.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. The root login page — a `front_page_message` paragraph above the form — is **rendered once at startup** (`AppState.root_page`); other paths render per request. The login form carries a sanitized `next` so a successful login returns you to what you asked for. Cross-site POSTs are refused via `Sec-Fetch-Site` (`same-origin`/`none` pass), then an `Origin` that must match Host — https when cookies are Secure. A POST with neither header is refused too. Phrase checks run on the blocking pool, **one Argon2 hash at a time** (`hash_slot`), and at most **32 logins may queue** for it — extras get 503, kind `login_busy`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware; gate pages are `no-store` and frame-denied.
 
 **Steps in execution.**
 
@@ -238,7 +239,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** The whole control surface. write-config lays down a commented config.toml; add-user, remove-user and list-users maintain the phrase book; serve runs everything. The config is all-or-nothing: every setting must be present and no unknown keys are allowed.
 
-**How it's built.** `src/main.rs` + `src/settings.rs`. Seven settings, **all required, unknown keys denied**: users_db, listen_addr (a literal IP:port), upstream, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file's directory.
+**How it's built.** `src/main.rs` + `src/settings.rs`. Eight settings, **all required, unknown keys denied**: users_db, listen_addr (a literal IP:port), upstream, front_page_message, session_ttl_secs (1s–10y), cookie_secure, monitor_addr (loopback only), monitor_queue_len (≥1). Relative users_db resolves against the config file's directory.
 
 **Steps in execution.**
 

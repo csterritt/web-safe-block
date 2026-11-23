@@ -23,6 +23,9 @@ listen_addr = "127.0.0.1:8080"
 # Protected server: http://host:port (no path), or unix:/absolute/path.sock.
 upstream = "http://127.0.0.1:3000"
 
+# Plain text shown in a paragraph above the sign-in form (HTML is escaped).
+front_page_message = "Site Description Here"
+
 # Session lifetime in seconds (180 days, about 6 months).
 session_ttl_secs = 15552000
 
@@ -43,6 +46,7 @@ struct RawSettings {
     users_db: PathBuf,
     listen_addr: SocketAddr,
     upstream: String,
+    front_page_message: String,
     session_ttl_secs: u64,
     cookie_secure: bool,
     monitor_addr: SocketAddr,
@@ -55,6 +59,7 @@ pub struct Settings {
     pub users_db: PathBuf,
     pub listen_addr: SocketAddr,
     pub upstream: Upstream,
+    pub front_page_message: String,
     pub session_ttl_secs: u64,
     pub cookie_secure: bool,
     pub monitor_addr: SocketAddr,
@@ -116,6 +121,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         users_db,
         listen_addr: raw.listen_addr,
         upstream,
+        front_page_message: raw.front_page_message,
         session_ttl_secs: raw.session_ttl_secs,
         cookie_secure: raw.cookie_secure,
         monitor_addr: raw.monitor_addr,
@@ -184,6 +190,7 @@ mod tests {
         assert_eq!(s.users_db, dir.join("users.db"));
         assert_eq!(s.listen_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(s.upstream, "http://127.0.0.1:3000".parse().unwrap());
+        assert_eq!(s.front_page_message, "Site Description Here");
         assert_eq!(s.session_ttl_secs / 86_400, 180);
         assert!(s.cookie_secure);
         assert_eq!(s.monitor_addr, "127.0.0.1:8081".parse().unwrap());

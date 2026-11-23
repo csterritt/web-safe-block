@@ -49,6 +49,8 @@ pub enum EventKind {
     Proxied,
     /// Authenticated request asked for a protocol upgrade; refused with 501.
     Upgrade,
+    /// Request for /robots.txt; answered by the gate.
+    Robots,
     /// Request for an unknown path under `/__wsb/`.
     Reserved,
     /// Anything else, e.g. wrong method or malformed login form.
