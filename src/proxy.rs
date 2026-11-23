@@ -62,10 +62,10 @@ pub(crate) async fn proxy_or_login(
 }
 
 async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Response {
-    let upstream = &state.config.upstream;
+    let (scheme, authority) = state.config.upstream.request_base();
     let mut parts = req.uri().clone().into_parts();
-    parts.scheme = upstream.scheme().cloned();
-    parts.authority = upstream.authority().cloned();
+    parts.scheme = Some(scheme);
+    parts.authority = Some(authority);
     let new_uri = match Uri::from_parts(parts) {
         Ok(u) => u,
         Err(_) => return plain_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),

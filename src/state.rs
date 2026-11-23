@@ -5,14 +5,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::Uri;
-use hyper_util::client::legacy::Client;
+use axum::http::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::{Client, ResponseFuture};
 use hyper_util::rt::TokioExecutor;
 
 use crate::monitor::EventQueue;
 use crate::sessions::Session;
 use crate::settings::Settings;
+#[cfg(unix)]
+use crate::upstream::UnixConnector;
+use crate::upstream::Upstream;
 use crate::users::UserStore;
 
 #[derive(Clone, Copy, Debug)]
@@ -58,8 +61,8 @@ impl Default for Limits {
 pub struct Config {
     /// Users that may log in, looked up by user name and pass phrase.
     pub users: Arc<UserStore>,
-    /// Upstream base URI (http scheme + host + optional port).
-    pub upstream: Uri,
+    /// Upstream base: an `http://host[:port]` URI or a unix socket path.
+    pub upstream: Upstream,
     pub session_ttl: Duration,
     /// Emit `Secure` on session cookies.
     pub cookie_secure: bool,
@@ -88,7 +91,7 @@ pub(crate) struct AppState {
     pub sessions: Arc<Mutex<HashMap<String, Session>>>,
     pub failures: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     pub events: Arc<EventQueue>,
-    pub client: Client<HttpConnector, Body>,
+    pub client: UpstreamClient,
     /// Serializes Argon2 hashing so at most one ~12 MiB run happens at a time.
     pub hash_slot: Arc<tokio::sync::Mutex<()>>,
     /// Serializes every session DB mutation and reload; the value is the last
@@ -100,11 +103,40 @@ pub(crate) struct AppState {
     pub login_waiters: Arc<tokio::sync::Semaphore>,
 }
 
+/// The hyper client used to reach upstream — TCP for `http://`, a unix
+/// domain socket for `unix:/path`. Both share the connect timeout.
+#[derive(Clone)]
+pub(crate) enum UpstreamClient {
+    Tcp(Client<HttpConnector, Body>),
+    #[cfg(unix)]
+    Unix(Client<UnixConnector, Body>),
+}
+
+impl UpstreamClient {
+    pub(crate) fn request(&self, req: Request<Body>) -> ResponseFuture {
+        match self {
+            UpstreamClient::Tcp(c) => c.request(req),
+            #[cfg(unix)]
+            UpstreamClient::Unix(c) => c.request(req),
+        }
+    }
+}
+
 impl AppState {
     pub fn new(config: Config, events: Arc<EventQueue>) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = match &config.upstream {
+            Upstream::Http(_) => {
+                let mut connector = HttpConnector::new();
+                connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
+                UpstreamClient::Tcp(Client::builder(TokioExecutor::new()).build(connector))
+            }
+            #[cfg(unix)]
+            Upstream::Unix(path) => {
+                let connector =
+                    UnixConnector::new(path.clone(), config.limits.upstream_connect_timeout);
+                UpstreamClient::Unix(Client::builder(TokioExecutor::new()).build(connector))
+            }
+        };
         let max_upstream_requests = config.limits.max_upstream_requests;
         let max_login_waiters = config.limits.max_login_waiters;
         AppState {

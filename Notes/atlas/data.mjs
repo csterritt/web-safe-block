@@ -60,7 +60,7 @@ export const DECISIONS = [
   { axis: 'Client IP', decision: 'CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback', adr: '[0003](./adr/0003-trusted-edge-header.md)' },
   { axis: 'Config', decision: 'Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y', adr: '[0004](./adr/0004-strict-config.md)' },
   { axis: 'Monitor', decision: 'One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten', adr: '[0005](./adr/0005-one-monitor.md)' },
-  { axis: 'Upstream', decision: 'http:// only, no path — the protected app stays on loopback', adr: '—' },
+  { axis: 'Upstream', decision: 'http:// (no path) or unix:/absolute/path socket — the protected app stays on the same machine', adr: '—' },
   { axis: 'Reserved paths', decision: '/__wsb/* is never forwarded; cross-site POSTs to it are rejected', adr: '—' },
   { axis: 'Shared caches', decision: 'Upstream Cache-Control is rewritten to private (public/s-maxage/proxy-revalidate and CDN override headers dropped) — a shared cache must never serve a gated page', adr: '—' },
   { axis: 'Protocol upgrades', decision: 'An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost)', adr: '—' },
@@ -164,7 +164,7 @@ export const NODES = [
   { id: 'F', code: 'F', name: 'Forwarder', short: 'FORWARDER', group: 'relay', gx: 10.5, gy: 3, w: 2.5, d: 2, h: 44, kind: 'box',
     one: 'Rewrites the request, scrubs it, sends it upstream, brings the answer back.',
     what: 'Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app\'s answer.',
-    how: '<code>hyper-util</code> client in <code>forward()</code> (<code>src/proxy.rs</code>). Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers (a client <code>Connection</code> header can\'t remove Host or Content-Length), and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (<code>IdleTimeoutBody</code>) that cuts off stalled streams. At most <mark>256 requests</mark> run upstream at once — extras get 503 — and the permit is held until the response body finishes — and a client that stops reading loses the connection (and the permit) after the 60s write-stall timeout in <code>src/server.rs</code>. Upstream Cache-Control is <mark>rewritten to private</mark> (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.',
+    how: '<code>hyper-util</code> client in <code>forward()</code> (<code>src/proxy.rs</code>), connecting over TCP or the configured unix socket (same 10s connect timeout). Swaps scheme+authority for <code>upstream</code>; strips <code>wsb_session</code>, hop-by-hop headers (a client <code>Connection</code> header can\'t remove Host or Content-Length), and <mark>all client-sent Forwarded/X-Forwarded-*/X-Real-IP</mark>; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (<code>IdleTimeoutBody</code>) that cuts off stalled streams. At most <mark>256 requests</mark> run upstream at once — extras get 503 — and the permit is held until the response body finishes — and a client that stops reading loses the connection (and the permit) after the 60s write-stall timeout in <code>src/server.rs</code>. Upstream Cache-Control is <mark>rewritten to private</mark> (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.',
     steps: [
       ['Rewrite', 'Keep path+query; replace scheme and authority with upstream.'],
       ['Scrub', 'Session cookie out; hop-by-hop out; client forwarding headers out.'],
@@ -178,15 +178,15 @@ export const NODES = [
       { q: 'The body-idle timer only runs while downstream polls frames — a slow-reading client can hold an upstream permit indefinitely. Idle the connection, not just the upstream read?', r: 'Fixed — a custom accept loop (src/server.rs) wraps each connection in StallTimeoutIo: a write stalled 60s fails the connection, plus a 30s header-read timeout; a stalled client frees its permit (review-4 finding 5, fixed).' },
     ] },
   { id: 'UP', code: 'A', name: 'Protected app', short: 'UPSTREAM', group: 'relay', gx: 14, gy: 3, w: 3, d: 2.5, h: 18, kind: 'slab',
-    one: 'The web server being sheltered — bound to loopback, reachable only through the gate.',
+    one: 'The web server being sheltered — bound to loopback or a unix socket, reachable only through the gate.',
     what: 'Whatever app you are protecting: a blog, a dashboard, a thing that was never hardened. It sees only requests the gate already decided to allow, carrying honest forwarding headers.',
-    how: 'Any http server on <code>upstream</code> (default <code>http://127.0.0.1:3000</code>, <mark>http only, no path</mark>). It receives <code>X-Forwarded-For/Proto/Host</code> and never the <code>wsb_session</code> cookie.',
+    how: 'Any http server on <code>upstream</code> (default <code>http://127.0.0.1:3000</code>, http with no path — or <code>unix:/absolute/path.sock</code>, where <mark>file permissions</mark> keep other local processes out; a loopback TCP port cannot). It receives the visitor\'s <code>Host</code>, <code>X-Forwarded-For/Proto/Host</code> and never the <code>wsb_session</code> cookie.',
     steps: [
       ['Serve', 'Handle the request as if the caller were already trusted.'],
       ['Respond', 'Answer streams back through the forwarder to the visitor.'],
     ],
     cond: [
-      'Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?',
+      { q: 'Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?', r: 'Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.' },
     ] },
   // ---- Operating it ----
   { id: 'OP', code: 'O', name: 'Operator', short: 'OPERATOR', group: 'ops', gx: -1, gy: 1, w: 2, d: 2, h: 30, kind: 'screen',

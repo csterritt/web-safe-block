@@ -5,8 +5,9 @@ use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use axum::http::{Uri, uri::Scheme};
 use serde::Deserialize;
+
+use crate::upstream::Upstream;
 
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -19,7 +20,7 @@ users_db = "users.db"
 # Public-facing address (point Cloudflare Tunnel here).
 listen_addr = "127.0.0.1:8080"
 
-# Protected server; must be http:// with no path.
+# Protected server: http://host:port (no path), or unix:/absolute/path.sock.
 upstream = "http://127.0.0.1:3000"
 
 # Session lifetime in seconds (180 days, about 6 months).
@@ -53,7 +54,7 @@ pub struct Settings {
     /// Resolved against the config file's directory.
     pub users_db: PathBuf,
     pub listen_addr: SocketAddr,
-    pub upstream: Uri,
+    pub upstream: Upstream,
     pub session_ttl_secs: u64,
     pub cookie_secure: bool,
     pub monitor_addr: SocketAddr,
@@ -86,31 +87,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         .map_err(|e| format!("invalid config file {}: {e}", path.display()))?;
     let bad = |msg: String| format!("invalid config file {}: {msg}", path.display());
 
-    let upstream: Uri = raw
-        .upstream
-        .parse()
-        .map_err(|_| bad(format!("upstream is not a valid URI: {:?}", raw.upstream)))?;
-    if upstream.scheme() != Some(&Scheme::HTTP) || upstream.authority().is_none() {
-        return Err(bad(format!(
-            "upstream must be an http:// URI with a host: {:?}",
-            raw.upstream
-        )));
-    }
-    if upstream
-        .authority()
-        .is_some_and(|a| a.as_str().contains('@'))
-    {
-        return Err(bad(format!(
-            "upstream must not contain userinfo (user:pass@): {:?}",
-            raw.upstream
-        )));
-    }
-    if upstream.path_and_query().is_some_and(|pq| pq != "/") {
-        return Err(bad(format!(
-            "upstream must not have a path or query: {:?}",
-            raw.upstream
-        )));
-    }
+    let upstream: Upstream = raw.upstream.parse().map_err(&bad)?;
     if !raw.monitor_addr.ip().is_loopback() {
         return Err(bad(format!(
             "monitor_addr must be a loopback address, got {}",
@@ -206,7 +183,7 @@ mod tests {
         let s = load(&path).unwrap();
         assert_eq!(s.users_db, dir.join("users.db"));
         assert_eq!(s.listen_addr, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(s.upstream, "http://127.0.0.1:3000");
+        assert_eq!(s.upstream, "http://127.0.0.1:3000".parse().unwrap());
         assert_eq!(s.session_ttl_secs / 86_400, 180);
         assert!(s.cookie_secure);
         assert_eq!(s.monitor_addr, "127.0.0.1:8081".parse().unwrap());
@@ -290,6 +267,26 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upstream_unix_socket() {
+        let s = load_str(&replace("upstream", "upstream = \"unix:/run/app.sock\"")).unwrap();
+        assert_eq!(
+            s.upstream,
+            crate::upstream::Upstream::Unix(Path::new("/run/app.sock").into())
+        );
+        assert_eq!(s.upstream.to_string(), "unix:/run/app.sock");
+
+        for (line, needle) in [
+            ("upstream = \"unix:\"", "unix:/absolute/path"),
+            ("upstream = \"unix:run/app.sock\"", "absolute"),
+            ("upstream = \"unix://run/app.sock\"", "unix:/absolute/path"),
+        ] {
+            let err = load_str(&replace("upstream", line)).unwrap_err();
+            assert!(err.contains(needle), "{line}: {err}");
+        }
+    }
+
     #[test]
     fn upstream_root_slash_ok() {
         let s = load_str(&replace(
@@ -297,7 +294,7 @@ mod tests {
             "upstream = \"http://127.0.0.1:3000/\"",
         ))
         .unwrap();
-        assert_eq!(s.upstream, "http://127.0.0.1:3000/");
+        assert_eq!(s.upstream, "http://127.0.0.1:3000/".parse().unwrap());
     }
 
     #[test]

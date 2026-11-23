@@ -4,7 +4,7 @@ Status: accepted (2026-11)
 
 ## Decision
 
-`config.toml` must contain all seven settings (`users_db`, `listen_addr`, `upstream`, `session_ttl_secs`, `cookie_secure`, `monitor_addr`, `monitor_queue_len`); `serde(deny_unknown_fields)` rejects anything extra. `write-config` emits a commented template and refuses to overwrite. A relative `users_db` resolves against the config file's directory. `monitor_addr` must be loopback; `upstream` must be `http://` with no path.
+`config.toml` must contain all seven settings (`users_db`, `listen_addr`, `upstream`, `session_ttl_secs`, `cookie_secure`, `monitor_addr`, `monitor_queue_len`); `serde(deny_unknown_fields)` rejects anything extra. `write-config` emits a commented template and refuses to overwrite. A relative `users_db` resolves against the config file's directory. `monitor_addr` must be loopback; `upstream` must be `http://` with no path, or `unix:/absolute/path` (added 2026-11-23).
 
 ## Why
 

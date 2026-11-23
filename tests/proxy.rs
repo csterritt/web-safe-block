@@ -1913,3 +1913,86 @@ async fn stalled_client_does_not_hold_upstream_permit() {
     }
     drop(stalled);
 }
+
+/// Unix-socket upstream: echoes Host, X-Forwarded-For, Cookie and path so the
+/// test can see exactly what the gate forwarded.
+#[cfg(unix)]
+async fn spawn_unix_upstream() -> PathBuf {
+    async fn echo(req: Request) -> String {
+        let h = req.headers();
+        let get = |n: &str| {
+            h.get(n)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.to_string())
+            .unwrap_or_default();
+        format!(
+            "{}|{}|{}|{}",
+            get("host"),
+            get("x-forwarded-for"),
+            get("cookie"),
+            path
+        )
+    }
+    // Keep the path short: sun_path is limited (~104 bytes on macOS).
+    let sock = temp_dir().join("s.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let app = Router::new().fallback(any(echo));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    sock
+}
+
+/// An authenticated request to a unix-socket upstream keeps the visitor's
+/// Host header, gets X-Forwarded-For, and has wsb_session stripped.
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_upstream_forwards() {
+    let sock = spawn_unix_upstream().await;
+    let proxy = spawn_proxy(&format!("unix:{}", sock.display())).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let resp = client
+        .get(format!("{base}/some/path?x=1"))
+        .header(
+            header::COOKIE,
+            format!("other=1; wsb_session={token}; more=2"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let parts: Vec<&str> = body.split('|').collect();
+    assert_eq!(parts.len(), 4, "body: {body}");
+    assert_eq!(parts[0], proxy.to_string(), "visitor Host not forwarded");
+    assert!(!parts[1].is_empty(), "no X-Forwarded-For");
+    assert_eq!(parts[2], "other=1; more=2", "wsb_session not stripped");
+    assert_eq!(parts[3], "/some/path?x=1");
+}
+
+/// A unix upstream whose socket does not exist answers 502, like a refused
+/// TCP connection.
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_upstream_missing_socket_is_502() {
+    let sock = temp_dir().join("missing.sock");
+    let proxy = spawn_proxy(&format!("unix:{}", sock.display())).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let resp = client
+        .get(format!("{base}/foo"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+}

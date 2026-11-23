@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **7 open · 16 resolved**._
+_Question status: **6 open · 17 resolved**._
 
 ## One paragraph
 
@@ -20,7 +20,7 @@ web-safe-block is a small Rust program that parks itself in front of a web serve
 | Client IP | CF-Connecting-IP is trusted only from a loopback peer (cloudflared on the same box) and when it parses as an IP; any other peer is keyed on its own address. serve warns if listen_addr is not loopback | [0003](./adr/0003-trusted-edge-header.md) |
 | Config | Every setting required; unknown keys rejected; relative users_db resolves against the config file; session_ttl_secs bounded to 1s–10y | [0004](./adr/0004-strict-config.md) |
 | Monitor | One loopback JSON-lines client at a time; queue bounded by count and ~4 MiB, oldest overwritten | [0005](./adr/0005-one-monitor.md) |
-| Upstream | http:// only, no path — the protected app stays on loopback | — |
+| Upstream | http:// (no path) or unix:/absolute/path socket — the protected app stays on the same machine | — |
 | Reserved paths | /__wsb/* is never forwarded; cross-site POSTs to it are rejected | — |
 | Shared caches | Upstream Cache-Control is rewritten to private (public/s-maxage/proxy-revalidate and CDN override headers dropped) — a shared cache must never serve a gated page | — |
 | Protocol upgrades | An Upgrade header gets 501 after the session check — never proxied (a real WS relay is still a ghost) | — |
@@ -181,7 +181,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Once you are known, this is the actual proxy. It points your request at the protected app, removes everything that could confuse or poison it — including the session cookie itself — and returns the app's answer.
 
-**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers (a client `Connection` header can't remove Host or Content-Length), and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (`IdleTimeoutBody`) that cuts off stalled streams. At most **256 requests** run upstream at once — extras get 503 — and the permit is held until the response body finishes — and a client that stops reading loses the connection (and the permit) after the 60s write-stall timeout in `src/server.rs`. Upstream Cache-Control is **rewritten to private** (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
+**How it's built.** `hyper-util` client in `forward()` (`src/proxy.rs`), connecting over TCP or the configured unix socket (same 10s connect timeout). Swaps scheme+authority for `upstream`; strips `wsb_session`, hop-by-hop headers (a client `Connection` header can't remove Host or Content-Length), and **all client-sent Forwarded/X-Forwarded-*/X-Real-IP**; then stamps its own X-Forwarded-For (client IP), -Proto (https when cookies are Secure), -Host. 10s connect, 60s response-header deadline → 502/504, plus a 60s body-idle timeout (`IdleTimeoutBody`) that cuts off stalled streams. At most **256 requests** run upstream at once — extras get 503 — and the permit is held until the response body finishes — and a client that stops reading loses the connection (and the permit) after the 60s write-stall timeout in `src/server.rs`. Upstream Cache-Control is **rewritten to private** (public/s-maxage/proxy-revalidate and CDN override headers dropped) so a shared cache never serves a gated page; upstream Set-Cookie for wsb_session is dropped. Upgrade requests never reach here — the gate answers them 501.
 
 **Steps in execution.**
 
@@ -199,11 +199,11 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 #### A · Protected app
 
-**In one line.** The web server being sheltered — bound to loopback, reachable only through the gate.
+**In one line.** The web server being sheltered — bound to loopback or a unix socket, reachable only through the gate.
 
 **What it does.** Whatever app you are protecting: a blog, a dashboard, a thing that was never hardened. It sees only requests the gate already decided to allow, carrying honest forwarding headers.
 
-**How it's built.** Any http server on `upstream` (default `http://127.0.0.1:3000`, **http only, no path**). It receives `X-Forwarded-For/Proto/Host` and never the `wsb_session` cookie.
+**How it's built.** Any http server on `upstream` (default `http://127.0.0.1:3000`, http with no path — or `unix:/absolute/path.sock`, where **file permissions** keep other local processes out; a loopback TCP port cannot). It receives the visitor's `Host`, `X-Forwarded-For/Proto/Host` and never the `wsb_session` cookie.
 
 **Steps in execution.**
 
@@ -212,7 +212,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **Questions.**
 
-- **Q-A1** Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?
+- ~~**Q-A1** Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?~~ ✓ Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.
 
 ### Operating it
 
@@ -390,7 +390,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - ~~**Q-F1**~~ (F) ✓ No — inbound forwarding headers are discarded and rebuilt from verified proxy metadata (review-1 finding 1, fixed).
 - ~~**Q-F2**~~ (F) ✓ Fixed — a 60s body-idle timeout (IdleTimeoutBody) ends stalled streams, and a 256-permit semaphore bounds concurrent upstream requests (commit f5285b2).
 - ~~**Q-F3**~~ (F) ✓ Fixed — a custom accept loop (src/server.rs) wraps each connection in StallTimeoutIo: a write stalled 60s fails the connection, plus a 30s header-read timeout; a stalled client frees its permit (review-4 finding 5, fixed).
-- **Q-A1** (A) Upstream is http-on-loopback only — will a real deployment ever need https upstream or a unix socket?
+- ~~**Q-A1**~~ (A) ✓ Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
 - **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
 - **Q-M1** (M) The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?

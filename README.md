@@ -56,7 +56,7 @@ Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `s
 |---------------------|---------------------------|---|
 | `users_db`          | `"users.db"`              | sqlite3 users database. A relative path is relative to the config file's directory. |
 | `listen_addr`       | `"127.0.0.1:8080"`        | Public-facing address web-safe-block listens on. |
-| `upstream`          | `"http://127.0.0.1:3000"` | Protected server (must be `http://` with no path). |
+| `upstream`          | `"http://127.0.0.1:3000"` | Protected server: `http://host:port` (no path) or `unix:/absolute/path.sock`. |
 | `session_ttl_secs`  | `15552000` (180 days)     | Session lifetime; at most 10 years (315360000). |
 | `cookie_secure`     | `true`                    | Set to `false` to omit the `Secure` cookie flag (plain-http testing on a non-localhost host). |
 | `monitor_addr`      | `"127.0.0.1:8081"`        | Local monitor port. Must be a loopback address. |
@@ -134,6 +134,12 @@ $ nc 127.0.0.1 8081
 - WebSockets and other protocol upgrades are not supported in v1; authenticated requests with an `Upgrade` header are answered 501 and never forwarded.
 - Paths under `/__wsb/` are reserved and never forwarded.
 - Cookies are not port-scoped: other services on the same hostname will also receive `wsb_session`.
+
+#### Unix socket upstream
+
+`upstream` also accepts a unix domain socket: `unix:/absolute/path.sock`. The path must be absolute (`unix:run/app.sock` and `unix://run/app.sock` are rejected). The socket is not checked at startup — the app may start after the gate; if the socket is missing when a request comes in, the visitor gets a 502 and the error is logged to stderr. The user web-safe-block runs as needs read+write permission on the socket file.
+
+Why use it: a loopback TCP port can be reached by **any** local process, bypassing the gate entirely. A socket with mode `0660` owned by a group shared only by the app and web-safe-block cannot be opened by other local users. Requests are sent with the visitor's `Host` header and the same `X-Forwarded-*` headers as over http.
 
 #### Client IP
 
