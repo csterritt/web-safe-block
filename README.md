@@ -103,6 +103,7 @@ Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session.
 
 ```sh
 $ nc 127.0.0.1 8081
+{"kind":"daily_counts","day":"2026-11-23","since":"2026-11-23T09:14:02Z","final":false,"counts":{"login_succeeded":1,"login_failed":0,"unauth_non_root":3,"rate_limited":0,"login_busy":0,"forbidden":0,"reserved":0,"other":0,"login_error":0,"logout_error":0,"dropped_unseen":2}}
 {"seq":4,"time":"2026-11-16T18:40:01Z","kind":"login_succeeded","status":303,"ip":"203.0.113.9","method":"POST","path":"/__wsb/login","user":"chris","user_agent":"Mozilla/5.0 ..."}
 ```
 
@@ -116,8 +117,9 @@ $ nc 127.0.0.1 8081
 - `ip` is `CF-Connecting-IP` if present and the connection comes from a loopback address (the tunnel), otherwise the peer address. `user` is set for `login_succeeded`, `proxied`, `logout_page`, `logout` and `logout_error`. `truncated` is true when `path` (1024 bytes), `user_agent` (512 bytes) or `method` (32 bytes) was cut to its cap.
 - The request handlers add events to a bounded in-memory queue without blocking. A separate thread sends them to the monitor — at most 100 events per write — and marks them consumed only after they have been written. The queue also has a ~4 MiB total byte budget.
 - When the queue is full, the oldest events are overwritten.
-  - With no monitor connected this happens silently. A monitor that connects later first receives whatever is still queued.
+  - With no monitor connected, each overwrite is counted in the day's `dropped_unseen` counter (below). A monitor that connects later first receives the `daily_counts` lines, then whatever is still queued.
   - If events are overwritten before a connected monitor gets them, it receives `{"kind":"dropped","count":N}`.
+- On connect, before any queued events, the monitor gets one `daily_counts` line per retained UTC day (oldest first, at most 7 days) — security counters kept in memory only, so a restart resets them (`since` is the process start time for the day it started, midnight for later days). While a monitor stays connected, each day that ends at 00:00 UTC is sent again with `"final":true`. Fields, in order: `login_succeeded`, `login_failed`, `unauth_non_root` (unauthenticated requests for a path other than `/` outside `/__wsb/` — probes looking for the app), `rate_limited`, `login_busy`, `forbidden`, `reserved`, `other`, `login_error`, `logout_error`, `dropped_unseen`.
 - Only one monitor can be connected at a time. Another connection gets `{"error":"another monitor is already connected"}` and is closed.
 - If the monitor client stops sending (e.g. `nc 127.0.0.1 8081 < /dev/null`), it gets a `{"kind":"heartbeat",...}` line every 10s while idle; this is how the server finds out when it has gone away.
 

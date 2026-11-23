@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **6 open · 17 resolved**._
+_Question status: **5 open · 18 resolved**._
 
 ## One paragraph
 
@@ -258,17 +258,17 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** Every request — page shown, login won or lost, request proxied — becomes one small record. The queue holds the most recent ones until a monitor comes to read them; when it fills, the oldest are overwritten.
 
-**How it's built.** `VecDeque<Event>` + `Condvar` in `src/monitor.rs`. Each event: `{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}` — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets `truncated`. The queue is bounded by count **and ~4 MiB of retained bytes**; overwrites of unsent events during a live connection are counted and later reported as **{"kind":"dropped"}**; events leave only after they are written to the client, at most 100 per write.
+**How it's built.** `VecDeque<Event>` + `Condvar` in `src/monitor.rs`. Each event: `{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}` — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets `truncated`. The queue is bounded by count **and ~4 MiB of retained bytes**; overwrites of unsent events during a live connection are counted and later reported as **{"kind":"dropped"}**; events leave only after they are written to the client, at most 100 per write. Alongside the queue, **per-UTC-day security counters** (last 7 days, memory only) tally logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors — and events evicted while nobody is watching (`dropped_unseen`).
 
 **Steps in execution.**
 
-1. **Push** — Stamp seq + UTC time; if full, evict the oldest (count it if a monitor is attached).
+1. **Push** — Stamp seq + UTC time; count the kind in today's counters; if full, evict the oldest (dropped notice if a monitor is attached, dropped_unseen if not).
 2. **Pending** — Wait on the condvar; hand the batch out but keep it queued.
 3. **Consume** — mark_consumed only after the bytes hit the socket.
 
 **Questions.**
 
-- **Q-Q1** Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
+- ~~**Q-Q1** Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?~~ ✓ Yes — every eviction with no monitor attached is counted as dropped_unseen in in-memory per-UTC-day security counters (logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors); a new monitor first receives the last 7 days as daily_counts lines, and a connected monitor gets each day's final line at 00:00 UTC (2026-11-23).
 
 #### M · Monitor port
 
@@ -276,13 +276,14 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.
 
-**How it's built.** Plain `TcpListener` on `monitor_addr` (**loopback enforced in config**) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get `{"error":"another monitor is already connected"}`. Once a client half-closes, a `heartbeat` line every 10s probes for gone-aways — a reset frees the slot.
+**How it's built.** Plain `TcpListener` on `monitor_addr` (**loopback enforced in config**) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get `{"error":"another monitor is already connected"}` — **never the counters**. On connect the client first receives one `daily_counts` line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with `"final":true`. Once a client half-closes, a `heartbeat` line every 10s probes for gone-aways — a reset frees the slot.
 
 **Steps in execution.**
 
 1. **Accept** — One slot: try_connect or send the busy error and close.
-2. **Stream** — Wait for pending events; write JSON lines + dropped notices.
-3. **Probe** — After EOF on reads, heartbeat every 10s; a reset ends the connection.
+2. **Report** — Write the retained days' daily_counts lines first.
+3. **Stream** — Wait for pending events; write JSON lines + dropped notices; a finished day's final counts go out at 00:00 UTC.
+4. **Probe** — After EOF on reads, heartbeat every 10s; a reset ends the connection.
 
 **Questions.**
 
@@ -392,7 +393,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 - ~~**Q-F3**~~ (F) ✓ Fixed — a custom accept loop (src/server.rs) wraps each connection in StallTimeoutIo: a write stalled 60s fails the connection, plus a 30s header-read timeout; a stalled client frees its permit (review-4 finding 5, fixed).
 - ~~**Q-A1**~~ (A) ✓ Unix socket: yes — upstream = "unix:/absolute/path.sock" (2026-11-23); socket permissions keep other local processes out. https upstream: not supported; use a sidecar (stunnel/socat) if the app is off-host.
 - **Q-C1** (C) Single config file, no environment overrides or flags — fine for a small self-hosted tool, or will it annoy deployment?
-- **Q-Q1** (Q) Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?
+- ~~**Q-Q1**~~ (Q) ✓ Yes — every eviction with no monitor attached is counted as dropped_unseen in in-memory per-UTC-day security counters (logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors); a new monitor first receives the last 7 days as daily_counts lines, and a connected monitor gets each day's final line at 00:00 UTC (2026-11-23).
 - **Q-M1** (M) The monitor trusts loopback alone — any local process can watch the request stream. Is that fine, or should it take a token?
 - ~~**Q-W1**~~ (W) ✓ Yes — the gate answers 501 (kind upgrade) to authenticated Upgrade requests and forwards nothing (2026-11-17).
 

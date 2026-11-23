@@ -218,22 +218,23 @@ export const NODES = [
   { id: 'EQ', code: 'Q', name: 'Event queue', short: 'EVENT QUEUE', group: 'ops', gx: 9.5, gy: 9.5, w: 2, d: 2, h: 18, kind: 'store',
     one: 'A bounded ring of "what just happened" — handlers push without blocking.',
     what: 'Every request — page shown, login won or lost, request proxied — becomes one small record. The queue holds the most recent ones until a monitor comes to read them; when it fills, the oldest are overwritten.',
-    how: '<code>VecDeque&lt;Event&gt;</code> + <code>Condvar</code> in <code>src/monitor.rs</code>. Each event: <code>{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}</code> — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets <code>truncated</code>. The queue is bounded by count <mark>and ~4 MiB of retained bytes</mark>; overwrites of unsent events during a live connection are counted and later reported as <mark>{"kind":"dropped"}</mark>; events leave only after they are written to the client, at most 100 per write.',
+    how: '<code>VecDeque&lt;Event&gt;</code> + <code>Condvar</code> in <code>src/monitor.rs</code>. Each event: <code>{seq, time, kind, status, ip, method, path, user?, user_agent?, truncated}</code> — the middleware caps fields (method 32 B, path+query 1 KiB, UA 512 B) on char boundaries and sets <code>truncated</code>. The queue is bounded by count <mark>and ~4 MiB of retained bytes</mark>; overwrites of unsent events during a live connection are counted and later reported as <mark>{"kind":"dropped"}</mark>; events leave only after they are written to the client, at most 100 per write. Alongside the queue, <mark>per-UTC-day security counters</mark> (last 7 days, memory only) tally logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors — and events evicted while nobody is watching (<code>dropped_unseen</code>).',
     steps: [
-      ['Push', 'Stamp seq + UTC time; if full, evict the oldest (count it if a monitor is attached).'],
+      ['Push', 'Stamp seq + UTC time; count the kind in today\'s counters; if full, evict the oldest (dropped notice if a monitor is attached, dropped_unseen if not).'],
       ['Pending', 'Wait on the condvar; hand the batch out but keep it queued.'],
       ['Consume', 'mark_consumed only after the bytes hit the socket.'],
     ],
     cond: [
-      'Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?',
+      { q: 'Events overwritten while no monitor is connected vanish silently — should that count be surfaced to the next monitor?', r: 'Yes — every eviction with no monitor attached is counted as dropped_unseen in in-memory per-UTC-day security counters (logins won/lost, unauthenticated non-root probes, rate-limited, login_busy, forbidden, reserved, other, login/logout errors); a new monitor first receives the last 7 days as daily_counts lines, and a connected monitor gets each day\'s final line at 00:00 UTC (2026-11-23).' },
     ] },
   { id: 'MO', code: 'M', name: 'Monitor port', short: 'MONITOR', group: 'ops', gx: 13, gy: 10, w: 2, d: 2, h: 26, kind: 'screen',
     one: 'One loopback TCP client at a time gets the live JSON-lines feed.',
     what: 'A peephole for the operator: connect with netcat and watch one JSON line per request scroll by. Only one watcher at a time; a second connection is told it is busy and hung up.',
-    how: 'Plain <code>TcpListener</code> on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get <code>{"error":"another monitor is already connected"}</code>. Once a client half-closes, a <code>heartbeat</code> line every 10s probes for gone-aways — a reset frees the slot.',
+    how: 'Plain <code>TcpListener</code> on <code>monitor_addr</code> (<mark>loopback enforced in config</mark>) on its own OS thread; each client is served on a further thread, writes timing out at 30s and client input discarded. Second clients get <code>{"error":"another monitor is already connected"}</code> — <mark>never the counters</mark>. On connect the client first receives one <code>daily_counts</code> line per retained UTC day (up to 7, oldest first); while it stays connected, each day that ends at 00:00 UTC is pushed with <code>"final":true</code>. Once a client half-closes, a <code>heartbeat</code> line every 10s probes for gone-aways — a reset frees the slot.',
     steps: [
       ['Accept', 'One slot: try_connect or send the busy error and close.'],
-      ['Stream', 'Wait for pending events; write JSON lines + dropped notices.'],
+      ['Report', 'Write the retained days\' daily_counts lines first.'],
+      ['Stream', 'Wait for pending events; write JSON lines + dropped notices; a finished day\'s final counts go out at 00:00 UTC.'],
       ['Probe', 'After EOF on reads, heartbeat every 10s; a reset ends the connection.'],
     ],
     cond: [

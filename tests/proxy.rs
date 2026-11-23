@@ -185,22 +185,72 @@ async fn spawn_proxy_full(
     (addr, monitor_addr, db)
 }
 
-struct MonitorClient(BufReader<std::net::TcpStream>);
+struct MonitorClient {
+    r: BufReader<std::net::TcpStream>,
+    /// The `daily_counts` lines the monitor sends on connect, oldest first.
+    daily: Vec<serde_json::Value>,
+    /// First non-daily line read while draining the daily block.
+    pending: Option<serde_json::Value>,
+}
 
 impl MonitorClient {
     fn connect(addr: SocketAddr) -> Self {
         let s = std::net::TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        MonitorClient(BufReader::new(s))
+        let mut m = MonitorClient {
+            r: BufReader::new(s),
+            daily: Vec::new(),
+            pending: None,
+        };
+        let mut line = String::new();
+        let n = m.r.read_line(&mut line).unwrap();
+        assert!(n > 0, "monitor closed");
+        let first: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if first["kind"] != "daily_counts" {
+            // A busy-error line, or (shouldn't happen) a queued event.
+            m.pending = Some(first);
+            return m;
+        }
+        m.daily.push(first);
+        // The rest of the daily block was already written in one write;
+        // anything non-daily means the block ended.
+        m.r.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        loop {
+            let mut line = String::new();
+            match m.r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if v["kind"] == "daily_counts" {
+                        m.daily.push(v);
+                    } else {
+                        m.pending = Some(v);
+                        break;
+                    }
+                }
+            }
+        }
+        m.r.get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        m
     }
 
     /// Next line, or None on EOF.
     fn line(&mut self) -> Option<String> {
+        if let Some(v) = self.pending.take() {
+            return Some(v.to_string());
+        }
         let mut line = String::new();
-        (self.0.read_line(&mut line).unwrap() > 0).then_some(line)
+        (self.r.read_line(&mut line).unwrap() > 0).then_some(line)
     }
 
     fn event(&mut self) -> serde_json::Value {
+        if let Some(v) = self.pending.take() {
+            return v;
+        }
         serde_json::from_str(&self.line().expect("monitor closed")).unwrap()
     }
 }
@@ -210,24 +260,12 @@ impl MonitorClient {
 fn connect_when_free(addr: SocketAddr) -> (MonitorClient, Option<serde_json::Value>) {
     for _ in 0..50 {
         let mut m = MonitorClient::connect(addr);
-        m.0.get_ref()
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        let mut line = String::new();
-        let first = match m.0.read_line(&mut line) {
-            Ok(_) if line.contains("already connected") => {
+        match m.pending.take() {
+            Some(v) if v.to_string().contains("already connected") => {
                 std::thread::sleep(Duration::from_millis(100));
-                continue;
             }
-            Ok(0) => panic!("monitor closed"),
-            Ok(_) => Some(serde_json::from_str(&line).unwrap()),
-            // Timed out with nothing to read: we hold the slot.
-            Err(_) => None,
-        };
-        m.0.get_ref()
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        return (m, first);
+            first => return (m, first),
+        }
     }
     panic!("monitor slot never freed");
 }
@@ -238,7 +276,7 @@ async fn monitor_half_closed_client() {
     let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
     let (proxy, monitor_addr) = spawn_proxy_with_monitor(&upstream, 10).await;
     let mut m = MonitorClient::connect(monitor_addr);
-    m.0.get_ref().shutdown(std::net::Shutdown::Write).unwrap();
+    m.r.get_ref().shutdown(std::net::Shutdown::Write).unwrap();
     assert_eq!(m.event()["kind"], "heartbeat");
     client()
         .get(format!("http://{proxy}/x"))
@@ -370,6 +408,46 @@ async fn monitor_reports() {
     let e = m.event();
     assert_eq!(e["path"], "/after", "{e}");
     assert_eq!(e["seq"], 13);
+}
+
+/// The monitor's opening block is today's counters; queued events follow it.
+#[tokio::test(flavor = "multi_thread")]
+async fn monitor_daily_counts() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, monitor_addr) = spawn_proxy_with_monitor(&upstream, 100).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+
+    // An unauthenticated probe on a non-root path, a failed login, a good one.
+    client.get(format!("{base}/wp-admin")).send().await.unwrap();
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
+        .body("user=alice&phrase=wrong&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    login_token(&client, &base).await;
+
+    let mut m = MonitorClient::connect(monitor_addr);
+    assert_eq!(m.daily.len(), 1, "{:?}", m.daily);
+    let today = &m.daily[0];
+    assert_eq!(today["kind"], "daily_counts");
+    assert_eq!(today["final"], false);
+    let counts = &today["counts"];
+    assert_eq!(counts["login_succeeded"], 1);
+    assert_eq!(counts["login_failed"], 1);
+    assert_eq!(counts["unauth_non_root"], 1);
+
+    // The queued events arrive after the daily block, in order.
+    let kinds: Vec<serde_json::Value> = (0..3).map(|_| m.event()["kind"].clone()).collect();
+    assert_eq!(
+        kinds,
+        ["login_page", "login_failed", "login_succeeded"],
+        "{kinds:?}"
+    );
 }
 
 fn set_cookie_values(resp: &reqwest::Response) -> Vec<String> {

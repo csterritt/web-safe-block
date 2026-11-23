@@ -91,6 +91,143 @@ pub fn truncate_at(s: &str, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
+/// Per-day counters of security-relevant events, serialized in this order.
+#[derive(Default, Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Counts {
+    login_succeeded: u64,
+    login_failed: u64,
+    /// Unauthenticated requests (login page shown) for a path other than `/`
+    /// outside `/__wsb/` — probes looking for the app.
+    unauth_non_root: u64,
+    rate_limited: u64,
+    login_busy: u64,
+    forbidden: u64,
+    reserved: u64,
+    other: u64,
+    login_error: u64,
+    logout_error: u64,
+    /// Events evicted from the queue while no monitor was connected.
+    dropped_unseen: u64,
+}
+
+/// One retained day's counters, as sent to the monitor.
+#[derive(Debug, Serialize)]
+pub(crate) struct DayReport {
+    kind: &'static str,
+    /// `YYYY-MM-DD`.
+    day: String,
+    /// RFC 3339 of max(day start, process start): a restart mid-day is
+    /// visible because `since` is later than midnight.
+    since: String,
+    /// True for days that have fully ended.
+    r#final: bool,
+    counts: Counts,
+}
+
+/// In-memory counters for the last 7 UTC days. Pure and clock-free: every
+/// method takes `now` as unix seconds.
+#[derive(Default)]
+struct DailyCounts {
+    /// Process start as unix secs (from the queue's clock).
+    started: u64,
+    /// (UTC day number, counts), consecutive days, at most 7.
+    days: VecDeque<(u64, Counts)>,
+}
+
+const RETAINED_DAYS: usize = 7;
+
+impl DailyCounts {
+    fn new(started: u64) -> Self {
+        DailyCounts {
+            started,
+            days: VecDeque::new(),
+        }
+    }
+
+    /// Append zero-filled entries for every day after the last one up to
+    /// today (never before the start day), then trim to the newest 7.
+    fn roll(&mut self, now: u64) {
+        let today = now / 86_400;
+        let mut next = match self.days.back() {
+            Some((d, _)) => d + 1,
+            None => self.started / 86_400,
+        };
+        while next <= today {
+            self.days.push_back((next, Counts::default()));
+            next += 1;
+        }
+        while self.days.len() > RETAINED_DAYS {
+            self.days.pop_front();
+        }
+    }
+
+    fn record(&mut self, now: u64, kind: EventKind, path: &str) {
+        self.roll(now);
+        let Some((_, c)) = self.days.back_mut() else {
+            return;
+        };
+        match kind {
+            EventKind::LoginSucceeded => c.login_succeeded += 1,
+            EventKind::LoginFailed => c.login_failed += 1,
+            EventKind::LoginPage => {
+                let p = path.split('?').next().unwrap_or("");
+                if p != "/" && !p.starts_with("/__wsb/") {
+                    c.unauth_non_root += 1;
+                }
+            }
+            EventKind::RateLimited => c.rate_limited += 1,
+            EventKind::LoginBusy => c.login_busy += 1,
+            EventKind::Forbidden => c.forbidden += 1,
+            EventKind::Reserved => c.reserved += 1,
+            EventKind::Other => c.other += 1,
+            EventKind::LoginError => c.login_error += 1,
+            EventKind::LogoutError => c.logout_error += 1,
+            _ => {}
+        }
+    }
+
+    fn drop_unseen(&mut self, now: u64) {
+        self.roll(now);
+        if let Some((_, c)) = self.days.back_mut() {
+            c.dropped_unseen += 1;
+        }
+    }
+
+    fn report_for(&self, day: u64, counts: &Counts, today: u64) -> DayReport {
+        let day_start = day.saturating_mul(86_400);
+        DayReport {
+            kind: "daily_counts",
+            day: rfc3339(UNIX_EPOCH + Duration::from_secs(day_start))[..10].to_string(),
+            since: rfc3339(UNIX_EPOCH + Duration::from_secs(day_start.max(self.started))),
+            r#final: day < today,
+            counts: counts.clone(),
+        }
+    }
+
+    /// All retained days, oldest first.
+    fn report(&mut self, now: u64) -> Vec<DayReport> {
+        self.roll(now);
+        let today = now / 86_400;
+        self.days
+            .iter()
+            .map(|(d, c)| self.report_for(*d, c, today))
+            .collect()
+    }
+
+    /// The report for a specific past day, if still retained.
+    fn finished(&mut self, day: u64, now: u64) -> Option<DayReport> {
+        self.roll(now);
+        let today = now / 86_400;
+        if day >= today {
+            return None;
+        }
+        self.days
+            .iter()
+            .find(|(d, _)| *d == day)
+            .map(|(d, c)| self.report_for(*d, c, today))
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     events: VecDeque<Event>,
@@ -103,31 +240,55 @@ struct Inner {
     /// not a drop since they were already sent.
     sent_up_to: u64,
     monitor_connected: bool,
+    daily: DailyCounts,
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub struct EventQueue {
     inner: Mutex<Inner>,
     ready: Condvar,
     capacity: usize,
+    /// Unix seconds source; replaceable in tests.
+    clock: fn() -> u64,
 }
 
 impl EventQueue {
     pub fn new(capacity: usize) -> Self {
+        Self::build(capacity, unix_secs)
+    }
+
+    #[cfg(test)]
+    fn with_clock(capacity: usize, clock: fn() -> u64) -> Self {
+        Self::build(capacity, clock)
+    }
+
+    fn build(capacity: usize, clock: fn() -> u64) -> Self {
         assert!(capacity > 0, "event queue capacity must be at least 1");
         EventQueue {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                daily: DailyCounts::new(clock()),
+                ..Inner::default()
+            }),
             ready: Condvar::new(),
             capacity,
+            clock,
         }
     }
 
     /// Add an event, overwriting the oldest unconsumed ones if the queue is
     /// over its count capacity or its total byte budget.
     pub fn push(&self, mut ev: Event) {
+        let now = (self.clock)();
         let mut inner = self.inner.lock().unwrap();
         ev.time = rfc3339(SystemTime::now());
         inner.next_seq += 1;
         ev.seq = inner.next_seq;
+        inner.daily.record(now, ev.kind, &ev.path);
         inner.events.push_back(ev);
         inner.bytes += event_bytes(inner.events.back().unwrap());
         while !inner.events.is_empty()
@@ -135,8 +296,12 @@ impl EventQueue {
         {
             let old = inner.events.pop_front().unwrap();
             inner.bytes -= event_bytes(&old);
-            if inner.monitor_connected && old.seq > inner.sent_up_to {
-                inner.dropped += 1;
+            if inner.monitor_connected {
+                if old.seq > inner.sent_up_to {
+                    inner.dropped += 1;
+                }
+            } else {
+                inner.daily.drop_unseen(now);
             }
         }
         drop(inner);
@@ -167,6 +332,23 @@ impl EventQueue {
             let ev = inner.events.pop_front().unwrap();
             inner.bytes -= event_bytes(&ev);
         }
+    }
+
+    /// The current UTC day number, per this queue's clock.
+    fn utc_day(&self) -> u64 {
+        (self.clock)() / 86_400
+    }
+
+    /// One report per retained day, oldest first.
+    fn daily_report(&self) -> Vec<DayReport> {
+        let now = (self.clock)();
+        self.inner.lock().unwrap().daily.report(now)
+    }
+
+    /// The report for a finished day, if still retained.
+    fn finished_day(&self, day: u64) -> Option<DayReport> {
+        let now = (self.clock)();
+        self.inner.lock().unwrap().daily.finished(day, now)
     }
 
     /// Claim the single monitor slot; false if a monitor is already connected.
@@ -239,6 +421,14 @@ pub fn spawn_monitor(listener: TcpListener, events: Arc<EventQueue>) -> thread::
 
 fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // The daily counters go first, before any queued events.
+    let mut out = String::new();
+    for report in events.daily_report() {
+        out.push_str(&serde_json::to_string(&report).map_err(io::Error::other)?);
+        out.push('\n');
+    }
+    stream.write_all(out.as_bytes())?;
+    let mut day = events.utc_day();
     // EOF on read only means the client stopped sending (e.g. `nc < /dev/null`
     // half-closes); it may still be listening. Once seen, liveness is checked
     // with heartbeat probes instead.
@@ -247,7 +437,17 @@ fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
     let mut next_probe: Option<Instant> = None;
     loop {
         let (batch, dropped) = events.pending(IDLE_CHECK);
-        if batch.is_empty() && dropped == 0 {
+        let mut out = String::new();
+        // UTC midnight passed: send each finished day's final counts.
+        let today = events.utc_day();
+        while day < today {
+            if let Some(report) = events.finished_day(day) {
+                out.push_str(&serde_json::to_string(&report).map_err(io::Error::other)?);
+                out.push('\n');
+            }
+            day += 1;
+        }
+        if out.is_empty() && batch.is_empty() && dropped == 0 {
             if !half_closed {
                 half_closed = read_eof(&stream)?;
             }
@@ -257,7 +457,6 @@ fn serve_monitor(mut stream: TcpStream, events: &EventQueue) -> io::Result<()> {
             }
             continue;
         }
-        let mut out = String::new();
         if dropped > 0 {
             out.push_str(&serde_json::json!({"kind": "dropped", "count": dropped}).to_string());
             out.push('\n');
@@ -343,6 +542,8 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn ev(path: &str) -> Event {
         Event {
@@ -504,5 +705,207 @@ mod tests {
         assert_eq!(v["user"], "alice");
         assert_eq!(v["path"], "/x?y=1");
         assert!(v["user_agent"].is_null());
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn daily_counts_each_kind() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        for kind in [
+            EventKind::LoginSucceeded,
+            EventKind::LoginFailed,
+            EventKind::RateLimited,
+            EventKind::LoginBusy,
+            EventKind::Forbidden,
+            EventKind::Reserved,
+            EventKind::Other,
+            EventKind::LoginError,
+            EventKind::LogoutError,
+        ] {
+            d.record(t0, kind, "/x");
+        }
+        let c = &d.days.back().unwrap().1;
+        assert_eq!(c.login_succeeded, 1);
+        assert_eq!(c.login_failed, 1);
+        assert_eq!(c.rate_limited, 1);
+        assert_eq!(c.login_busy, 1);
+        assert_eq!(c.forbidden, 1);
+        assert_eq!(c.reserved, 1);
+        assert_eq!(c.other, 1);
+        assert_eq!(c.login_error, 1);
+        assert_eq!(c.logout_error, 1);
+    }
+
+    #[test]
+    fn daily_counts_unauth_non_root() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        for path in ["/wp-admin", "/a?b"] {
+            d.record(t0, EventKind::LoginPage, path);
+        }
+        for path in ["/", "/?x=1", "/__wsb/login"] {
+            d.record(t0, EventKind::LoginPage, path);
+        }
+        assert_eq!(d.days.back().unwrap().1.unauth_non_root, 2);
+    }
+
+    #[test]
+    fn daily_counts_ignores_uncounted_kinds() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        for kind in [
+            EventKind::Proxied,
+            EventKind::Logout,
+            EventKind::LogoutPage,
+            EventKind::Upgrade,
+        ] {
+            d.record(t0, kind, "/x");
+        }
+        d.record(t0, EventKind::LoginPage, "/");
+        assert_eq!(d.days.back().unwrap().1, Counts::default());
+    }
+
+    #[test]
+    fn daily_counts_rolls_at_midnight() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        d.record(20_001 * DAY - 1, EventKind::LoginSucceeded, "/x");
+        d.record(20_001 * DAY, EventKind::LoginSucceeded, "/x");
+        let reports = d.report(20_001 * DAY + 60);
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].r#final);
+        assert!(!reports[1].r#final);
+        assert_eq!(reports[0].counts.login_succeeded, 1);
+        assert_eq!(reports[1].counts.login_succeeded, 1);
+        assert_eq!(
+            d.finished(20_000, 20_001 * DAY + 60)
+                .unwrap()
+                .counts
+                .login_succeeded,
+            1
+        );
+        assert!(d.finished(20_001, 20_001 * DAY + 60).is_none());
+    }
+
+    #[test]
+    fn daily_counts_gap_days_zero_filled() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        d.record(t0, EventKind::Forbidden, "/x");
+        d.record(20_005 * DAY, EventKind::Forbidden, "/x");
+        let reports = d.report(20_005 * DAY + 60);
+        assert_eq!(reports.len(), 6);
+        for r in &reports[1..5] {
+            assert_eq!(r.counts, Counts::default());
+        }
+        assert_eq!(reports[5].counts.forbidden, 1);
+        assert!(reports[..5].iter().all(|r| r.r#final));
+    }
+
+    #[test]
+    fn daily_counts_trims_to_seven() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        d.record(t0, EventKind::LoginSucceeded, "/x");
+        d.record(20_010 * DAY, EventKind::LoginSucceeded, "/x");
+        let reports = d.report(20_010 * DAY + 60);
+        assert_eq!(reports.len(), 7);
+        assert_eq!(reports[0].day, "2024-10-08");
+        assert_eq!(reports[6].counts.login_succeeded, 1);
+    }
+
+    #[test]
+    fn daily_counts_since_is_start_then_midnight() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        d.record(t0, EventKind::Other, "/x");
+        let reports = d.report(20_001 * DAY + 60);
+        assert!(
+            reports[0].since.ends_with("T01:00:00Z"),
+            "{}",
+            reports[0].since
+        );
+        assert!(
+            reports[1].since.ends_with("T00:00:00Z"),
+            "{}",
+            reports[1].since
+        );
+    }
+
+    #[test]
+    fn day_report_json_shape() {
+        let t0 = 20_000 * DAY + 3600;
+        let mut d = DailyCounts::new(t0);
+        d.record(t0, EventKind::LoginSucceeded, "/x");
+        d.record(20_001 * DAY, EventKind::LoginFailed, "/x");
+        let reports = d.report(20_001 * DAY + 60);
+        let s = serde_json::to_string(&reports[0]).unwrap();
+        assert_eq!(
+            s,
+            "{\"kind\":\"daily_counts\",\"day\":\"2024-10-04\",\"since\":\"2024-10-04T01:00:00Z\",\"final\":true,\"counts\":{\"login_succeeded\":1,\"login_failed\":0,\"unauth_non_root\":0,\"rate_limited\":0,\"login_busy\":0,\"forbidden\":0,\"reserved\":0,\"other\":0,\"login_error\":0,\"logout_error\":0,\"dropped_unseen\":0}}"
+        );
+    }
+
+    #[test]
+    fn dropped_unseen_counts_only_without_monitor() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_100 * DAY + 60, Ordering::SeqCst);
+        let q = EventQueue::with_clock(2, clk);
+        for _ in 0..4 {
+            q.push(ev("/x"));
+        }
+        assert_eq!(q.daily_report()[0].counts.dropped_unseen, 2);
+        assert!(q.try_connect());
+        for _ in 0..3 {
+            q.push(ev("/x"));
+        }
+        // Queue still holds seqs 3 and 4, so each push evicts one.
+        assert_eq!(q.pending(Duration::ZERO).1, 3);
+        assert_eq!(q.daily_report()[0].counts.dropped_unseen, 2);
+    }
+
+    #[test]
+    fn monitor_receives_daily_then_final() {
+        use std::io::BufReader;
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_000 * DAY + 1000, Ordering::SeqCst);
+        let q = Arc::new(EventQueue::with_clock(100, clk));
+        let mut e = ev("/wp-admin");
+        e.kind = EventKind::LoginSucceeded;
+        q.push(e);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_monitor(listener, q.clone());
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "daily_counts");
+        assert_eq!(v["final"], false);
+        assert_eq!(v["counts"]["login_succeeded"], 1);
+        // Then the queued event itself.
+        line.clear();
+        r.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "login_succeeded");
+        // Jump the clock past midnight: the finished day's line arrives.
+        NOW.store(20_001 * DAY + 10, Ordering::SeqCst);
+        line.clear();
+        r.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "daily_counts");
+        assert_eq!(v["final"], true);
+        assert_eq!(v["counts"]["login_succeeded"], 1);
+        q.disconnect();
     }
 }
