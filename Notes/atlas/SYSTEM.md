@@ -2,7 +2,7 @@
 
 _**This file is the living source of truth for the design.** The interactive atlas (`atlas.html`) is built from the same data; edit this file and rebuild, never the outputs._
 
-_Question status: **8 open · 15 resolved**._
+_Question status: **7 open · 16 resolved**._
 
 ## One paragraph
 
@@ -95,7 +95,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 
 **What it does.** One port answers every request the internet sends. Without a valid session you get the phrase form and nothing else; with one, your request is handed to the forwarder — unless it asks for a protocol upgrade, which earns a 501. A tiny /__wsb/ namespace carries login, logout, and nothing else.
 
-**How it's built.** `axum` router in `src/app.rs`: `GET|POST /__wsb/login` (GET just 303s to /; POST bodies capped at 4 KiB) and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. The login form carries a sanitized `next` so a successful login returns you to what you asked for. Cross-site POSTs are refused via `Sec-Fetch-Site` (`same-origin`/`none` pass), then an `Origin` that must match Host — https when cookies are Secure. Phrase checks run on the blocking pool, **one Argon2 hash at a time** (`hash_slot`), and at most **32 logins may queue** for it — extras get 503, kind `login_busy`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware; gate pages are `no-store` and frame-denied.
+**How it's built.** `axum` router in `src/app.rs`: `GET|POST /__wsb/login` (GET just 303s to /; POST bodies capped at 4 KiB) and `GET|POST /__wsb/logout` live in `src/auth.rs`, fallback `proxy_or_login` in `src/proxy.rs`. Any other `/__wsb/*` path is a 404 **reserved**. The login form carries a sanitized `next` so a successful login returns you to what you asked for. Cross-site POSTs are refused via `Sec-Fetch-Site` (`same-origin`/`none` pass), then an `Origin` that must match Host — https when cookies are Secure. A POST with neither header is refused too. Phrase checks run on the blocking pool, **one Argon2 hash at a time** (`hash_slot`), and at most **32 logins may queue** for it — extras get 503, kind `login_busy`. Authenticated requests with an `Upgrade` header get **501**, kind `upgrade`. Every request exits through `record_event` middleware; gate pages are `no-store` and frame-denied.
 
 **Steps in execution.**
 
@@ -107,7 +107,7 @@ Bounds, not dollars — this is one process on one box. Every in-memory structur
 **Questions.**
 
 - ~~**Q-G1** Should GET /__wsb/logout end the session?~~ ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
-- **Q-G2** Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
+- ~~**Q-G2** Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?~~ ✓ No, option B: fail closed — a POST to /__wsb/login or /__wsb/logout with neither Sec-Fetch-Site nor Origin gets 403 forbidden; every supported browser sends Origin on POST, and scripted clients must add one of the headers (2026-11-21).
 - ~~**Q-G3** A client that disconnects mid-login drops the hash_slot guard while its Argon2 run continues — rapid resets can stack many 12 MiB hashes in parallel and OOM the box. Move an owned guard inside the blocking task?~~ ✓ Fixed — owned hash_slot (and session_writes) guards now move inside the blocking closures, so a cancelled request cannot release them early; at most 32 logins may queue for the slot, extras get 503 login_busy (review-4 finding 1, fixed).
 - ~~**Q-G4** A non-UTF-8 byte in any sibling cookie makes parse_cookies skip the whole Cookie header — a valid wsb_session is ignored (lockout loop) and logout then revokes nothing server-side. Parse cookies on raw bytes like strip_session_cookie does?~~ ✓ Fixed — session_tokens parses Cookie headers on raw bytes, matching wsb_session by name and keeping only UTF-8 values (review-4 finding 3, fixed).
 
@@ -374,7 +374,7 @@ Reference by ID. ✓ resolved (with date) · otherwise open.
 
 - ~~**Q-T1**~~ (T) ✓ Yes, option A: the header is honored only from a loopback peer (127.0.0.0/8, ::1, IPv4-mapped loopback), with no new config setting; other peers are keyed on their own address, and serve warns at startup when listen_addr is not loopback. cloudflared must run on the same machine (2026-11-21).
 - ~~**Q-G1**~~ (G) ✓ No — GET shows a confirm form; only POST destroys the session, and cross-site POSTs are rejected (review-1 finding 5, fixed).
-- **Q-G2** (G) Cross-site POST checks fall back to Origin only when Sec-Fetch-Site is absent; a client sending neither is allowed through. Keep that posture?
+- ~~**Q-G2**~~ (G) ✓ No, option B: fail closed — a POST to /__wsb/login or /__wsb/logout with neither Sec-Fetch-Site nor Origin gets 403 forbidden; every supported browser sends Origin on POST, and scripted clients must add one of the headers (2026-11-21).
 - ~~**Q-G3**~~ (G) ✓ Fixed — owned hash_slot (and session_writes) guards now move inside the blocking closures, so a cancelled request cannot release them early; at most 32 logins may queue for the slot, extras get 503 login_busy (review-4 finding 1, fixed).
 - ~~**Q-G4**~~ (G) ✓ Fixed — session_tokens parses Cookie headers on raw bytes, matching wsb_session by name and keeping only UTF-8 values (review-4 finding 3, fixed).
 - ~~**Q-S1**~~ (S) ✓ Persisted — write-through to the sessions table in users.db, hashes only, reload at startup and on the purge tick (ADR 0006, 2026-11).

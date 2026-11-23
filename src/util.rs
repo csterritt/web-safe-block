@@ -267,7 +267,8 @@ pub(crate) fn rate_limit_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> S
     }
 }
 
-/// True if a POST came from another site, per Sec-Fetch-Site or Origin.
+/// True if a POST came from another site, per Sec-Fetch-Site or Origin; a
+/// request carrying neither fails closed (treated as cross-site).
 /// When `secure` (cookie_secure), the Origin scheme must be https; plain
 /// http deployments also accept http.
 pub(crate) fn cross_site(headers: &HeaderMap, secure: bool) -> bool {
@@ -310,7 +311,7 @@ pub(crate) fn cross_site(headers: &HeaderMap, secure: bool) -> bool {
             Err(_) => true,
         };
     }
-    false
+    true
 }
 
 /// Remove hop-by-hop headers: `Connection`, the names it lists, and a fixed set.
@@ -559,7 +560,8 @@ mod tests {
             &h(&[("origin", "http://nohost.example")]),
             false
         ));
-        assert!(!cross_site(&h(&[]), false));
+        assert!(cross_site(&h(&[]), false));
+        assert!(cross_site(&h(&[("host", "example.com")]), true));
         // Secure (https) deployment: an http Origin is cross-site.
         assert!(!cross_site(
             &h(&[("origin", "https://example.com"), ("host", "example.com")]),

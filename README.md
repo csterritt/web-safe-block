@@ -91,7 +91,7 @@ Speed: one hash took about 16 ms in a release build on the development machine. 
 
 Runs the proxy. It exits with an error if the users database is missing or has no users. Users added while the server is running can log in right away. Logins are logged to stdout with the user name.
 
-Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. Login form bodies are limited to 4 KiB.
+Visit `/__wsb/logout` to get a log-out button, or POST to it to end the session. Cross-site POSTs to `/__wsb/` endpoints are rejected. So are POSTs that carry neither `Sec-Fetch-Site` nor `Origin`; scripted clients (e.g. curl) must send `-H 'Sec-Fetch-Site: same-origin'` or an `Origin` matching the Host. A `GET /__wsb/login` (e.g. a bookmarked or reloaded page) redirects to `/`, which shows the login form until you are authenticated. Login form bodies are limited to 4 KiB.
 
 #### Backups
 

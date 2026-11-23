@@ -354,7 +354,10 @@ mod tests {
             let task = tokio::spawn(login(
                 State(st),
                 ConnectInfo(peer),
-                HeaderMap::new(),
+                HeaderMap::from_iter([(
+                    header::HeaderName::from_static("sec-fetch-site"),
+                    HeaderValue::from_static("same-origin"),
+                )]),
                 Form(LoginForm {
                     user: "alice".into(),
                     phrase: "Correct-Horse-Battery-42".into(),

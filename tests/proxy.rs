@@ -279,6 +279,7 @@ async fn monitor_reports() {
             .header("CF-Connecting-IP", "198.51.100.7")
             .header(header::USER_AGENT, "wsb-test")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "same-origin")
             .body(format!("user=alice&phrase={phrase}&next=%2F"))
             .send()
     };
@@ -349,6 +350,7 @@ async fn monitor_reports() {
     check("logout_page", 200, "/__wsb/logout", Some("alice"));
     client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(header::COOKIE, cookie.clone())
         .send()
         .await
@@ -400,6 +402,7 @@ async fn end_to_end() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=wrong&next=%2F")
         .send()
         .await
@@ -413,6 +416,7 @@ async fn end_to_end() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=carol&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -424,6 +428,7 @@ async fn end_to_end() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=++CORRECT-HORSE-BATTERY-42++%0A&next=%2Ffoo%3Fx%3D1")
         .send()
         .await
@@ -515,6 +520,7 @@ async fn end_to_end() {
     assert_eq!(resp.status(), 200);
     let resp = client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(header::COOKIE, format!("wsb_session={token}"))
         .send()
         .await
@@ -546,6 +552,7 @@ async fn rate_limit() {
             .post(format!("{base}/__wsb/login"))
             .header("CF-Connecting-IP", ip)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "same-origin")
             .body("user=alice&phrase=wrong&next=%2F")
             .send()
             .await
@@ -557,6 +564,7 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", ip)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -570,6 +578,7 @@ async fn rate_limit() {
         .post(format!("{base}/__wsb/login"))
         .header("CF-Connecting-IP", "203.0.113.100")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -591,6 +600,7 @@ async fn rate_limit_is_atomic() {
                 .post(format!("{base}/__wsb/login"))
                 .header("CF-Connecting-IP", "203.0.113.77")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
                 .body("user=alice&phrase=wrong&next=%2F")
                 .send()
                 .await
@@ -624,6 +634,7 @@ async fn per_user_session_cap() {
         let resp = client
             .post(format!("{base}/__wsb/login"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "same-origin")
             .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
             .send()
             .await
@@ -659,6 +670,7 @@ async fn login_token(client: &reqwest::Client, base: &str) -> String {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -796,6 +808,7 @@ async fn stalled_upstream_times_out() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -828,6 +841,7 @@ async fn cross_site_posts_rejected() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -860,6 +874,17 @@ async fn cross_site_posts_rejected() {
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("origin", "http://evil.example")
+        .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.text().await.unwrap(), "Forbidden");
+
+    // A POST with neither Sec-Fetch-Site nor Origin fails closed: 403.
+    let resp = client
+        .post(format!("{base}/__wsb/login"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -1208,6 +1233,7 @@ async fn upgrade_requests_get_501() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -1272,6 +1298,7 @@ async fn logout_waits_for_durable_revoke() {
 
     let resp = client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(header::COOKIE, format!("wsb_session={token}"))
         .send()
         .await
@@ -1290,6 +1317,7 @@ async fn logout_waits_for_durable_revoke() {
     holder.join().unwrap();
     let resp = client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(header::COOKIE, format!("wsb_session={token}"))
         .send()
         .await
@@ -1333,6 +1361,7 @@ async fn session_db_contention_does_not_block_requests() {
     let login = tokio::spawn(async move {
         c2.post(format!("{b2}/__wsb/login"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "same-origin")
             .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
             .send()
             .await
@@ -1644,6 +1673,7 @@ async fn successful_login_does_not_reset_failures() {
             .post(format!("{base}/__wsb/login"))
             .header("CF-Connecting-IP", ip)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "same-origin")
             .body(body.to_string())
             .send()
     };
@@ -1689,6 +1719,7 @@ async fn multiple_session_cookies() {
     // Logout revokes every wsb_session cookie offered.
     let resp = client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(
             header::COOKIE,
             format!("wsb_session={t1}; wsb_session={t2}"),
@@ -1750,6 +1781,7 @@ async fn login_get_redirects_and_body_limit() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body(format!("user=alice&phrase=wrong&next={}", "a".repeat(5000)))
         .send()
         .await
@@ -1764,6 +1796,7 @@ async fn login_get_redirects_and_body_limit() {
     let resp = client
         .post(format!("{base}/__wsb/login"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .body("user=alice&phrase=Correct-Horse-Battery-42&next=%2F")
         .send()
         .await
@@ -1794,6 +1827,7 @@ async fn obs_text_sibling_cookie_does_not_hide_session() {
 
     let resp = client
         .post(format!("{base}/__wsb/logout"))
+        .header("sec-fetch-site", "same-origin")
         .header(header::COOKIE, cookie)
         .send()
         .await
