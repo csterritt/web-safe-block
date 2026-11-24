@@ -20,4 +20,3 @@ pub use app::build_router;
 pub use server::serve;
 pub use state::{Config, Limits};
 pub use upstream::Upstream;
-pub use util::{LOGIN_PATH, LOGOUT_PATH, SESSION_COOKIE};
