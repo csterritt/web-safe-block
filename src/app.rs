@@ -2,11 +2,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
-use axum::http::{HeaderValue, header};
+use axum::handler::Handler;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -18,6 +20,10 @@ use crate::rate_limit::RATE_LIMIT_WINDOW;
 use crate::sessions::reload_sessions;
 use crate::state::{AppState, Config};
 use crate::util::{LOGIN_PATH, LOGOUT_PATH, client_key};
+
+/// Login form size cap; enforced both by the body limit and by
+/// `login_body_deadline` while it buffers the body.
+const LOGIN_BODY_LIMIT: usize = 4096;
 
 /// Build the public-facing router. Every request is reported to `events`.
 /// Loads the persisted sessions before serving; errors if users.db cannot
@@ -34,8 +40,11 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, S
         .route(
             LOGIN_PATH,
             get(login_redirect)
-                .post(login)
-                .layer(DefaultBodyLimit::max(4096)),
+                .post(login.layer(middleware::from_fn_with_state(
+                    state.config.limits.request_body_timeout,
+                    login_body_deadline,
+                )))
+                .layer(DefaultBodyLimit::max(LOGIN_BODY_LIMIT)),
         )
         .route(LOGOUT_PATH, get(logout_page).post(logout))
         // Answered by the gate for everyone; never forwarded upstream.
@@ -43,6 +52,30 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, S
         .fallback(proxy_or_login)
         .layer(middleware::from_fn_with_state(state.clone(), record_event))
         .with_state(state))
+}
+
+/// Buffer the login form within `request_body_timeout`, so a client that
+/// sends headers then stalls can't hold the connection.
+async fn login_body_deadline(State(limit): State<Duration>, req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    match tokio::time::timeout(limit, axum::body::to_bytes(body, LOGIN_BODY_LIMIT)).await {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(e)) => {
+            let e = e.into_inner();
+            let too_long =
+                std::iter::successors(Some(e.as_ref() as &dyn std::error::Error), |s| s.source())
+                    .any(|s| s.is::<http_body_util::LengthLimitError>());
+            if too_long {
+                StatusCode::PAYLOAD_TOO_LARGE.into_response()
+            } else {
+                StatusCode::BAD_REQUEST.into_response()
+            }
+        }
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, [(header::CONNECTION, "close")]).into_response(),
+    }
 }
 
 /// Push one event per request, using the `Outcome` the handler attached.

@@ -22,7 +22,7 @@ export const META = {
     '| Sessions | 3 per user, 10,000 total, TTL from `session_ttl_secs` (default 180d); earliest-created evicted; persisted as hashes in users.db | `src/state.rs` `Limits` + `src/sessions.rs` |',
     '| Failed-login keys | 10,000 IPs, ≤10 stamps each, 15-minute window; fullest ledger evicts the fewest-stamp key | `src/rate_limit.rs` `reserve_attempt` |',
     '| Argon2 memory | one ~12 MiB hash at a time, on the blocking pool; at most 32 logins queued, extras get 503 | `src/state.rs` `hash_slot` + `login_waiters` + `src/auth.rs` |',
-    '| Client connections | 30s to send request headers; writes may stall 60s | `src/server.rs` `serve` + `StallTimeoutIo` |',
+    '| Client connections | 30s to send request headers; writes may stall 60s; login body within 15s (408); at most 1,024 connections; 15s shutdown drain | `src/server.rs` `serve` + `StallTimeoutIo` + `src/app.rs` `login_body_deadline` |',
     '| Login POST body | 4,096 B | `src/app.rs` `DefaultBodyLimit` |',
     '| Event queue | `monitor_queue_len` (default 100) events *and* ~4 MiB retained, oldest overwritten | `src/monitor.rs` `EventQueue` |',
     '| Upstream waits | 10s to connect, 60s for response headers, 60s body-idle; 256 requests upstream at once | `src/proxy.rs` `forward` |',
@@ -37,7 +37,7 @@ export const META = {
     lib.rs        crate root: module wiring + re-exports
     app.rs        router, record_event middleware, 60s purger
     auth.rs       login/logout handlers
-    server.rs     accept loop: header-read + write-stall timeouts
+    server.rs     accept loop: header-read + write-stall timeouts, connection cap, drain deadline
     proxy.rs      session check, 501 on upgrade, forwarder
     sessions.rs   session table ops + token minting
     rate_limit.rs per-IP failure ledger ops

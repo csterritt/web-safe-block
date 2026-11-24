@@ -37,6 +37,14 @@ pub struct Limits {
     pub header_read_timeout: Duration,
     /// A write to the client may stall for at most this long.
     pub client_write_stall_timeout: Duration,
+    /// The login form body must arrive within this long.
+    pub request_body_timeout: Duration,
+    /// At most this many client connections are served at once; further
+    /// ones wait in the listen backlog.
+    pub max_connections: usize,
+    /// On shutdown, in-flight connections get this long to finish before
+    /// they are closed.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -53,6 +61,9 @@ impl Default for Limits {
             max_login_waiters: 32,
             header_read_timeout: Duration::from_secs(30),
             client_write_stall_timeout: Duration::from_secs(60),
+            request_body_timeout: Duration::from_secs(15),
+            max_connections: 1024,
+            shutdown_timeout: Duration::from_secs(15),
         }
     }
 }

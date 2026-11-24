@@ -1,11 +1,15 @@
 //! The HTTP accept loop. Each connection is served by hyper http1 with a
 //! per-connection header read timeout (slowloris) and a write-stall
-//! timeout (a client that stops reading).
+//! timeout (a client that stops reading). At most `limits.max_connections`
+//! connections are served at once — extras wait in the listen backlog —
+//! and on shutdown in-flight connections are drained for up to
+//! `limits.shutdown_timeout`, then closed.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -23,8 +27,9 @@ use tower::{Service, ServiceExt};
 use crate::state::Limits;
 
 /// Serve `router` on `listener` until `shutdown` resolves, then drain
-/// in-flight connections. Enforces `limits.header_read_timeout` and
-/// `limits.client_write_stall_timeout`.
+/// in-flight connections for up to `limits.shutdown_timeout`. Enforces
+/// `limits.header_read_timeout`, `limits.client_write_stall_timeout`, and
+/// `limits.max_connections`.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
@@ -34,11 +39,24 @@ pub async fn serve(
     tokio::pin!(shutdown);
     let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     let graceful = GracefulShutdown::new();
+    let conns = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    // Nothing is ever sent: dropping the sender resolves `changed()` in
+    // every connection task still alive after the drain deadline.
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(());
     let mut conn_builder = hyper::server::conn::http1::Builder::new();
     conn_builder
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout);
     loop {
+        let permit = tokio::select! {
+            permit = conns.clone().acquire_owned() => {
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                }
+            }
+            _ = &mut shutdown => break,
+        };
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = &mut shutdown => break,
@@ -51,6 +69,7 @@ pub async fn serve(
                 continue;
             }
         };
+        let _ = stream.set_nodelay(true);
         let svc = make_service
             .call(peer)
             .await
@@ -64,13 +83,27 @@ pub async fn serve(
             TowerToHyperService::new(svc),
         );
         let conn = graceful.watch(conn);
+        let mut abort = abort_rx.clone();
         // Errors (client disconnects, timeouts) are expected and quiet.
         tokio::spawn(async move {
-            let _ = conn.await;
+            let _permit = permit;
+            tokio::select! {
+                _ = conn => {}
+                _ = abort.changed() => {}
+            }
         });
     }
     drop(listener);
-    graceful.shutdown().await;
+    if tokio::time::timeout(limits.shutdown_timeout, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "web-safe-block: shutdown: connections still open after {}s; closing them",
+            limits.shutdown_timeout.as_secs()
+        );
+    }
+    drop(abort_tx);
     Ok(())
 }
 

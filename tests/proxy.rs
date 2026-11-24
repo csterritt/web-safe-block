@@ -150,6 +150,20 @@ async fn spawn_proxy_on_db(
     limits: Limits,
     db: &std::path::Path,
 ) -> (SocketAddr, SocketAddr) {
+    let (addr, monitor_addr, _serve) =
+        spawn_proxy_serve(upstream, queue_len, limits, db, std::future::pending()).await;
+    (addr, monitor_addr)
+}
+
+/// Start the proxy on an existing users.db, serving until `shutdown`
+/// resolves; returns (proxy addr, monitor addr, serve task).
+async fn spawn_proxy_serve(
+    upstream: &str,
+    queue_len: usize,
+    limits: Limits,
+    db: &std::path::Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> (SocketAddr, SocketAddr, tokio::task::JoinHandle<()>) {
     let events = Arc::new(EventQueue::new(queue_len));
     let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let monitor_addr = monitor_listener.local_addr().unwrap();
@@ -166,12 +180,12 @@ async fn spawn_proxy_on_db(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = web_safe_block::build_router(config, events).unwrap();
-    tokio::spawn(async move {
-        web_safe_block::serve(listener, router, limits, std::future::pending())
+    let serve = tokio::spawn(async move {
+        web_safe_block::serve(listener, router, limits, shutdown)
             .await
             .unwrap()
     });
-    (addr, monitor_addr)
+    (addr, monitor_addr, serve)
 }
 
 /// Start the proxy with custom limits on a fresh database;
@@ -2231,4 +2245,121 @@ fn cli_unix_monitor_socket() {
     child.kill().unwrap();
     child.wait().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn slow_login_body_times_out() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits).await;
+    let limits = Limits {
+        request_body_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (proxy, _, _db) = spawn_proxy_full(&upstream, 100, limits).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /__wsb/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\nSec-Fetch-Site: same-origin\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .expect("connection not closed within 5s")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 408"), "{resp}");
+}
+
+#[tokio::test]
+async fn oversized_login_body_413() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits).await;
+    let (proxy, _, _db) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let mut req = b"POST /__wsb/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 5000\r\nSec-Fetch-Site: same-origin\r\n\r\n".to_vec();
+    req.extend(std::iter::repeat_n(b'x', 5000));
+    s.write_all(&req).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+}
+
+#[tokio::test]
+async fn connection_cap_queues_extra_connections() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits).await;
+    let limits = Limits {
+        max_connections: 1,
+        ..Limits::default()
+    };
+    let (proxy, _, _db) = spawn_proxy_full(&upstream, 100, limits).await;
+    // Connection A holds the only permit without sending anything.
+    let a = std::net::TcpStream::connect(proxy).unwrap();
+    let got = client()
+        .get(format!("http://{proxy}/robots.txt"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await;
+    assert!(got.unwrap_err().is_timeout());
+    drop(a);
+    let resp = client()
+        .get(format!("http://{proxy}/robots.txt"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn shutdown_drains_with_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits).await;
+    let db = user_db();
+    // With no connections, shutdown returns promptly.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (_, _, serve) = spawn_proxy_serve(&upstream, 100, Limits::default(), &db, async move {
+        let _ = rx.await;
+    })
+    .await;
+    tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), serve)
+        .await
+        .expect("idle shutdown did not finish")
+        .unwrap();
+    // A stalled request body must not outlive the drain deadline.
+    let limits = Limits {
+        shutdown_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (proxy, _, serve) = spawn_proxy_serve(&upstream, 100, limits, &db, async move {
+        let _ = rx.await;
+    })
+    .await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /__wsb/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\nSec-Fetch-Site: same-origin\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), serve)
+        .await
+        .expect("serve did not stop within the drain deadline")
+        .unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf))
+        .await
+        .expect("stalled connection was not closed")
+        .unwrap();
 }

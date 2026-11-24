@@ -318,13 +318,21 @@ impl DailyCounts {
     }
 
     /// Append zero-filled entries for every day after the last one up to
-    /// today (never before the start day), then trim to the newest 7.
+    /// today, then trim to the newest 7. A forward clock jump never adds
+    /// more than 7 days (older entries fall below the retention floor and
+    /// are trimmed, so `days` stays consecutive); a step backward before
+    /// any event seeds at the earlier of the start day and today. If the
+    /// clock went backward while days are already present, nothing is
+    /// added — records keep landing in the newest entry until real time
+    /// catches up.
     fn roll(&mut self, now: u64) {
         let today = now / 86_400;
+        let oldest = today.saturating_sub(RETAINED_DAYS as u64 - 1);
         let mut next = match self.days.back() {
             Some((d, _)) => d + 1,
-            None => self.started / 86_400,
-        };
+            None => (self.started / 86_400).min(today),
+        }
+        .max(oldest);
         while next <= today {
             self.days.push_back((next, Counts::default()));
             next += 1;
@@ -368,10 +376,17 @@ impl DailyCounts {
 
     fn report_for(&self, day: u64, counts: &Counts, today: u64) -> DayReport {
         let day_start = day.saturating_mul(86_400);
+        // A day seeded before the start day by a backward clock step gets
+        // its own midnight as `since`, not a time in its future.
+        let since = if day == self.started / 86_400 {
+            self.started
+        } else {
+            day_start
+        };
         DayReport {
             kind: "daily_counts",
             day: rfc3339(UNIX_EPOCH + Duration::from_secs(day_start))[..10].to_string(),
-            since: rfc3339(UNIX_EPOCH + Duration::from_secs(day_start.max(self.started))),
+            since: rfc3339(UNIX_EPOCH + Duration::from_secs(since)),
             r#final: day < today,
             counts: counts.clone(),
         }
@@ -456,9 +471,9 @@ impl EventQueue {
     /// Add an event, overwriting the oldest unconsumed ones if the queue is
     /// over its count capacity or its total byte budget.
     pub fn push(&self, mut ev: Event) {
-        let now = (self.clock)();
         let mut inner = self.inner.lock().unwrap();
-        ev.time = rfc3339(SystemTime::now());
+        let now = (self.clock)();
+        ev.time = rfc3339(UNIX_EPOCH + Duration::from_secs(now));
         inner.next_seq += 1;
         ev.seq = inner.next_seq;
         inner.daily.record(now, ev.kind, &ev.path);
@@ -512,10 +527,12 @@ impl EventQueue {
         (self.clock)() / 86_400
     }
 
-    /// One report per retained day, oldest first.
-    fn daily_report(&self) -> Vec<DayReport> {
+    /// One report per retained day, oldest first, plus the current UTC
+    /// day — both from the same clock sample under the lock.
+    fn daily_report(&self) -> (Vec<DayReport>, u64) {
+        let mut inner = self.inner.lock().unwrap();
         let now = (self.clock)();
-        self.inner.lock().unwrap().daily.report(now)
+        (inner.daily.report(now), now / 86_400)
     }
 
     /// The report for a finished day, if still retained.
@@ -601,12 +618,12 @@ fn serve_monitor(mut stream: Box<dyn MonitorStream>, events: &EventQueue) -> io:
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     // The daily counters go first, before any queued events.
     let mut out = String::new();
-    for report in events.daily_report() {
+    let (reports, mut day) = events.daily_report();
+    for report in reports {
         out.push_str(&serde_json::to_string(&report).map_err(io::Error::other)?);
         out.push('\n');
     }
     stream.write_all(out.as_bytes())?;
-    let mut day = events.utc_day();
     // EOF on read only means the client stopped sending (e.g. `nc < /dev/null`
     // half-closes); it may still be listening. Once seen, liveness is checked
     // with heartbeat probes instead.
@@ -618,6 +635,8 @@ fn serve_monitor(mut stream: Box<dyn MonitorStream>, events: &EventQueue) -> io:
         let mut out = String::new();
         // UTC midnight passed: send each finished day's final counts.
         let today = events.utc_day();
+        // A huge forward clock jump only reports the retained window.
+        day = day.max(today.saturating_sub(RETAINED_DAYS as u64 - 1));
         while day < today {
             if let Some(report) = events.finished_day(day) {
                 out.push_str(&serde_json::to_string(&report).map_err(io::Error::other)?);
@@ -938,6 +957,7 @@ mod tests {
             EventKind::Logout,
             EventKind::LogoutPage,
             EventKind::Upgrade,
+            EventKind::Robots,
         ] {
             d.record(t0, kind, "/x");
         }
@@ -1037,14 +1057,136 @@ mod tests {
         for _ in 0..4 {
             q.push(ev("/x"));
         }
-        assert_eq!(q.daily_report()[0].counts.dropped_unseen, 2);
+        assert_eq!(q.daily_report().0[0].counts.dropped_unseen, 2);
         assert!(q.try_connect());
         for _ in 0..3 {
             q.push(ev("/x"));
         }
         // Queue still holds seqs 3 and 4, so each push evicts one.
         assert_eq!(q.pending(Duration::ZERO).1, 3);
-        assert_eq!(q.daily_report()[0].counts.dropped_unseen, 2);
+        assert_eq!(q.daily_report().0[0].counts.dropped_unseen, 2);
+    }
+
+    #[test]
+    fn daily_counts_forward_jump_from_epoch() {
+        let mut d = DailyCounts::new(0);
+        d.record(20_000 * DAY + 5, EventKind::LoginFailed, "/x");
+        assert_eq!(d.days.len(), RETAINED_DAYS);
+        for (i, (day, c)) in d.days.iter().enumerate() {
+            assert_eq!(*day, 19_994 + i as u64);
+            if i == RETAINED_DAYS - 1 {
+                continue;
+            }
+            assert_eq!(*c, Counts::default(), "day {day}");
+        }
+        assert_eq!(d.days.back().unwrap().1.login_failed, 1);
+    }
+
+    #[test]
+    fn daily_counts_huge_forward_jump() {
+        let mut d = DailyCounts::new(5 * DAY);
+        d.record(5 * DAY, EventKind::LoginSucceeded, "/x");
+        d.record(1_000_000_000_000 * DAY, EventKind::LoginSucceeded, "/x");
+        assert_eq!(d.days.len(), RETAINED_DAYS);
+        for (i, (day, _)) in d.days.iter().enumerate() {
+            assert_eq!(
+                *day,
+                1_000_000_000_000 - RETAINED_DAYS as u64 + 1 + i as u64
+            );
+        }
+        assert_eq!(d.days.back().unwrap().1.login_succeeded, 1);
+    }
+
+    #[test]
+    fn daily_counts_backward_step_before_first_event() {
+        let mut d = DailyCounts::new(100 * DAY + 50);
+        d.record(99 * DAY + 5, EventKind::LoginFailed, "/x");
+        d.drop_unseen(99 * DAY + 6);
+        let reports = d.report(99 * DAY + 10);
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert_eq!(
+            r.day,
+            rfc3339(UNIX_EPOCH + Duration::from_secs(99 * DAY))[..10]
+        );
+        // `since` is day 99's midnight, not the (later) process start.
+        assert_eq!(r.since, rfc3339(UNIX_EPOCH + Duration::from_secs(99 * DAY)));
+        assert!(!r.r#final);
+        assert_eq!(r.counts.login_failed, 1);
+        assert_eq!(r.counts.dropped_unseen, 1);
+    }
+
+    #[test]
+    fn push_uses_queue_clock_for_time() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_000 * DAY + 3600, Ordering::SeqCst);
+        let q = EventQueue::with_clock(10, clk);
+        q.push(ev("/x"));
+        assert_eq!(q.pending(Duration::ZERO).0[0].time, "2024-10-04T01:00:00Z");
+    }
+
+    #[test]
+    fn daily_report_returns_today() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_000 * DAY + 3600, Ordering::SeqCst);
+        let q = EventQueue::with_clock(10, clk);
+        let (_, today) = q.daily_report();
+        assert_eq!(today, 20_000);
+    }
+
+    #[test]
+    fn monitor_survives_huge_clock_jump() {
+        use std::io::BufReader;
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_000 * DAY + 1000, Ordering::SeqCst);
+        let q = Arc::new(EventQueue::with_clock(100, clk));
+        q.push(ev("/wp-admin"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_monitor(listener, q.clone());
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+            "daily_counts"
+        );
+        line.clear();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+            "login_page"
+        );
+        // Jump the clock far forward: only the retained window is replayed.
+        NOW.store(10_000_000_000 * DAY, Ordering::SeqCst);
+        let mut e = ev("/x");
+        e.kind = EventKind::LoginSucceeded;
+        q.push(e);
+        let mut finals = 0;
+        loop {
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["kind"] == "daily_counts" {
+                finals += 1;
+                assert!(finals <= RETAINED_DAYS);
+            } else {
+                assert_eq!(v["kind"], "login_succeeded");
+                break;
+            }
+        }
+        q.disconnect();
     }
 
     #[test]
