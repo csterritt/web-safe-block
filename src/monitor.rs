@@ -115,12 +115,6 @@ pub enum MonitorListener {
     Unix(UnixListener),
 }
 
-impl From<TcpListener> for MonitorListener {
-    fn from(l: TcpListener) -> Self {
-        MonitorListener::Tcp(l)
-    }
-}
-
 impl MonitorListener {
     fn accept(&self) -> io::Result<Box<dyn MonitorStream>> {
         match self {
@@ -570,11 +564,7 @@ fn event_bytes(e: &Event) -> usize {
 
 /// Run the monitor on its own OS thread. Each accepted client is served on a
 /// further thread so a second client can be turned away immediately.
-pub fn spawn_monitor(
-    listener: impl Into<MonitorListener>,
-    events: Arc<EventQueue>,
-) -> thread::JoinHandle<()> {
-    let listener = listener.into();
+pub fn spawn_monitor(listener: MonitorListener, events: Arc<EventQueue>) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("wsb-monitor".into())
         .spawn(move || {
@@ -1152,7 +1142,7 @@ mod tests {
         q.push(ev("/wp-admin"));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        spawn_monitor(listener, q.clone());
+        spawn_monitor(MonitorListener::Tcp(listener), q.clone());
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut r = BufReader::new(s);
@@ -1203,7 +1193,7 @@ mod tests {
         q.push(e);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        spawn_monitor(listener, q.clone());
+        spawn_monitor(MonitorListener::Tcp(listener), q.clone());
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut r = BufReader::new(s);

@@ -167,7 +167,10 @@ async fn spawn_proxy_serve(
     let events = Arc::new(EventQueue::new(queue_len));
     let monitor_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let monitor_addr = monitor_listener.local_addr().unwrap();
-    monitor::spawn_monitor(monitor_listener, events.clone());
+    monitor::spawn_monitor(
+        monitor::MonitorListener::Tcp(monitor_listener),
+        events.clone(),
+    );
     let config = Config {
         users: Arc::new(UserStore::open(db).unwrap()),
         upstream: upstream.parse().unwrap(),
