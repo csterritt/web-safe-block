@@ -11,6 +11,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
 use http_body::Frame;
+use hyper::body::Incoming;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::app::with_outcome;
@@ -167,8 +168,8 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
 
 /// An upstream response body that ends with a timeout error if no frame
 /// arrives within `idle`. Holds the concurrency permit until dropped.
-struct IdleTimeoutBody<B> {
-    inner: B,
+struct IdleTimeoutBody {
+    inner: Incoming,
     _permit: OwnedSemaphorePermit,
     idle: Duration,
     sleep: Pin<Box<tokio::time::Sleep>>,
@@ -177,8 +178,8 @@ struct IdleTimeoutBody<B> {
     done: bool,
 }
 
-impl<B> IdleTimeoutBody<B> {
-    fn new(inner: B, permit: OwnedSemaphorePermit, idle: Duration) -> Self {
+impl IdleTimeoutBody {
+    fn new(inner: Incoming, permit: OwnedSemaphorePermit, idle: Duration) -> Self {
         IdleTimeoutBody {
             inner,
             _permit: permit,
@@ -189,12 +190,8 @@ impl<B> IdleTimeoutBody<B> {
     }
 }
 
-impl<B> http_body::Body for IdleTimeoutBody<B>
-where
-    B: http_body::Body + Unpin,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    type Data = B::Data;
+impl http_body::Body for IdleTimeoutBody {
+    type Data = hyper::body::Bytes;
     type Error = io::Error;
 
     fn poll_frame(
