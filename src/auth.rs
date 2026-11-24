@@ -15,8 +15,9 @@ use crate::sessions::{Session, evictions, hash_token, new_token, unix_micros, va
 use crate::state::AppState;
 use crate::users::StoredSession;
 use crate::util::{
-    LOGOUT_PATH, PAGE_STYLE, clear_cookie_header, cross_site, html_response, login_page,
-    plain_response, rate_limit_key, sanitize_next, session_cookie_header, session_tokens,
+    LOGOUT_PATH, clear_cookie_header, cross_site, html_response, login_page, message_para,
+    page_shell, plain_response, rate_limit_key, sanitize_next, session_cookie_header,
+    session_tokens,
 };
 
 pub(crate) fn forbidden() -> Response {
@@ -220,11 +221,12 @@ fn login_error(front: &str, next: &str) -> Response {
 }
 
 fn logout_form_html(message: Option<&str>) -> String {
-    let msg = message
-        .map(|m| format!("<p>{}</p>\n", crate::util::html_escape(m)))
-        .unwrap_or_default();
-    format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Log out</title>\n{PAGE_STYLE}</head>\n<body>\n{msg}<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n</body>\n</html>\n"
+    let msg = message_para(message);
+    page_shell(
+        "Log out",
+        &format!(
+            "{msg}<form method=\"post\" action=\"{LOGOUT_PATH}\">\n<button type=\"submit\">Log out</button>\n</form>\n"
+        ),
     )
 }
 
@@ -361,6 +363,22 @@ mod tests {
         let state = state_with_alice();
         let expected = login_page("Site Description Here", None, "/");
         assert_eq!(&state.root_page[..], expected.as_bytes());
+    }
+
+    #[test]
+    fn logout_form_uses_shared_shell() {
+        let page = logout_form_html(Some("<b>oops</b>"));
+        assert!(
+            page.starts_with("<!DOCTYPE html>\n<html>\n<head>"),
+            "{page}"
+        );
+        assert!(page.contains("<title>Log out</title>"), "{page}");
+        assert!(
+            page.contains("<p>&lt;b&gt;oops&lt;/b&gt;</p>\n<form"),
+            "{page}"
+        );
+        assert!(page.contains("action=\"/__wsb/logout\""), "{page}");
+        assert!(page.ends_with("</body>\n</html>\n"), "{page}");
     }
 
     /// Cancelling a login mid-hash must not release the hash slot early:

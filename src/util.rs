@@ -180,18 +180,34 @@ pub(crate) fn sets_session_cookie(value: &[u8]) -> bool {
 pub(crate) const PAGE_STYLE: &str =
     "<style>body,input,button{font-size:18pt}input{border:1px solid #000}</style>\n";
 
+/// A `<p>` block holding `text` escaped; empty when `text` is `None`.
+pub(crate) fn message_para(text: Option<&str>) -> String {
+    text.map(|m| format!("<p>{}</p>\n", html_escape(m)))
+        .unwrap_or_default()
+}
+
+/// The shared page shell: doctype, charset/viewport metas, title, style, then
+/// `<body>` holding `inner`, which must already be built and escaped. `title`
+/// is `&'static str` so it can only ever be a literal, never user input.
+pub(crate) fn page_shell(title: &'static str, inner: &str) -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title}</title>\n{PAGE_STYLE}</head>\n<body>\n{inner}</body>\n</html>\n"
+    )
+}
+
 pub(crate) fn login_page(front: &str, message: Option<&str>, next: &str) -> String {
     let front = if front.is_empty() {
         String::new()
     } else {
         format!("<p>{}</p>\n", html_escape(front))
     };
-    let msg = message
-        .map(|m| format!("<p>{}</p>\n", html_escape(m)))
-        .unwrap_or_default();
-    format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Login</title>\n{PAGE_STYLE}</head>\n<body>\n{front}{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n</body>\n</html>\n",
-        html_escape(next)
+    let msg = message_para(message);
+    page_shell(
+        "Login",
+        &format!(
+            "{front}{msg}<form method=\"post\" action=\"{LOGIN_PATH}\">\n<label for=\"user\">User name</label>\n<br/>\n<input type=\"text\" id=\"user\" name=\"user\" autocomplete=\"username\" autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\" autofocus>\n<br/>\n<label for=\"phrase\">Pass phrase</label>\n<br/>\n<input type=\"password\" id=\"phrase\" name=\"phrase\" autocomplete=\"current-password\">\n<br/>\n<input type=\"hidden\" name=\"next\" value=\"{}\">\n<button type=\"submit\">Submit</button>\n</form>\n",
+            html_escape(next)
+        ),
     )
 }
 
@@ -485,6 +501,14 @@ mod tests {
         let front = page.find("<p>Site Description Here</p>").unwrap();
         let form = page.find("<form").unwrap();
         assert!(front < form, "{page}");
+
+        // The shared shell edges.
+        assert!(
+            page.starts_with("<!DOCTYPE html>\n<html>\n<head>"),
+            "{page}"
+        );
+        assert!(page.contains("<title>Login</title>"), "{page}");
+        assert!(page.ends_with("</body>\n</html>\n"), "{page}");
 
         let page = login_page("<b>A&B</b>", Some("nope"), "/x");
         assert!(
