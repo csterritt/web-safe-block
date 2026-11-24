@@ -10,6 +10,8 @@ use rusqlite::{
 };
 use subtle::ConstantTimeEq;
 
+use crate::util::to_hex;
+
 pub const DB_FILE: &str = "users.db";
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
@@ -97,7 +99,7 @@ pub fn phrase_problem(phrase: &str) -> Option<String> {
 pub fn new_salt() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    to_hex(&bytes)
 }
 
 /// Argon2id parameters: OWASP's 12 MiB / t=3, p=1 option, chosen because the
@@ -127,7 +129,7 @@ pub fn hash_phrase(salt: &str, phrase: &str) -> Result<String, argon2::Error> {
         salt.as_bytes(),
         &mut out,
     )?;
-    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(to_hex(&out))
 }
 
 /// Column names of `table`, or an empty Vec if it does not exist.
@@ -661,7 +663,8 @@ mod tests {
             hash_phrase("aaaaaaaa", "abc").unwrap(),
             hash_phrase("bbbbbbbb", "abc").unwrap()
         );
-        // Known answer: computed independently via the argon2 crate.
+        // Known answer: computed independently via the argon2 crate; the hex
+        // encode is kept local (not util::to_hex) so it stays an oracle.
         let params = Params::new(12 * 1024, 3, 1, Some(32)).unwrap();
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut expected = [0u8; 32];

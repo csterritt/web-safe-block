@@ -76,6 +76,13 @@ pub(crate) fn sanitize_next(next: &str) -> String {
     }
 }
 
+/// Bytes as lowercase hex: the stored format for salts, session tokens and
+/// pass-phrase hashes. The two test copies (users.rs KAT, tests/proxy.rs
+/// `sha256_hex`) are deliberately independent oracles — don't merge them.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

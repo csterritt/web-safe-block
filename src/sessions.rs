@@ -9,7 +9,7 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use crate::state::{AppState, Limits};
-use crate::util::session_tokens;
+use crate::util::{session_tokens, to_hex};
 
 pub(crate) struct Session {
     pub expires: SystemTime,
@@ -29,10 +29,7 @@ pub(crate) fn unix_micros() -> i64 {
 
 /// Hex SHA-256 of a raw token; the map key and the stored cookie_string.
 pub(crate) fn hash_token(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    to_hex(&Sha256::digest(token.as_bytes()))
 }
 
 /// The user name of a valid, unexpired session, if the request has one.
@@ -161,7 +158,7 @@ pub(crate) fn reload_sessions(state: &AppState) -> rusqlite::Result<i64> {
 pub(crate) fn new_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    to_hex(&bytes)
 }
 
 #[cfg(test)]

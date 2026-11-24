@@ -789,6 +789,8 @@ async fn token_status(client: &reqwest::Client, base: &str, token: &str) -> u16 
         .as_u16()
 }
 
+// Kept independent of the crate's to_hex so it stays an oracle for the
+// cookie_string format stored in the sessions table.
 fn sha256_hex(s: &str) -> String {
     Sha256::digest(s.as_bytes())
         .iter()
