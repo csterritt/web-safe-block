@@ -484,11 +484,6 @@ impl UserStore {
         })
     }
 
-    /// Every user, sorted by name.
-    pub fn list(&self) -> rusqlite::Result<Vec<User>> {
-        list_users(&self.conn.lock().unwrap())
-    }
-
     /// Every session whose expiry is still in the future.
     pub fn load_sessions(&self, now: SystemTime) -> rusqlite::Result<Vec<StoredSession>> {
         self.conn
