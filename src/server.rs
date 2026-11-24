@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 //! The HTTP accept loop. Each connection is served by hyper http1 with a
 //! per-connection header read timeout (slowloris) and a write-stall
 //! timeout (a client that stops reading). At most `limits.max_connections`
