@@ -21,7 +21,11 @@ last_dir=$(basename "$(pwd)")
 
 remote_dir=$(ssh chris@utmbox mktemp -d)
 local_dir=$(mktemp -d)
-trap 'rm -rf "$local_dir"' EXIT
+cleanup() {
+  rm -rf "$local_dir"
+  ssh chris@utmbox "rm -rf $(printf %q "$remote_dir")" || true
+}
+trap cleanup EXIT
 
 ssh chris@utmbox "cd $(printf %q "$last_dir") && scripts/tar-new.sh $(printf %q "$remote_dir")/new-files.tar"
 
@@ -33,5 +37,3 @@ tar xf "$local_dir/new-files.tar"
 while IFS= read -r -d '' file; do
   [ -n "$file" ] && rm -f "$file"
 done < "$local_dir/new-files.tar.deleted"
-
-ssh chris@utmbox "rm -rf $(printf %q "$remote_dir")"

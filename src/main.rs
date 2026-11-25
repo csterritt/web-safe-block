@@ -158,14 +158,12 @@ fn serve(settings: Settings) -> ExitCode {
             settings.listen_addr
         );
     }
-    // Everything that can fail runs before the monitor thread starts.
+    // Everything that can fail runs before the monitor socket is published:
+    // users DB, TCP bind, router, then bind_monitor (which also cleans up a
+    // stale unix socket). The guard unlinks a unix socket on shutdown.
     let config = match UserStore::open(&settings.users_db) {
         Ok(users) => web_safe_block::Config::new(&settings, users),
         Err(e) => return fail(e),
-    };
-    let monitor_listener = match monitor::bind_monitor(&monitor_addr) {
-        Ok(l) => l,
-        Err(e) => return fail(format!("failed to bind monitor {monitor_addr}: {e}")),
     };
     rt.block_on(async move {
         let limits = config.limits;
@@ -178,19 +176,32 @@ fn serve(settings: Settings) -> ExitCode {
             Ok(r) => r,
             Err(e) => return fail(e),
         };
+        let (monitor_listener, monitor_guard) = match monitor::bind_monitor(&monitor_addr) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("failed to bind monitor {monitor_addr}: {e}")),
+        };
+        let bound_monitor = monitor_listener.local_addr();
         monitor::spawn_monitor(monitor_listener, events);
-        println!("web-safe-block: monitor on {monitor_addr} (queue {queue_len} events)");
+        // Report the addresses actually bound: port 0 resolves to a real port
+        // and a unix monitor reports its published path.
+        let bound = listener.local_addr().map(|a| a.to_string());
         println!(
-            "web-safe-block: listening on {listen}, upstream {}, users {}, session TTL {}s, cookie_secure={}",
+            "web-safe-block: monitor on {bound_monitor} (queue {queue_len} events)"
+        );
+        println!(
+            "web-safe-block: listening on {}, upstream {}, users {}, session TTL {}s, cookie_secure={}",
+            bound.as_deref().unwrap_or("?"),
             settings.upstream,
             settings.users_db.display(),
             settings.session_ttl_secs,
             settings.cookie_secure
         );
-        match web_safe_block::serve(listener, router, limits, shutdown_signal()).await {
+        let rc = match web_safe_block::serve(listener, router, limits, shutdown_signal()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("server error: {e}")),
-        }
+        };
+        drop(monitor_guard);
+        rc
     })
 }
 

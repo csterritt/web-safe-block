@@ -41,11 +41,21 @@ pub(crate) fn hash_token(token: &str) -> String {
 /// (a path-scoped cookie may shadow the real one). Expired ones seen on
 /// the way are dropped lazily.
 pub(crate) fn valid_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let tokens = session_tokens(headers);
+    // Only 64 lowercase-hex bytes can be a minted token (see `new_token`);
+    // every other attacker-controlled value is knowably invalid and is
+    // neither hashed nor looked up. Hashing also happens outside the map
+    // lock so malformed cookies can't hold it.
+    let keys: Vec<String> = session_tokens(headers)
+        .into_iter()
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .map(|t| hash_token(&t))
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
     let mut sessions = state.sessions.lock().unwrap();
     let now = SystemTime::now();
-    for token in tokens {
-        let key = hash_token(&token);
+    for key in keys {
         match sessions.get(&key) {
             Some(s) if s.expires > now => return Some(s.user.clone()),
             Some(_) => {
@@ -245,5 +255,73 @@ mod tests {
         assert!(!sessions.contains_key("old"));
         assert!(sessions.contains_key("n1") && sessions.contains_key("n2"));
         assert_eq!(removed, ["old"]);
+    }
+
+    fn state_with_alice() -> AppState {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::monitor::EventQueue;
+        use crate::state::Config;
+        use crate::users::{self, UserStore};
+
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wsb-sessions-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::users::DB_FILE);
+        let conn = users::open_for_add(&path).unwrap();
+        users::add_users(
+            &conn,
+            "alice Correct-Horse-Battery-42\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        drop(conn);
+        let config = Config {
+            users: Arc::new(UserStore::open(&path).unwrap()),
+            upstream: "http://127.0.0.1:1".parse().unwrap(),
+            front_page_message: "Site Description Here".into(),
+            session_ttl: Duration::from_secs(600),
+            cookie_secure: false,
+            fail_delay: Duration::ZERO,
+            limits: Limits::default(),
+        };
+        AppState::new(config, Arc::new(EventQueue::new(10)))
+    }
+
+    /// Values that cannot be a minted token — wrong length or non-hex —
+    /// resolve to None without reaching the map (and without panicking).
+    #[test]
+    fn valid_session_filters_token_format() {
+        use axum::http::{HeaderValue, header};
+
+        let state = state_with_alice();
+        let token = new_token();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(hash_token(&token), session("alice", 600, 1));
+        let cookie = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("wsb_session={v}")).unwrap(),
+            );
+            h
+        };
+        assert_eq!(
+            valid_session(&state, &cookie(&token)),
+            Some("alice".to_string())
+        );
+        assert_eq!(valid_session(&state, &cookie(&token.to_uppercase())), None);
+        assert_eq!(valid_session(&state, &cookie(&format!("{token}0"))), None);
+        assert_eq!(valid_session(&state, &cookie(&"a".repeat(4096))), None);
+        assert_eq!(valid_session(&state, &cookie("short")), None);
     }
 }

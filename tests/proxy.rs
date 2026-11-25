@@ -78,6 +78,17 @@ async fn spawn_upstream(hits: Arc<AtomicUsize>) -> String {
         };
         format!("{}|{}", get("x-forwarded-for"), get("x-forwarded-host"))
     }
+    // Echo every received header so tests can see exactly what the gate
+    // forwarded — and what it stripped.
+    async fn dump_headers(req: Request) -> String {
+        let mut lines: Vec<String> = req
+            .headers()
+            .iter()
+            .map(|(n, v)| format!("{}: {}", n, v.to_str().unwrap_or("?")))
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    }
     // Set-Cookie for wsb_session containing a non-UTF-8 (obs-text) byte.
     async fn raw_cookie() -> impl IntoResponse {
         (
@@ -97,6 +108,7 @@ async fn spawn_upstream(hits: Arc<AtomicUsize>) -> String {
     let app = Router::new()
         .route("/cached", axum::routing::get(cached))
         .route("/headers", axum::routing::get(echo_headers))
+        .route("/dump", axum::routing::get(dump_headers))
         .route("/rawcookie", axum::routing::get(raw_cookie))
         .fallback(any(handler))
         .with_state(hits);
@@ -405,7 +417,8 @@ async fn monitor_reports() {
         assert_eq!(e["user"].as_str(), user, "{e}");
     };
     authed("/foo?x=1").await.unwrap();
-    check("proxied", 200, "/foo?x=1", Some("alice"));
+    // The query itself is never reported; a '?' marks that one was present.
+    check("proxied", 200, "/foo?", Some("alice"));
     authed("/__wsb/logout").await.unwrap();
     check("logout_page", 200, "/__wsb/logout", Some("alice"));
     client
@@ -1312,6 +1325,14 @@ fn cli_list_users() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no users database"), "{stderr}");
 
+    // A database that exists but has no users -> the same failure as serve.
+    let out = run_add_user(&dir, "weak x\n");
+    assert!(!out.status.success());
+    let out = bin().arg("list-users").current_dir(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("has no users"), "{stderr}");
+
     run_add_user(
         &dir,
         "alice Correct-Horse-Battery-42\nadmin-bob Big Secret Phrase Number 99!\n",
@@ -1321,6 +1342,22 @@ fn cli_list_users() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines, ["admin-bob\ttrue", "alice\tfalse"], "{stdout}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A users_db path that is a dangling symlink is never followed: SQLite
+/// would otherwise create the uncontrolled target.
+#[cfg(unix)]
+#[test]
+fn cli_dangling_symlink_users_db() {
+    let dir = config_dir();
+    let target = dir.join("real-users.db");
+    std::os::unix::fs::symlink(&target, dir.join(users::DB_FILE)).unwrap();
+    let out = run_add_user(&dir, "alice Correct-Horse-Battery-42\n");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("dangling symlink"), "{stderr}");
+    assert!(!target.exists(), "symlink target must not be created");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1366,7 +1403,7 @@ async fn monitor_truncates_oversized_fields() {
     let mut m = MonitorClient::connect(monitor_addr);
     client()
         .get(format!("http://{proxy}/x"))
-        .header(header::USER_AGENT, "a".repeat(100_000))
+        .header(header::USER_AGENT, "a".repeat(10_000))
         .send()
         .await
         .unwrap();
@@ -1487,32 +1524,44 @@ async fn session_db_contention_does_not_block_requests() {
     holder.join().unwrap();
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-async fn wait_ready(client: &reqwest::Client, base: &str) {
-    for _ in 0..100 {
-        if client.get(base).send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("serve did not start listening at {base}");
-}
-
-fn spawn_serve(dir: &PathBuf) -> std::process::Child {
-    bin()
+/// Spawn `serve` with piped stdout and return the child plus the address it
+/// reports on its "listening on ADDR, ..." line — no port guessing, so a
+/// restarted child may land on a different port.
+fn spawn_serve_bound(dir: &PathBuf) -> (std::process::Child, SocketAddr) {
+    let mut child = bin()
         .arg("serve")
         .current_dir(dir)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap()
+        .unwrap();
+    let mut r = BufReader::new(child.stdout.take().unwrap());
+    let mut found = None;
+    for _ in 0..10 {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some((_, rest)) = line.split_once("listening on ") {
+            found = Some(rest.split(',').next().unwrap().trim().parse().unwrap());
+            break;
+        }
+    }
+    match found {
+        Some(addr) => {
+            // Keep draining stdout: the child logs logins there, and a
+            // closed read end would make println! fail mid-request.
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut r, &mut std::io::sink());
+            });
+            (child, addr)
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve printed no 'listening on' line");
+        }
+    }
 }
 
 /// A real process restart preserves the persisted creation order: after a
@@ -1523,25 +1572,17 @@ async fn restart_keeps_eviction_order() {
     let dir = config_dir();
     let out = run_add_user(&dir, "alice Correct-Horse-Battery-42\n");
     assert!(out.status.success(), "{out:?}");
-    let (port, monitor_port) = (free_port(), free_port());
+    // Port 0: the child picks a free port and prints it, so there is no
+    // bind race between probe and listen.
     let config = dir.join("config.toml");
-    edit_config(
-        &config,
-        "listen_addr",
-        &format!("listen_addr = \"127.0.0.1:{port}\""),
-    );
-    edit_config(
-        &config,
-        "monitor_addr",
-        &format!("monitor_addr = \"127.0.0.1:{monitor_port}\""),
-    );
+    edit_config(&config, "listen_addr", "listen_addr = \"127.0.0.1:0\"");
+    edit_config(&config, "monitor_addr", "monitor_addr = \"127.0.0.1:0\"");
     edit_config(&config, "upstream", &format!("upstream = \"{upstream}\""));
     edit_config(&config, "cookie_secure", "cookie_secure = false");
-    let base = format!("http://127.0.0.1:{port}");
     let client = client();
 
-    let mut child = spawn_serve(&dir);
-    wait_ready(&client, &base).await;
+    let (mut child, addr) = spawn_serve_bound(&dir);
+    let base = format!("http://{addr}");
     let mut tokens = Vec::new();
     for _ in 0..3 {
         tokens.push(login_token(&client, &base).await);
@@ -1564,8 +1605,8 @@ async fn restart_keeps_eviction_order() {
         "created stamps distinct and increasing: {created:?}"
     );
 
-    let mut child = spawn_serve(&dir);
-    wait_ready(&client, &base).await;
+    let (mut child, addr) = spawn_serve_bound(&dir);
+    let base = format!("http://{addr}");
     tokens.push(login_token(&client, &base).await);
     for (i, token) in tokens.iter().enumerate() {
         assert_eq!(
@@ -2118,6 +2159,7 @@ async fn front_page_message_shown() {
     assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
     assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
     assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+    assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
     let body = resp.text().await.unwrap();
     let front = body.find("<p>Site Description Here</p>").unwrap();
     assert!(front < body.find("<form").unwrap(), "{body}");
@@ -2213,11 +2255,7 @@ fn cli_unix_monitor_socket() {
         "monitor_addr",
         &format!("monitor_addr = \"unix:{}\"", sock.display()),
     );
-    edit_config(
-        &config,
-        "listen_addr",
-        &format!("listen_addr = \"127.0.0.1:{}\"", free_port()),
-    );
+    edit_config(&config, "listen_addr", "listen_addr = \"127.0.0.1:0\"");
     assert!(
         run_add_user(&dir, "alice Correct-Horse-Battery-42\n")
             .status
@@ -2251,8 +2289,22 @@ fn cli_unix_monitor_socket() {
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
     assert!(line.contains("\"daily_counts\""), "{line}");
-    child.kill().unwrap();
+
+    // Orderly shutdown (SIGTERM) unlinks the socket and its lock dir.
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
     child.wait().unwrap();
+    for _ in 0..100 {
+        if !sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!sock.exists(), "socket left behind after SIGTERM");
+    assert!(!dir.join(".m.sock").exists(), "lock directory left behind");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2371,4 +2423,283 @@ async fn shutdown_drains_with_deadline() {
         .await
         .expect("stalled connection was not closed")
         .unwrap();
+}
+
+/// Read a raw connection until the response head is complete.
+async fn read_head(s: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("no response within 5s")
+            .unwrap();
+        assert!(
+            n > 0,
+            "connection closed: {}",
+            String::from_utf8_lossy(&got)
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&got).to_string()
+}
+
+/// Headers up to the configured limit get a normal response and keep-alive
+/// still works; over it the answer is 431 and the connection is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn header_size_limits() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, Limits::default()).await;
+
+    // One long header value: header *count* has its own (100) cap.
+    let request_with_headers = |bytes: usize, path: &str| {
+        let head = format!("GET {path} HTTP/1.1\r\nHost: {proxy}\r\nX-Pad: ");
+        let pad = "0".repeat(bytes.saturating_sub(head.len()));
+        let mut req = head;
+        req.push_str(&pad);
+        req.push_str("\r\n\r\n");
+        req
+    };
+
+    // ~12 KiB: under the 16 KiB default, so the request is answered and the
+    // connection stays usable for a second request.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(request_with_headers(12 * 1024, "/").as_bytes())
+        .await
+        .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    s.write_all(format!("GET /robots.txt HTTP/1.1\r\nHost: {proxy}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // ~20 KiB: over the read buffer — hyper answers 431 and closes with
+    // the rest of the request still unread, so the kernel may send a reset
+    // that discards the 431 before it is read (it does on macOS). Either
+    // way the connection must end rather than keep buffering.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(request_with_headers(20 * 1024, "/").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .expect("connection not closed after oversized headers")
+    {
+        Ok(_) => {
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(resp.starts_with("HTTP/1.1 431"), "{resp}");
+        }
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}"),
+    }
+
+    // A request that arrives whole in hyper's first 8 KiB read, with
+    // headers over max_header_size, is rejected only after it has been
+    // read in full: nothing is left unread, so the 431 always arrives,
+    // followed by a clean close.
+    let limits = Limits {
+        max_header_size: 4 * 1024,
+        ..Limits::default()
+    };
+    let (proxy, ..) = spawn_proxy_full(&upstream, 100, limits).await;
+    let head = format!("GET / HTTP/1.1\r\nHost: {proxy}\r\nX-Pad: ");
+    let req = format!("{head}{}\r\n\r\n", "0".repeat(6 * 1024 - head.len()));
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+        .await
+        .expect("connection not closed after 431")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 431"), "{resp}");
+}
+
+/// Every request needs exactly one well-formed Host header, and an
+/// absolute-form URI must agree with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn host_header_validated() {
+    use tokio::io::AsyncWriteExt;
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+
+    let raw = |head: &str| {
+        let head = head.replace("{proxy}", &proxy.to_string());
+        async move {
+            let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            s.write_all(head.as_bytes()).await.unwrap();
+            read_head(&mut s).await
+        }
+    };
+
+    for (head, want) in [
+        // Missing Host.
+        ("GET / HTTP/1.1\r\n\r\n", "400"),
+        // Two identical Host headers.
+        (
+            "GET / HTTP/1.1\r\nHost: {proxy}\r\nHost: {proxy}\r\n\r\n",
+            "400",
+        ),
+        // Two different Host headers.
+        (
+            "GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n",
+            "400",
+        ),
+        // Empty, and a port that is not a number.
+        ("GET / HTTP/1.1\r\nHost: \r\n\r\n", "400"),
+        ("GET / HTTP/1.1\r\nHost: x:abc\r\n\r\n", "400"),
+        // An absolute-form URI whose authority disagrees with Host.
+        (
+            "GET http://other.example/ HTTP/1.1\r\nHost: {proxy}\r\n\r\n",
+            "400",
+        ),
+        // IPv6 literal and an absolute-form URI matching Host are fine.
+        ("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n", "401"),
+        (
+            "GET http://{proxy}/ HTTP/1.1\r\nHost: {proxy}\r\n\r\n",
+            "401",
+        ),
+    ] {
+        let head = raw(head).await;
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {want}")),
+            "{head:?} (want {want})"
+        );
+    }
+}
+
+/// Client-supplied forwarding headers are stripped; only the gate's own
+/// X-Forwarded-* stamps reach upstream, and a duplicated CF-Connecting-IP
+/// fails closed to the peer address.
+#[tokio::test]
+async fn forwarding_headers_scrubbed() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    let resp = client
+        .get(format!("{base}/dump"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .header("cf-connecting-ip", "198.51.100.9")
+        .header("cf-connecting-ipv6", "2001:db8::1")
+        .header("true-client-ip", "203.0.113.1")
+        .header("x-client-ip", "203.0.113.2")
+        .header("x-real-ip", "203.0.113.3")
+        .header("forwarded", "for=1.2.3.4;proto=https")
+        .header("x-forwarded-scheme", "https")
+        .header("x-forwarded-ssl", "on")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "evil.example")
+        .header("x-forwarded-for", "10.0.0.1")
+        .header("x-url-scheme", "https")
+        .header("front-end-https", "on")
+        .header("x-host", "evil.example")
+        .header("x-original-host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let names: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.split(':').next().map(str::trim))
+        .collect();
+    // The gate's own stamps survive — XFF from the trusted CF header.
+    assert!(body.contains("x-forwarded-for: 198.51.100.9"), "{body}");
+    assert!(body.contains("x-forwarded-proto: http"), "{body}");
+    assert!(names.contains(&"x-forwarded-host"), "{body}");
+    for name in [
+        "cf-connecting-ip",
+        "cf-connecting-ipv6",
+        "true-client-ip",
+        "x-client-ip",
+        "x-real-ip",
+        "forwarded",
+        "x-forwarded-scheme",
+        "x-forwarded-ssl",
+        "x-url-scheme",
+        "front-end-https",
+        "x-host",
+        "x-original-host",
+    ] {
+        assert!(!names.contains(&name), "{name} forwarded: {body}");
+    }
+    assert!(!body.contains("evil.example"), "{body}");
+    assert!(!body.contains("10.0.0.1"), "client XFF kept: {body}");
+
+    // Two CF-Connecting-IP values are ambiguous: fail closed to the peer.
+    let resp = client
+        .get(format!("{base}/dump"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .header("cf-connecting-ip", "198.51.100.9")
+        .header("cf-connecting-ip", "198.51.100.10")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("x-forwarded-for: 127.0.0.1"), "{body}");
+}
+
+/// Any path segment that decodes to `__wsb` (any case, percent-encoded, in
+/// any position) is the gate's namespace and is never forwarded.
+#[tokio::test]
+async fn reserved_paths_never_forwarded() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(hits.clone()).await;
+    let proxy = spawn_proxy(&upstream).await;
+    let base = format!("http://{proxy}");
+    let client = client();
+    let token = login_token(&client, &base).await;
+
+    for path in ["/__WSB/login", "/__wsb", "/a/__wsb/x", "/%5f%5Fwsb/x"] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .header(header::COOKIE, format!("wsb_session={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+        assert_eq!(
+            resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff",
+            "{path}"
+        );
+    }
+    // Lookalikes are ordinary paths and do forward.
+    let resp = client
+        .get(format!("{base}/__wsbx"))
+        .header(header::COOKIE, format!("wsb_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "reserved paths hit upstream"
+    );
+}
+
+/// The monitor sees the path with a '?' marking a query — never its contents.
+#[tokio::test(flavor = "multi_thread")]
+async fn monitor_path_never_contains_query() {
+    let upstream = spawn_upstream(Arc::new(AtomicUsize::new(0))).await;
+    let (proxy, monitor_addr) = spawn_proxy_with_monitor(&upstream, 10).await;
+    let mut m = MonitorClient::connect(monitor_addr);
+    client()
+        .get(format!("http://{proxy}/callback?code=s3cret-value"))
+        .send()
+        .await
+        .unwrap();
+    let e = m.event();
+    assert_eq!(e["kind"], "login_page", "{e}");
+    assert_eq!(e["path"], "/callback?", "{e}");
+    assert!(!e.to_string().contains("s3cret-value"), "{e}");
 }

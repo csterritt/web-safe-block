@@ -151,7 +151,7 @@ pub(crate) async fn login(
             let cookie_string = hash_token(&token);
             let saved = tokio::task::spawn_blocking(move || {
                 let mut last_created = writes;
-                let created = unix_micros().max(*last_created + 1);
+                let created = unix_micros().max(last_created.saturating_add(1));
                 *last_created = created;
                 let stored = StoredSession {
                     cookie_string: cookie_string.clone(),

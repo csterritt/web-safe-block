@@ -87,7 +87,10 @@ impl FromStr for MonitorAddr {
             #[cfg(unix)]
             return unix_socket_path("monitor_addr", rest).map(MonitorAddr::Unix);
             #[cfg(not(unix))]
-            return Err("unix socket monitor_addr is only supported on Unix".into());
+            {
+                let _ = rest;
+                return Err("unix socket monitor_addr is only supported on Unix".into());
+            }
         }
         let addr: SocketAddr = s
             .parse()
@@ -116,7 +119,16 @@ impl fmt::Display for MonitorAddr {
 pub enum MonitorListener {
     Tcp(TcpListener),
     #[cfg(unix)]
-    Unix(UnixListener),
+    Unix(UnixMonitorListener),
+}
+
+/// A unix listener plus the path it was published at (for logging and
+/// the guard's cleanup check).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnixMonitorListener {
+    listener: UnixListener,
+    path: PathBuf,
 }
 
 impl MonitorListener {
@@ -124,7 +136,17 @@ impl MonitorListener {
         match self {
             MonitorListener::Tcp(l) => l.accept().map(|(s, _)| Box::new(s) as _),
             #[cfg(unix)]
-            MonitorListener::Unix(l) => l.accept().map(|(s, _)| Box::new(s) as _),
+            MonitorListener::Unix(l) => l.listener.accept().map(|(s, _)| Box::new(s) as _),
+        }
+    }
+
+    /// The address clients connect to; for unix the published socket path.
+    pub fn local_addr(&self) -> MonitorAddr {
+        match self {
+            // unwrap: a bound TcpListener always has a local address.
+            MonitorListener::Tcp(l) => MonitorAddr::Tcp(l.local_addr().unwrap()),
+            #[cfg(unix)]
+            MonitorListener::Unix(l) => MonitorAddr::Unix(l.path.clone()),
         }
     }
 }
@@ -162,68 +184,220 @@ impl MonitorStream for UnixStream {
     }
 }
 
-/// Bind the monitor address. A unix socket is created mode 0600 (via a
-/// private temp dir + rename, so it is never reachable with looser
-/// permissions) inside an existing directory; a stale socket file at the
-/// path is replaced, a live one or a non-socket is an error.
-pub fn bind_monitor(addr: &MonitorAddr) -> io::Result<MonitorListener> {
+/// Keeps a bound unix monitor socket exclusively owned: it holds the flock
+/// on the socket's lock directory and, on drop (orderly shutdown), unlinks
+/// the published socket if it is still ours and removes the lock directory.
+/// A no-op for TCP (and off Unix).
+#[derive(Debug)]
+pub struct MonitorGuard {
+    /// Held only for its Drop, which unlinks the socket and lock dir.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    unix: Option<UnixMonitorGuard>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct UnixMonitorGuard {
+    /// Open fd holding the flock on `lockdir`; dropping it frees the lock.
+    _lock: std::fs::File,
+    path: PathBuf,
+    lockdir: PathBuf,
+    /// Identity of the socket we published, so drop never removes a
+    /// different file that appeared at `path`.
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl Drop for UnixMonitorGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(md) = std::fs::symlink_metadata(&self.path)
+            && md.dev() == self.dev
+            && md.ino() == self.ino
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        let _ = std::fs::remove_dir(&self.lockdir);
+        // `_lock` closes here, releasing the flock.
+    }
+}
+
+impl MonitorGuard {
+    #[cfg(unix)]
+    fn none() -> Self {
+        MonitorGuard { unix: None }
+    }
+    #[cfg(not(unix))]
+    fn none() -> Self {
+        MonitorGuard {}
+    }
+}
+
+/// Bind the monitor address. A unix socket is created mode 0600 (bound in
+/// a private lock directory next to it, then hard-linked into place with
+/// no clobber) inside an existing directory; a stale socket file at the
+/// path is replaced, a live one or a non-socket is an error. The returned
+/// [`MonitorGuard`] must be held as long as the socket should stay bound;
+/// dropping it unlinks a unix socket.
+pub fn bind_monitor(addr: &MonitorAddr) -> io::Result<(MonitorListener, MonitorGuard)> {
     match addr {
-        MonitorAddr::Tcp(a) => TcpListener::bind(a).map(MonitorListener::Tcp),
+        MonitorAddr::Tcp(a) => {
+            // from_str enforces this already; repeat it so a library caller
+            // building the enum directly cannot publish a remote monitor.
+            if !a.ip().is_loopback() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("monitor_addr must be a loopback address, got {a}"),
+                ));
+            }
+            TcpListener::bind(a).map(|l| (MonitorListener::Tcp(l), MonitorGuard::none()))
+        }
         #[cfg(unix)]
-        MonitorAddr::Unix(path) => bind_unix_monitor(path).map(MonitorListener::Unix),
+        MonitorAddr::Unix(path) => {
+            bind_unix_monitor(path).map(|(l, g)| (MonitorListener::Unix(l), g))
+        }
     }
 }
 
 #[cfg(unix)]
-fn bind_unix_monitor(path: &Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+fn bind_unix_monitor(path: &Path) -> io::Result<(UnixMonitorListener, MonitorGuard)> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 
     let parent = path.parent().unwrap_or(Path::new("/"));
-    if let Ok(md) = std::fs::symlink_metadata(path) {
-        if !md.file_type().is_socket() {
-            return Err(io::Error::new(
-                ErrorKind::AddrInUse,
-                format!("{} exists and is not a socket", path.display()),
-            ));
-        }
-        match UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    ErrorKind::AddrInUse,
-                    format!(
-                        "monitor socket {} is in use by another process",
-                        path.display()
-                    ),
-                ));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("monitor socket path {} has no file name", path.display()),
+        )
+    })?;
+    let lockdir = parent.join(format!(".{}", name.to_string_lossy()));
+
+    // The lock directory is both the private temp dir and the mutual-
+    // exclusion token: exactly one live web-safe-block can flock it, so a
+    // second instance can never clobber or remove a live socket.
+    let lock = {
+        let mut tries = 0;
+        loop {
+            match std::fs::DirBuilder::new().mode(0o700).create(&lockdir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Crash litter is fine only if it is a real directory.
+                    if !std::fs::symlink_metadata(&lockdir)?.is_dir() {
+                        return Err(io::Error::new(
+                            ErrorKind::AlreadyExists,
+                            format!("{} exists and is not a directory", lockdir.display()),
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            // Stale socket left by a previous run: remove it.
-            // Only a refused connect proves nobody is listening; anything
-            // else (e.g. permission denied) might be a live socket.
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)?,
-            Err(e) => return Err(e),
-        }
-    }
-    // Keep the temporary name short: the bound path must fit in sun_path
-    // (104 bytes on macOS), so it should not be much longer than `path`.
-    let mut attempt = 0;
-    let tmp = loop {
-        let tmp = parent.join(format!(".w{:x}-{attempt}", std::process::id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
-            Ok(()) => break tmp,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempt < 15 => attempt += 1,
-            Err(e) => return Err(e),
+            let f = std::fs::File::open(&lockdir)?;
+            match f.try_lock() {
+                Ok(()) => {
+                    // Confirm the dir we locked is still the linked one: a
+                    // failing concurrent bind removes its own lockdir on
+                    // the way out, and locking an unlinked dir would not
+                    // exclude a later instance.
+                    if f.metadata()?.ino() == std::fs::symlink_metadata(&lockdir)?.ino() {
+                        break f;
+                    }
+                    tries += 1;
+                    if tries > 3 {
+                        return Err(io::Error::new(
+                            ErrorKind::AddrInUse,
+                            format!(
+                                "monitor socket {} is in use by another web-safe-block",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!(
+                            "monitor socket {} is in use by another web-safe-block",
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
         }
     };
+
     let result = (|| {
-        let sock = tmp.join("s");
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            if !md.file_type().is_socket() {
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("{} exists and is not a socket", path.display()),
+                ));
+            }
+            // A live web-safe-block holds the flock, so a socket that still
+            // accepts a connection here belongs to another process. A
+            // refused connect proves nobody is listening; anything else
+            // (e.g. permission denied) might be a live socket.
+            match UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!(
+                            "monitor socket {} is in use by another process",
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(e) if e.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)?,
+                Err(e) => return Err(e),
+            }
+        }
+        // Crash litter from a previous bind is ours to remove: we hold
+        // the lock, so nobody else can be using the directory.
+        let _ = std::fs::remove_file(lockdir.join("s"));
+        let sock = lockdir.join("s");
         let listener = UnixListener::bind(&sock)
             .map_err(|e| io::Error::new(e.kind(), format!("binding {}: {e}", sock.display())))?;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&sock, path)?;
-        Ok(listener)
+        // Publish no-clobber: a path that appears between the check above
+        // and now is left alone and reported instead of being replaced.
+        if let Err(e) = std::fs::hard_link(&sock, path) {
+            return Err(match e.kind() {
+                ErrorKind::AlreadyExists => io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("{} already exists", path.display()),
+                ),
+                _ => e,
+            });
+        }
+        std::fs::remove_file(&sock)?;
+        let md = std::fs::symlink_metadata(path)?;
+        Ok((listener, md.dev(), md.ino()))
     })();
-    let _ = std::fs::remove_dir_all(&tmp);
-    result
+    match result {
+        Ok((listener, dev, ino)) => Ok((
+            UnixMonitorListener {
+                listener,
+                path: path.to_path_buf(),
+            },
+            MonitorGuard {
+                unix: Some(UnixMonitorGuard {
+                    _lock: lock,
+                    path: path.to_path_buf(),
+                    lockdir,
+                    dev,
+                    ino,
+                }),
+            },
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_file(lockdir.join("s"));
+            let _ = std::fs::remove_dir(&lockdir);
+            Err(e)
+        }
+    }
 }
 
 /// What a handler reports about a request; attached as a response extension.
@@ -349,8 +523,10 @@ impl DailyCounts {
             EventKind::LoginSucceeded => c.login_succeeded += 1,
             EventKind::LoginFailed => c.login_failed += 1,
             EventKind::LoginPage => {
-                let p = path.split('?').next().unwrap_or("");
-                if p != "/" && !p.starts_with("/__wsb/") {
+                // The recorded path is the bare path plus a possible '?'
+                // marker; "/?" is still the root.
+                let p = path.strip_suffix('?').unwrap_or(path);
+                if p != "/" && !crate::util::is_reserved_path(p) {
                     c.unauth_non_root += 1;
                 }
             }
@@ -365,10 +541,10 @@ impl DailyCounts {
         }
     }
 
-    fn drop_unseen(&mut self, now: u64) {
+    fn drop_unseen(&mut self, now: u64, n: u64) {
         self.roll(now);
         if let Some((_, c)) = self.days.back_mut() {
-            c.dropped_unseen += 1;
+            c.dropped_unseen += n;
         }
     }
 
@@ -487,7 +663,7 @@ impl EventQueue {
                     inner.dropped += 1;
                 }
             } else {
-                inner.daily.drop_unseen(now);
+                inner.daily.drop_unseen(now, 1);
             }
         }
         drop(inner);
@@ -495,15 +671,17 @@ impl EventQueue {
     }
 
     /// Wait up to `timeout` for unconsumed events. Returns copies of them (they
-    /// stay queued until [`mark_consumed`](Self::mark_consumed)) and the number
-    /// of events overwritten since the previous call.
+    /// stay queued until [`ack`](Self::ack)) and the number of events
+    /// overwritten since the reported count was last acknowledged. The count
+    /// is *not* cleared here: an unacknowledged notice is never lost to a
+    /// failed write.
     pub fn pending(&self, timeout: Duration) -> (Vec<Event>, u64) {
         let inner = self.inner.lock().unwrap();
         let (mut inner, _) = self
             .ready
             .wait_timeout_while(inner, timeout, |i| i.events.is_empty() && i.dropped == 0)
             .unwrap();
-        let dropped = std::mem::take(&mut inner.dropped);
+        let dropped = inner.dropped;
         let batch: Vec<Event> = inner.events.iter().take(MAX_BATCH).cloned().collect();
         if let Some(last) = batch.last() {
             inner.sent_up_to = last.seq;
@@ -511,13 +689,17 @@ impl EventQueue {
         (batch, dropped)
     }
 
-    /// Remove all events with `seq <= up_to`.
-    pub fn mark_consumed(&self, up_to: u64) {
+    /// Acknowledge what was written to the monitor: remove all events with
+    /// `seq <= up_to` and subtract the `dropped` count already reported.
+    pub fn ack(&self, up_to: Option<u64>, dropped: u64) {
         let mut inner = self.inner.lock().unwrap();
-        while inner.events.front().is_some_and(|e| e.seq <= up_to) {
-            let ev = inner.events.pop_front().unwrap();
-            inner.bytes -= event_bytes(&ev);
+        if let Some(up_to) = up_to {
+            while inner.events.front().is_some_and(|e| e.seq <= up_to) {
+                let ev = inner.events.pop_front().unwrap();
+                inner.bytes -= event_bytes(&ev);
+            }
         }
+        inner.dropped = inner.dropped.saturating_sub(dropped);
     }
 
     /// The current UTC day number, per this queue's clock.
@@ -552,7 +734,15 @@ impl EventQueue {
     }
 
     fn disconnect(&self) {
-        self.inner.lock().unwrap().monitor_connected = false;
+        let mut inner = self.inner.lock().unwrap();
+        inner.monitor_connected = false;
+        // Drops counted but never acknowledged are not lost: they land in
+        // today's dropped_unseen so the next monitor can still see them.
+        if inner.dropped > 0 {
+            let dropped = inner.dropped;
+            inner.daily.drop_unseen((self.clock)(), dropped);
+            inner.dropped = 0;
+        }
     }
 }
 
@@ -661,9 +851,7 @@ fn serve_monitor(mut stream: Box<dyn MonitorStream>, events: &EventQueue) -> io:
         // a possible reset so those events stay queued for the next monitor.
         thread::sleep(PROBE_WAIT);
         half_closed |= read_eof(&mut *stream)?;
-        if let Some(last) = batch.last() {
-            events.mark_consumed(last.seq);
-        }
+        events.ack(batch.last().map(|e| e.seq), dropped);
     }
 }
 
@@ -774,7 +962,11 @@ mod tests {
         for _ in 0..5 {
             q.push(ev("/"));
         }
+        let (batch, dropped) = q.pending(Duration::ZERO);
+        assert_eq!(dropped, 3);
+        // pending does not clear the count: only ack after a write does.
         assert_eq!(q.pending(Duration::ZERO).1, 3);
+        q.ack(batch.last().map(|e| e.seq), dropped);
         assert_eq!(q.pending(Duration::ZERO).1, 0);
         // Seqs 4 and 5 were handed out above; overwriting them is not a drop.
         q.push(ev("/"));
@@ -796,7 +988,7 @@ mod tests {
         q.push(ev("/b"));
         let (batch, _) = q.pending(Duration::ZERO);
         q.push(ev("/c"));
-        q.mark_consumed(batch.last().unwrap().seq);
+        q.ack(Some(batch.last().unwrap().seq), 0);
         assert_eq!(seqs(&q), [3]);
     }
 
@@ -859,7 +1051,7 @@ mod tests {
             batch.iter().map(|e| e.seq).collect::<Vec<_>>()
         );
         assert_eq!(batch[0].seq, 5);
-        q.mark_consumed(5);
+        q.ack(Some(5), 0);
         for i in 0..4 {
             q.push(ev(&format!("/{i}")));
         }
@@ -876,11 +1068,11 @@ mod tests {
         let (b1, _) = q.pending(Duration::ZERO);
         assert_eq!(b1.len(), 100);
         assert_eq!(b1[0].seq, 1);
-        q.mark_consumed(b1.last().unwrap().seq);
+        q.ack(Some(b1.last().unwrap().seq), 0);
         let (b2, _) = q.pending(Duration::ZERO);
         assert_eq!(b2.len(), 100);
         assert_eq!(b2[0].seq, 101);
-        q.mark_consumed(b2.last().unwrap().seq);
+        q.ack(Some(b2.last().unwrap().seq), 0);
         let (b3, _) = q.pending(Duration::ZERO);
         assert_eq!(b3.len(), 50);
         assert_eq!(b3[0].seq, 201);
@@ -936,7 +1128,7 @@ mod tests {
         for path in ["/wp-admin", "/a?b"] {
             d.record(t0, EventKind::LoginPage, path);
         }
-        for path in ["/", "/?x=1", "/__wsb/login"] {
+        for path in ["/", "/?", "/__wsb/login", "/__WSB/x", "/%5f%5Fwsb/x"] {
             d.record(t0, EventKind::LoginPage, path);
         }
         assert_eq!(d.days.back().unwrap().1.unauth_non_root, 2);
@@ -1061,6 +1253,32 @@ mod tests {
         assert_eq!(q.daily_report().0[0].counts.dropped_unseen, 2);
     }
 
+    /// Drops that were handed to a monitor but never acknowledged (the write
+    /// failed or the client went away) land in dropped_unseen on disconnect.
+    #[test]
+    fn unacked_drops_move_to_dropped_unseen() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn clk() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        NOW.store(20_100 * DAY + 60, Ordering::SeqCst);
+        let q = EventQueue::with_clock(2, clk);
+        assert!(q.try_connect());
+        for _ in 0..5 {
+            q.push(ev("/x"));
+        }
+        let (_batch, dropped) = q.pending(Duration::ZERO);
+        assert_eq!(dropped, 3);
+        q.disconnect();
+        assert_eq!(q.daily_report().0[0].counts.dropped_unseen, 3);
+        // Acked drops do not move.
+        assert!(q.try_connect());
+        let (_batch, dropped) = q.pending(Duration::ZERO);
+        q.ack(None, dropped);
+        q.disconnect();
+        assert_eq!(q.daily_report().0[0].counts.dropped_unseen, 3);
+    }
+
     #[test]
     fn daily_counts_forward_jump_from_epoch() {
         let mut d = DailyCounts::new(0);
@@ -1095,7 +1313,7 @@ mod tests {
     fn daily_counts_backward_step_before_first_event() {
         let mut d = DailyCounts::new(100 * DAY + 50);
         d.record(99 * DAY + 5, EventKind::LoginFailed, "/x");
-        d.drop_unseen(99 * DAY + 6);
+        d.drop_unseen(99 * DAY + 6, 1);
         let reports = d.report(99 * DAY + 10);
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
@@ -1250,19 +1468,29 @@ mod tests {
         fn bind_monitor_creates_private_socket() {
             let path = sock("m.sock");
             let dir = path.parent().unwrap().to_path_buf();
-            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            let (listener, guard) = bind_monitor(&unix_addr(&path)).unwrap();
             assert!(matches!(listener, MonitorListener::Unix(_)));
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "umask must not widen the socket");
-            // No private temp dir left behind.
-            let names: Vec<_> = std::fs::read_dir(&dir)
+            // Only the socket and its lock directory; the temp name is gone.
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
                 .collect();
-            assert_eq!(names, [std::ffi::OsString::from("m.sock")], "{names:?}");
-            // The renamed listener still accepts.
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    std::ffi::OsString::from(".m.sock"),
+                    std::ffi::OsString::from("m.sock")
+                ],
+                "{names:?}"
+            );
+            // The listener still accepts via the published path after the
+            // temporary name was unlinked.
             UnixStream::connect(&path).unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
+            drop(guard);
         }
 
         /// The temporary bind path must not push a path that fits in
@@ -1275,7 +1503,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("monitor.sock");
             assert!(path.as_os_str().len() < 104, "{}", path.display());
-            let _listener = bind_monitor(&unix_addr(&path)).unwrap();
+            let _bound = bind_monitor(&unix_addr(&path)).unwrap();
             UnixStream::connect(&path).unwrap();
             std::fs::remove_dir_all(&base).unwrap();
         }
@@ -1288,9 +1516,43 @@ mod tests {
                 let _dead = UnixListener::bind(&path).unwrap();
             }
             assert!(path.exists(), "dropped listener leaves the file");
-            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            let (listener, _guard) = bind_monitor(&unix_addr(&path)).unwrap();
             assert!(matches!(listener, MonitorListener::Unix(_)));
             UnixStream::connect(&path).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A crashed run leaves the lock directory and its unpublished `s`
+        /// behind; the next bind cleans both up and succeeds.
+        #[test]
+        fn bind_monitor_clears_lockdir_litter() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            let lockdir = dir.join(".m.sock");
+            std::fs::create_dir(&lockdir).unwrap();
+            std::fs::File::create(lockdir.join("s")).unwrap();
+            let (listener, _guard) = bind_monitor(&unix_addr(&path)).unwrap();
+            assert!(matches!(listener, MonitorListener::Unix(_)));
+            UnixStream::connect(&path).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// While one instance's guard is alive a second bind is refused, and
+        /// dropping the guard unlinks the socket and the lock directory.
+        #[test]
+        fn bind_monitor_second_instance_refused() {
+            let path = sock("m.sock");
+            let dir = path.parent().unwrap().to_path_buf();
+            let (listener, guard) = bind_monitor(&unix_addr(&path)).unwrap();
+            let err = bind_monitor(&unix_addr(&path)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+            assert!(err.to_string().contains("web-safe-block"), "{err}");
+            // The first listener is untouched.
+            UnixStream::connect(&path).unwrap();
+            drop(listener);
+            drop(guard);
+            assert!(!path.exists(), "guard removed the socket");
+            assert!(!dir.join(".m.sock").exists(), "guard removed the lockdir");
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
@@ -1320,7 +1582,7 @@ mod tests {
             use std::io::BufReader;
             let path = sock("m.sock");
             let dir = path.parent().unwrap().to_path_buf();
-            let listener = bind_monitor(&unix_addr(&path)).unwrap();
+            let (listener, _guard) = bind_monitor(&unix_addr(&path)).unwrap();
             let q = Arc::new(EventQueue::new(10));
             spawn_monitor(listener, q.clone());
             let mut e = ev("/x");

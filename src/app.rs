@@ -23,7 +23,9 @@ use crate::proxy::proxy_or_login;
 use crate::rate_limit::RATE_LIMIT_WINDOW;
 use crate::sessions::reload_sessions;
 use crate::state::{AppState, Config};
-use crate::util::{LOGIN_PATH, LOGOUT_PATH, client_key};
+use crate::util::{
+    LOGIN_PATH, LOGOUT_PATH, client_key, is_reserved_path, plain_response, valid_host,
+};
 
 /// Login form size cap; enforced both by the body limit and by
 /// `login_body_deadline` while it buffers the body.
@@ -54,8 +56,24 @@ pub fn build_router(config: Config, events: Arc<EventQueue>) -> Result<Router, S
         // Answered by the gate for everyone; never forwarded upstream.
         .route("/robots.txt", get(robots))
         .fallback(proxy_or_login)
+        // Inside record_event so a rejected request is still reported.
+        .layer(middleware::from_fn(validate_host))
         .layer(middleware::from_fn_with_state(state.clone(), record_event))
         .with_state(state))
+}
+
+/// Reject ambiguous request authority before anything else: exactly one
+/// Host header that parses as an authority and matches an absolute-form
+/// request URI if there is one.
+async fn validate_host(req: Request, next: Next) -> Response {
+    if !valid_host(req.headers(), req.uri()) {
+        return with_outcome(
+            plain_response(StatusCode::BAD_REQUEST, "Bad Request"),
+            EventKind::Other,
+            None,
+        );
+    }
+    next.run(req).await
 }
 
 /// Buffer the login form within `request_body_timeout`, so a client that
@@ -90,10 +108,16 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
         .map(|c| c.0);
     let ip = client_key(req.headers(), peer);
     let (method, m1) = truncate_at(req.method().as_str(), 32);
-    let (path, m2) = truncate_at(
-        req.uri().path_and_query().map_or("/", |pq| pq.as_str()),
-        1024,
-    );
+    // The query string is never recorded (it can carry tokens and reset
+    // codes); a bare '?' marks only that a query was present.
+    let raw_path = req.uri().path();
+    let (path, m2) = if req.uri().query().is_some() {
+        let mut p = raw_path.to_string();
+        p.push('?');
+        truncate_at(&p, 1024)
+    } else {
+        truncate_at(raw_path, 1024)
+    };
     let (user_agent, m3) = req
         .headers()
         .get(header::USER_AGENT)
@@ -103,7 +127,7 @@ async fn record_event(State(state): State<AppState>, req: Request, next: Next) -
             (Some(t), cut)
         });
     let truncated = m1 || m2 || m3;
-    let wsb_path = path.starts_with("/__wsb/");
+    let wsb_path = is_reserved_path(raw_path);
     let mut resp = next.run(req).await;
     // Axum's own rejections (400/405/413/415/422) carry no Cache-Control;
     // gate answers must never be stored.
@@ -144,6 +168,10 @@ async fn robots() -> Response {
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=86400"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
     );
     with_outcome(resp, EventKind::Robots, None)
 }

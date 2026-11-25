@@ -38,19 +38,19 @@ pub enum Upstream {
 }
 
 impl Upstream {
-    /// Scheme and authority stamped on the outgoing request URI. For a unix
-    /// socket `localhost` is only the connection-pool key — the connector
-    /// ignores it and the visitor's Host header is forwarded untouched.
-    pub(crate) fn request_base(&self) -> (Scheme, Authority) {
+    /// Scheme and authority stamped on the outgoing request URI, or None if
+    /// an Http upstream has no authority (FromStr rejects those; an enum
+    /// built directly can still hold one). For a unix socket `localhost` is
+    /// only the connection-pool key — the connector ignores it and the
+    /// visitor's Host header is forwarded untouched.
+    pub(crate) fn request_base(&self) -> Option<(Scheme, Authority)> {
         match self {
-            Upstream::Http(uri) => (
-                uri.scheme().cloned().unwrap_or(Scheme::HTTP),
-                uri.authority()
-                    .cloned()
-                    .expect("http upstream always has an authority"),
-            ),
+            Upstream::Http(uri) => uri
+                .authority()
+                .cloned()
+                .map(|a| (uri.scheme().cloned().unwrap_or(Scheme::HTTP), a)),
             #[cfg(unix)]
-            Upstream::Unix(_) => (Scheme::HTTP, Authority::from_static("localhost")),
+            Upstream::Unix(_) => Some((Scheme::HTTP, Authority::from_static("localhost"))),
         }
     }
 }
@@ -63,7 +63,10 @@ impl FromStr for Upstream {
             #[cfg(unix)]
             return unix_upstream(rest).map(Upstream::Unix);
             #[cfg(not(unix))]
-            return Err("unix socket upstream is only supported on Unix".into());
+            {
+                let _ = rest;
+                return Err("unix socket upstream is only supported on Unix".into());
+            }
         }
         http_upstream(s).map(Upstream::Http)
     }
@@ -101,7 +104,7 @@ pub(crate) fn unix_socket_path(setting: &str, rest: &str) -> Result<PathBuf, Str
     }
     if rest.starts_with("//") {
         return Err(format!(
-            "{setting} unix socket uses unix:/absolute/path, not unix://{rest}"
+            "{setting} unix socket uses unix:/absolute/path, not unix:{rest}"
         ));
     }
     Err(format!(
@@ -170,5 +173,18 @@ impl tower::Service<Uri> for UnixConnector {
                 )),
             }
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_socket_path_double_slash_message() {
+        let e = unix_socket_path("upstream", "//run/app.sock").unwrap_err();
+        // The shown value reproduces the user's input: unix://run/app.sock.
+        assert!(e.contains("unix://run/app.sock"), "{e}");
+        assert!(!e.contains("unix:////"), "{e}");
     }
 }

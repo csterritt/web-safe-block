@@ -3,11 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! The HTTP accept loop. Each connection is served by hyper http1 with a
-//! per-connection header read timeout (slowloris) and a write-stall
-//! timeout (a client that stops reading). At most `limits.max_connections`
-//! connections are served at once — extras wait in the listen backlog —
-//! and on shutdown in-flight connections are drained for up to
-//! `limits.shutdown_timeout`, then closed.
+//! per-connection header read timeout (slowloris), a write-stall
+//! timeout (a client that stops reading), and header/read-buffer size
+//! caps so a client cannot pin memory with oversized headers (over-limit
+//! requests get 431 and a closed connection). At most
+//! `limits.max_connections` connections are served at once — extras wait
+//! in the listen backlog — and on shutdown in-flight connections are
+//! drained for up to `limits.shutdown_timeout`, then closed.
 
 use std::future::Future;
 use std::io;
@@ -32,7 +34,8 @@ use crate::state::Limits;
 
 /// Serve `router` on `listener` until `shutdown` resolves, then drain
 /// in-flight connections for up to `limits.shutdown_timeout`. Enforces
-/// `limits.header_read_timeout`, `limits.client_write_stall_timeout`, and
+/// `limits.header_read_timeout`, `limits.client_write_stall_timeout`,
+/// `limits.max_header_size`, `limits.max_buf_size`, and
 /// `limits.max_connections`.
 pub async fn serve(
     listener: TcpListener,
@@ -50,7 +53,12 @@ pub async fn serve(
     let mut conn_builder = hyper::server::conn::http1::Builder::new();
     conn_builder
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout);
+        .header_read_timeout(limits.header_read_timeout)
+        .max_header_size(limits.max_header_size)
+        .max_buf_size(limits.max_buf_size);
+    // Persistent accept failures (e.g. fd exhaustion) warn at most once
+    // a minute; the loop itself still backs off 100ms per failure.
+    let mut last_warned: Option<std::time::Instant> = None;
     loop {
         let permit = tokio::select! {
             permit = conns.clone().acquire_owned() => {
@@ -67,8 +75,13 @@ pub async fn serve(
         };
         let (stream, peer) = match accepted {
             Ok(pair) => pair,
-            Err(_) => {
-                // accept() can fail fast (e.g. fd exhaustion); don't spin.
+            Err(e) => {
+                // accept() can fail fast (e.g. fd exhaustion); don't spin,
+                // and warn rather than retry silently.
+                if last_warned.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    eprintln!("web-safe-block: accept failed: {e}");
+                    last_warned = Some(std::time::Instant::now());
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }

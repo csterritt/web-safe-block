@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::http::uri::Authority;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
@@ -65,13 +66,43 @@ pub(crate) fn strip_session_cookie(headers: &mut HeaderMap) {
     }
 }
 
+/// Percent-decode one path segment once; invalid escapes are left literal.
+fn percent_decode(seg: &str) -> Vec<u8> {
+    let b = seg.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// True if any `/`- or `\`-separated segment of `path` — percent-decoded
+/// once and ASCII-lowercased — is `__wsb`. The reserved namespace is matched
+/// broadly (case, encoding, separators, doubled slashes, dot segments)
+/// because the untrusted upstream may normalize a path differently before
+/// routing on it.
+pub(crate) fn is_reserved_path(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|seg| percent_decode(seg).eq_ignore_ascii_case(b"__wsb"))
+}
+
 /// Sanitize a `next` redirect target; falls back to `/`.
 pub(crate) fn sanitize_next(next: &str) -> String {
     let ok = next.len() <= 2048
         && next.starts_with('/')
         && !next.starts_with("//")
         && !next.starts_with("/\\")
-        && !next.starts_with("/__wsb/")
+        && !is_reserved_path(next)
         && next.bytes().all(|b| b.is_ascii_graphic());
     if ok {
         next.to_string()
@@ -228,6 +259,10 @@ pub(crate) fn html_response(status: StatusCode, body: impl Into<axum::body::Body
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -237,6 +272,10 @@ pub(crate) fn plain_response(status: StatusCode, text: &'static str) -> Response
     let h = resp.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -261,16 +300,21 @@ pub(crate) fn clear_cookie_header(secure: bool) -> String {
 
 /// The client IP: `CF-Connecting-IP` when the TCP peer is loopback (the
 /// header is only trustworthy from a local reverse proxy such as
-/// cloudflared) and it parses, else the TCP peer.
+/// cloudflared) and it parses, else the TCP peer. More than one
+/// `CF-Connecting-IP` value is ambiguous and fails closed to the peer.
+/// The parsed IP is canonicalized so an IPv4-mapped IPv6 header folds to
+/// plain IPv4 everywhere the address is used.
 fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<std::net::IpAddr> {
     let peer_ip = peer.map(|a| a.ip().to_canonical());
-    if peer_ip.is_some_and(|ip| ip.is_loopback())
-        && let Some(ip) = headers
-            .get("CF-Connecting-IP")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-    {
-        return Some(ip);
+    if peer_ip.is_some_and(|ip| ip.is_loopback()) {
+        let mut values = headers.get_all("CF-Connecting-IP").iter();
+        if let Some(v) = values.next()
+            && values.next().is_none()
+            && let Ok(s) = v.to_str()
+            && let Ok(ip) = s.trim().parse::<std::net::IpAddr>()
+        {
+            return Some(ip.to_canonical());
+        }
     }
     peer_ip
 }
@@ -322,6 +366,8 @@ pub(crate) fn cross_site(headers: &HeaderMap, secure: bool) -> bool {
         let Ok(origin) = origin.to_str() else {
             return true;
         };
+        // get() seeing the single Host value relies on `validate_host`
+        // having already rejected missing and duplicate Host headers.
         let host = headers
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
@@ -380,6 +426,87 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
             headers.remove(&hn);
         }
     }
+}
+
+/// Remove every header a client could use to lie about forwarding or its
+/// address: anything whose name starts `x-forwarded-`, plus a denylist of
+/// vendor client-IP headers. `CF-Connecting-IP` goes unconditionally —
+/// upstreams must use the gate's stamped `X-Forwarded-For`, never the
+/// client's own header.
+pub(crate) fn strip_forwarding_headers(headers: &mut HeaderMap) {
+    const DENYLIST: &[&str] = &[
+        "forwarded",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "cf-connecting-ipv6",
+        "cf-pseudo-ipv4",
+        "true-client-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "fastly-client-ip",
+        "x-original-forwarded-for",
+        "client-ip",
+        "x-originating-ip",
+        "x-remote-ip",
+        "x-remote-addr",
+        "x-envoy-external-address",
+        "x-url-scheme",
+        "front-end-https",
+        "x-host",
+        "x-original-host",
+    ];
+    let names: Vec<header::HeaderName> = headers
+        .keys()
+        .filter(|n| n.as_str().starts_with("x-forwarded-") || DENYLIST.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(&name);
+    }
+}
+
+/// True if the request carries exactly one syntactically valid Host header
+/// (an authority without userinfo, and a numeric port when one is given).
+/// When the request URI is absolute-form its authority must match the Host
+/// value case-insensitively, so the gate and upstream never disagree about
+/// which host a request targets.
+pub(crate) fn valid_host(headers: &HeaderMap, uri: &Uri) -> bool {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let Some(host) = hosts.next() else {
+        return false;
+    };
+    if hosts.next().is_some() {
+        return false;
+    }
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    if host.is_empty() || host.ends_with(':') {
+        return false;
+    }
+    let Ok(authority) = host.parse::<Authority>() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    // Authority::port() only reports a numeric port — "host:abc" parses
+    // with no port at all — so check the raw text: a ':' outside any
+    // brackets must introduce a port that parses as u16.
+    let raw_port = match (host.rfind(':'), host.rfind(']')) {
+        (Some(c), Some(b)) if c < b => None,
+        (Some(c), _) => Some(&host[c + 1..]),
+        (None, _) => None,
+    };
+    if raw_port.is_some_and(|p| p.parse::<u16>().is_err()) {
+        return false;
+    }
+    if let Some(a) = uri.authority()
+        && !a.as_str().eq_ignore_ascii_case(host)
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -721,5 +848,123 @@ mod tests {
         // No peer at all: no header trust, so the key is "unknown".
         assert_eq!(client_key(&h, None), "unknown");
         assert_eq!(rate_limit_key(&h, None), "unknown");
+    }
+
+    #[test]
+    fn strip_forwarding_headers_cases() {
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-forwarded-scheme", "https"),
+            ("x-forwarded-ssl", "on"),
+            ("forwarded", "for=1.2.3.4"),
+            ("x-real-ip", "1.2.3.4"),
+            ("cf-connecting-ip", "1.2.3.4"),
+            ("true-client-ip", "1.2.3.4"),
+            ("x-client-ip", "1.2.3.4"),
+            ("x-cluster-client-ip", "1.2.3.4"),
+            ("fastly-client-ip", "1.2.3.4"),
+            ("x-original-forwarded-for", "1.2.3.4"),
+            ("client-ip", "1.2.3.4"),
+            ("x-original-host", "example.com"),
+            ("front-end-https", "on"),
+            ("x-envoy-external-address", "1.2.3.4"),
+        ] {
+            h.insert(k, HeaderValue::from_static(v));
+        }
+        h.insert("x-keep-me", HeaderValue::from_static("yes"));
+        h.insert(header::HOST, HeaderValue::from_static("example.com"));
+        h.insert(header::COOKIE, HeaderValue::from_static("a=1"));
+        strip_forwarding_headers(&mut h);
+        let mut left: Vec<String> = h.keys().map(|k| k.to_string()).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["cookie", "host", "x-keep-me"],
+            "only non-forwarding headers survive: {left:?}"
+        );
+    }
+
+    #[test]
+    fn client_ip_duplicate_cf_fails_closed() {
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.append("cf-connecting-ip", HeaderValue::from_static("203.0.113.1"));
+        h.append("cf-connecting-ip", HeaderValue::from_static("203.0.113.2"));
+        // Two values are ambiguous: the peer wins rather than the first.
+        assert_eq!(client_key(&h, Some(peer)), "127.0.0.1");
+        assert_eq!(rate_limit_key(&h, Some(peer)), "127.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_header_canonicalized() {
+        // client_key and rate_limit_key agree on IPv4-mapped IPv6 input.
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cf-connecting-ip",
+            HeaderValue::from_static("::ffff:203.0.113.7"),
+        );
+        assert_eq!(client_key(&h, Some(peer)), "203.0.113.7");
+    }
+
+    #[test]
+    fn is_reserved_path_cases() {
+        for p in [
+            "/__wsb",
+            "/__wsb/",
+            "/__wsb/login",
+            "/__WSB/login",
+            "/%5F%5Fwsb/x",
+            "/%5f%5FWSB",
+            "//__wsb/x",
+            "/a/../__wsb/login",
+            "/a/__wsb",
+            "/a\\__wsb",
+        ] {
+            assert!(is_reserved_path(p), "{p}");
+        }
+        for p in ["/__wsbx", "/x__wsb", "/a/b", "/", "/x"] {
+            assert!(!is_reserved_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn valid_host_cases() {
+        let host = |v: &[u8]| {
+            let mut h = HeaderMap::new();
+            h.append(header::HOST, HeaderValue::from_bytes(v).unwrap());
+            h
+        };
+        let uri: Uri = "/x".parse().unwrap();
+        for ok in [
+            "example.com",
+            "example.com:8080",
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "[2001:db8::1]",
+        ] {
+            assert!(valid_host(&host(ok.as_bytes()), &uri), "{ok}");
+        }
+        assert!(!valid_host(&HeaderMap::new(), &uri), "missing");
+        // Duplicate Host headers are ambiguous, identical or not.
+        let mut two_same = host(b"example.com");
+        two_same.append(header::HOST, HeaderValue::from_static("example.com"));
+        assert!(!valid_host(&two_same, &uri));
+        let mut two_diff = host(b"example.com");
+        two_diff.append(header::HOST, HeaderValue::from_static("other.com"));
+        assert!(!valid_host(&two_diff, &uri));
+        for bad in ["", "user@example.com", "example.com:abc", "example.com:"] {
+            assert!(!valid_host(&host(bad.as_bytes()), &uri), "{bad}");
+        }
+        assert!(
+            !valid_host(&host(b"example\xff.com"), &uri),
+            "non-UTF-8 Host"
+        );
+        // Absolute-form URI: its authority must equal the Host value.
+        let abs: Uri = "http://other.example/x".parse().unwrap();
+        assert!(!valid_host(&host(b"example.com"), &abs));
+        let abs: Uri = "http://Example.COM:8080/x".parse().unwrap();
+        assert!(valid_host(&host(b"example.com:8080"), &abs));
     }
 }

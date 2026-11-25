@@ -23,8 +23,9 @@ use crate::monitor::EventKind;
 use crate::sessions::valid_session;
 use crate::state::AppState;
 use crate::util::{
-    client_key, html_response, login_page, plain_response, rewrite_cache_control, sanitize_next,
-    sets_session_cookie, strip_hop_by_hop, strip_session_cookie,
+    client_key, html_response, is_reserved_path, login_page, plain_response, rewrite_cache_control,
+    sanitize_next, sets_session_cookie, strip_forwarding_headers, strip_hop_by_hop,
+    strip_session_cookie,
 };
 
 pub(crate) async fn proxy_or_login(
@@ -32,8 +33,8 @@ pub(crate) async fn proxy_or_login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    // Reserved namespace: never forward /__wsb/* upstream.
-    if req.uri().path().starts_with("/__wsb/") {
+    // Reserved namespace: never forward a __wsb path segment upstream.
+    if is_reserved_path(req.uri().path()) {
         return with_outcome(
             plain_response(StatusCode::NOT_FOUND, "Not Found"),
             EventKind::Reserved,
@@ -79,7 +80,9 @@ pub(crate) async fn proxy_or_login(
 }
 
 async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Response {
-    let (scheme, authority) = state.config.upstream.request_base();
+    let Some((scheme, authority)) = state.config.upstream.request_base() else {
+        return plain_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+    };
     let mut parts = req.uri().clone().into_parts();
     parts.scheme = Some(scheme);
     parts.authority = Some(authority);
@@ -90,23 +93,15 @@ async fn forward(state: &AppState, peer: SocketAddr, mut req: Request) -> Respon
     *req.uri_mut() = new_uri;
 
     // Read client IP and Host before stripping: a client-controlled
-    // `Connection` header must not be able to remove them first.
+    // `Connection` header must not be able to remove them first, and
+    // `client_key` still needs the incoming CF-Connecting-IP.
     let headers = req.headers_mut();
     let key = client_key(headers, Some(peer));
     let host = headers.get(header::HOST).cloned();
     strip_session_cookie(headers);
     strip_hop_by_hop(headers);
     // The client is untrusted: rebuild forwarding headers from scratch.
-    for name in [
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-proto",
-        "x-forwarded-host",
-        "x-forwarded-port",
-        "x-real-ip",
-    ] {
-        headers.remove(name);
-    }
+    strip_forwarding_headers(headers);
     if let Ok(v) = HeaderValue::from_str(&key) {
         headers.insert("x-forwarded-for", v);
     }

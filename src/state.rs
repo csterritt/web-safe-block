@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::http::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::{Client, ResponseFuture};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 
 use crate::monitor::EventQueue;
 use crate::sessions::Session;
@@ -46,9 +46,20 @@ pub struct Limits {
     /// At most this many client connections are served at once; further
     /// ones wait in the listen backlog.
     pub max_connections: usize,
+    /// Largest request-header block (start line + headers) a client may
+    /// send; larger ones get 431 and the connection is closed.
+    pub max_header_size: usize,
+    /// Largest read buffer a client connection may grow; bounds the memory
+    /// a keep-alive connection can pin with large headers.
+    pub max_buf_size: usize,
     /// On shutdown, in-flight connections get this long to finish before
     /// they are closed.
     pub shutdown_timeout: Duration,
+    /// Idle upstream connections kept in the pool are dropped after this.
+    pub upstream_pool_idle_timeout: Duration,
+    /// Idle upstream connections kept per host, on top of the
+    /// `max_upstream_requests` in-flight cap.
+    pub upstream_pool_max_idle: usize,
 }
 
 impl Default for Limits {
@@ -66,8 +77,12 @@ impl Default for Limits {
             header_read_timeout: Duration::from_secs(30),
             client_write_stall_timeout: Duration::from_secs(60),
             request_body_timeout: Duration::from_secs(15),
-            max_connections: 1024,
+            max_connections: 100,
+            max_header_size: 16 * 1024,
+            max_buf_size: 16 * 1024,
             shutdown_timeout: Duration::from_secs(15),
+            upstream_pool_idle_timeout: Duration::from_secs(30),
+            upstream_pool_max_idle: 32,
         }
     }
 }
@@ -98,7 +113,12 @@ impl Config {
             session_ttl: Duration::from_secs(settings.session_ttl_secs),
             cookie_secure: settings.cookie_secure,
             fail_delay: Duration::from_secs(1),
-            limits: Limits::default(),
+            limits: Limits {
+                max_header_size: settings.max_header_size,
+                max_buf_size: settings.max_buf_size,
+                max_connections: settings.max_connections,
+                ..Limits::default()
+            },
         }
     }
 }
@@ -144,17 +164,26 @@ impl UpstreamClient {
 
 impl AppState {
     pub fn new(config: Config, events: Arc<EventQueue>) -> Self {
+        // Both clients share the pool policy: a timer reaps idle pooled
+        // connections and the per-host idle count is bounded.
+        let builder = || {
+            let mut b = Client::builder(TokioExecutor::new());
+            b.pool_timer(TokioTimer::new())
+                .pool_idle_timeout(config.limits.upstream_pool_idle_timeout)
+                .pool_max_idle_per_host(config.limits.upstream_pool_max_idle);
+            b
+        };
         let client = match &config.upstream {
             Upstream::Http(_) => {
                 let mut connector = HttpConnector::new();
                 connector.set_connect_timeout(Some(config.limits.upstream_connect_timeout));
-                UpstreamClient::Tcp(Client::builder(TokioExecutor::new()).build(connector))
+                UpstreamClient::Tcp(builder().build(connector))
             }
             #[cfg(unix)]
             Upstream::Unix(path) => {
                 let connector =
                     UnixConnector::new(path.clone(), config.limits.upstream_connect_timeout);
-                UpstreamClient::Unix(Client::builder(TokioExecutor::new()).build(connector))
+                UpstreamClient::Unix(builder().build(connector))
             }
         };
         let max_upstream_requests = config.limits.max_upstream_requests;

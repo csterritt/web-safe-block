@@ -44,6 +44,18 @@ monitor_addr = "127.0.0.1:8081"
 
 # How many unreported events the monitor queue keeps.
 monitor_queue_len = 100
+
+# Maximum request-header block size (bytes) accepted on a client connection;
+# larger ones get 431 and a closed connection.
+max_header_size = 16384
+
+# Maximum per-connection read buffer (bytes); bounds the memory a client can
+# pin with large headers. Hyper requires at least 8192.
+max_buf_size = 16384
+
+# Maximum client connections served at once; extras wait in the listen
+# backlog. Each connection can retain up to max_buf_size of buffer.
+max_connections = 100
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +69,9 @@ struct RawSettings {
     cookie_secure: bool,
     monitor_addr: String,
     monitor_queue_len: usize,
+    max_header_size: usize,
+    max_buf_size: usize,
+    max_connections: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +85,9 @@ pub struct Settings {
     pub cookie_secure: bool,
     pub monitor_addr: MonitorAddr,
     pub monitor_queue_len: usize,
+    pub max_header_size: usize,
+    pub max_buf_size: usize,
+    pub max_connections: usize,
 }
 
 fn hint(path: &Path) -> String {
@@ -109,6 +127,21 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if raw.session_ttl_secs == 0 {
         return Err(bad("session_ttl_secs must be at least 1".into()));
     }
+    if raw.max_buf_size < 8192 {
+        return Err(bad("max_buf_size must be at least 8192".into()));
+    }
+    if raw.max_header_size < 1024 {
+        return Err(bad("max_header_size must be at least 1024".into()));
+    }
+    if raw.max_header_size > raw.max_buf_size {
+        return Err(bad(format!(
+            "max_header_size must be at most max_buf_size ({})",
+            raw.max_buf_size
+        )));
+    }
+    if raw.max_connections == 0 {
+        return Err(bad("max_connections must be at least 1".into()));
+    }
     if raw.session_ttl_secs > 315_360_000 {
         return Err(bad(
             "session_ttl_secs must be at most 315360000 (10 years)".into()
@@ -127,6 +160,9 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         cookie_secure: raw.cookie_secure,
         monitor_addr,
         monitor_queue_len: raw.monitor_queue_len,
+        max_header_size: raw.max_header_size,
+        max_buf_size: raw.max_buf_size,
+        max_connections: raw.max_connections,
     })
 }
 
@@ -196,6 +232,9 @@ mod tests {
         assert!(s.cookie_secure);
         assert_eq!(s.monitor_addr, "127.0.0.1:8081".parse().unwrap());
         assert_eq!(s.monitor_queue_len, 100);
+        assert_eq!(s.max_header_size, 16384);
+        assert_eq!(s.max_buf_size, 16384);
+        assert_eq!(s.max_connections, 100);
 
         let err = write_default(&path).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
@@ -269,6 +308,10 @@ mod tests {
             ),
             ("listen_addr", "listen_addr = \"localhost\"", "listen_addr"),
             ("cookie_secure", "cookie_secure = \"yes\"", "cookie_secure"),
+            ("max_buf_size", "max_buf_size = 8191", "8192"),
+            ("max_header_size", "max_header_size = 512", "1024"),
+            ("max_header_size", "max_header_size = 32768", "max_buf_size"),
+            ("max_connections", "max_connections = 0", "max_connections"),
         ] {
             let err = load_str(&replace(key, line)).unwrap_err();
             assert!(err.contains(needle), "{line}: {err}");

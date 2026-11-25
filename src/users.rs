@@ -32,11 +32,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_name)";
 
-/// Per-connection setup for a file database: a busy timeout (set first so
-/// the WAL pragma also waits) and WAL journal mode, which puts live data in
-/// users.db-wal/-shm as well — required for Litestream backups.
+/// Per-connection setup for a file database: WAL journal mode, which puts
+/// live data in users.db-wal/-shm as well — required for Litestream backups.
+/// `open` has already set the busy timeout, so this pragma also waits.
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))?;
     let mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -50,11 +49,10 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Foreign keys, a write busy timeout, and every table the file should have.
+/// Foreign keys and every table the file should have. The busy timeout is
+/// already set per connection by `open`.
 fn init(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(&format!(
-        "PRAGMA busy_timeout = 5000;\nPRAGMA foreign_keys = ON;\n{SCHEMA}"
-    ))
+    conn.execute_batch(&format!("PRAGMA foreign_keys = ON;\n{SCHEMA}"))
 }
 
 /// True for sqlite's "no such table" error (vs. locking or corruption).
@@ -194,9 +192,9 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// The db file and its existing WAL sidecars that are accessible to
-/// group/other users.
+/// group/other users, with each file's mode (stat'ed once here).
 #[cfg(unix)]
-fn exposed_files(path: &Path) -> Vec<PathBuf> {
+fn exposed_files(path: &Path) -> Vec<(PathBuf, u32)> {
     use std::os::unix::fs::PermissionsExt;
     [
         path.to_path_buf(),
@@ -204,10 +202,9 @@ fn exposed_files(path: &Path) -> Vec<PathBuf> {
         sidecar(path, "-shm"),
     ]
     .into_iter()
-    .filter(|p| {
-        p.metadata()
-            .map(|md| md.permissions().mode() & 0o077 != 0)
-            .unwrap_or(false)
+    .filter_map(|p| {
+        let mode = p.metadata().ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then_some((p, mode))
     })
     .collect()
 }
@@ -216,22 +213,18 @@ fn exposed_files(path: &Path) -> Vec<PathBuf> {
 /// to group/other users.
 #[cfg(unix)]
 fn warn_if_exposed(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let exposed = exposed_files(path);
     if exposed.is_empty() {
         return;
     }
     let files: Vec<String> = exposed
         .iter()
-        .map(|p| {
-            let mode = p
-                .metadata()
-                .map(|md| md.permissions().mode() & 0o777)
-                .unwrap_or(0);
-            format!("{} (mode {mode:04o})", p.display())
-        })
+        .map(|(p, mode)| format!("{} (mode {mode:04o})", p.display()))
         .collect();
-    let paths: Vec<String> = exposed.iter().map(|p| p.display().to_string()).collect();
+    let paths: Vec<String> = exposed
+        .iter()
+        .map(|(p, _)| p.display().to_string())
+        .collect();
     eprintln!(
         "web-safe-block: warning: {} accessible to other users; run: chmod 600 {}",
         files.join(", "),
@@ -261,6 +254,14 @@ fn open(path: &Path, kind: OpenKind) -> Result<Connection, String> {
     let hint = "add users with: web-safe-block add-user < users.txt";
     let missing = || format!("no users database at {}; {hint}", path.display());
     if !path.exists() {
+        // A dangling symlink still resolves for open(): SQLite would create
+        // the (uncontrolled) target, so refuse before touching the file.
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err(format!(
+                "{} is a dangling symlink; refusing to create the database through it",
+                path.display()
+            ));
+        }
         match kind {
             OpenKind::Add => create_private_db(path)?,
             _ => return Err(missing()),
@@ -295,7 +296,7 @@ fn open(path: &Path, kind: OpenKind) -> Result<Connection, String> {
     if stale_schema(&conn).map_err(cannot_open)? {
         return Err(stale_schema_err(path));
     }
-    if matches!(kind, OpenKind::Serve) && users == Some(0) {
+    if matches!(kind, OpenKind::Serve | OpenKind::ReadOnly) && users == Some(0) {
         return Err(format!(
             "users database {} has no users; {hint}",
             path.display()
@@ -425,6 +426,9 @@ pub fn add_users(
                 skipped += 1;
             }
         }
+    }
+    if pending.is_empty() {
+        return Ok((0, skipped));
     }
     // One IMMEDIATE transaction inserts the batch in microseconds; a
     // concurrent writer can never leave a stale read snapshot behind.
@@ -1198,7 +1202,7 @@ mod tests {
         let wal = sidecar(&path, "-wal");
         assert!(wal.exists(), "wal file exists");
         std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(exposed_files(&path), vec![wal]);
+        assert_eq!(exposed_files(&path), vec![(wal, 0o644)]);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
