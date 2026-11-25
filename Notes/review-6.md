@@ -37,8 +37,9 @@ This is an unauthenticated remote memory-exhaustion vector. The connection semap
 
 **Recommendation:**
 
-- Set an explicit `max_header_size` commensurate with this application (for example 16–32 KiB, after checking legitimate cookie/user-agent sizes) and consider setting `max_buf_size` explicitly as well.
-- Consider lowering `max_connections` or making it configurable; 1,024 concurrent downstream HTTP connections is a large default for a host documented as having ~67 MiB free.
+- Make `max_header_size` configurable; default should be 16 KiB.
+- Make `max_buf_size` configurable; default should be 16 KiB.
+- Make `max_connections` configurable; default should be 100.
 - Add a raw-socket integration test that sends a large-but-accepted header, receives the 401/response, keeps the connection open, and asserts the configured bound is enforced. A second test should assert over-bound headers receive 431/close rather than being buffered indefinitely.
 - Track the upstream Hyper read-buffer-retention fix, but do not rely on it as the only control; explicit application-level size limits are still needed.
 
