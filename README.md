@@ -10,7 +10,7 @@ I'd like to host some open-source programs, but I don't know if they have securi
 
 I'd also like to serve a simple program to allow some friends to search the articles for a neighborhood magazine - and these folks are pretty tech challenged. So it has to be simple to use.
 
-This program, `web-safe-block`, is a simple rust program that gates access to a server process. `web-safe-block` listens on one port for incoming connections, and presents for any URL, from memory, a tiny (632 bytes) log-in page. Users enter a user name and a pass phrase (more about that below) and from then on, they're forwarded directly to another port, which is where the actual application listens, but only for local connections.
+This program, `web-safe-block`, is a simple rust program that gates access to a server process. `web-safe-block` listens on one port for incoming connections, and presents for any URL, from memory, a tiny (~734 bytes) log-in page. Users enter a user name and a pass phrase (more about that below) and from then on, they're forwarded directly to another port, which is where the actual application listens, but only for local connections.
 
 It doesn't do TLS termination, so it's meant to be run behind a Cloudflare tunnel or some other such service.
 
@@ -50,7 +50,7 @@ web-safe-block -c /etc/web-safe-block/config.toml serve
 
 #### Configuration
 
-Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `serve`) validates the config file first, exiting with an error if it is missing, can't be parsed, is missing any setting, or contains an unknown one. An existing config file from before `front_page_message` was added must gain the line — startup fails on the missing setting, as with any other.
+Every command except `write-config` (`add-user`, `remove-user`, `list-users`, `serve`) validates the config file first, exiting with an error if it is missing, can't be parsed, is missing any setting, or contains an unknown one.
 
 | Setting | Default | Meaning |
 |---------------------|---------------------------|---|
